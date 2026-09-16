@@ -1,0 +1,51 @@
+name: smart_metering
+code: meter
+domain: metering
+description: >-
+  AMI smart-metering data product. Lands 15-minute interval reads from the
+  meter head-end, cleans them, and rolls them up to a daily consumption fact
+  joined to the meter and account dimensions.
+
+owners:
+  - smart-metering-team@utility.example.com
+
+etl:
+  flavor: pyspark
+  folder: glue
+
+databases:
+  - name: meter_raw
+    type: athena
+    layer: raw
+    description: Landed 15-minute interval meter reads.
+  - name: meter_stg
+    type: athena
+    layer: staging
+    description: Cleaned, deduped, gap-filled interval reads.
+  - name: meter_cur
+    type: athena
+    layer: curated
+    description: Daily consumption fact (grain = meter x day).
+
+# Tables in other product repos this product reads (cross-repo joins).
+cross_product_dependencies:
+  - product: meter_assets
+    code: asset
+    tables:
+      - asset_cur.dim_meter
+  - product: customer_master
+    code: cust
+    tables:
+      - cust_cur.dim_account
+
+orchestrator:
+  type: airflow
+  file: orchestration/dag_meter.py
+
+# Primary (product) schedule + per-script schedules.
+schedules:
+  primary: "0 2 * * *"
+  scripts:
+    ingest_interval_reads: "hourly"
+    stage_reads: "0 1 * * *"
+    build_fact_consumption: "0 2 * * *"

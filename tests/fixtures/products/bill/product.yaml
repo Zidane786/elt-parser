@@ -1,0 +1,50 @@
+name: billing
+code: bill
+domain: revenue
+owners:
+  - billing-team@utility.example.com
+
+databases:
+  - name: billing_pg
+    type: postgres
+    layer: source
+    description: Billing operational Postgres — invoices ledger (system of record).
+  - name: bill_raw
+    type: athena
+    layer: raw
+    description: Landed invoices extract from billing_pg.
+  - name: bill_stg
+    type: athena
+    layer: staging
+    description: Invoices re-rated against consumption + tariff.
+  - name: bill_cur
+    type: athena
+    layer: curated
+    description: Invoice fact (grain = invoice).
+
+# Tables this product reads from OTHER products' curated layers.
+cross_product_dependencies:
+  - product: smart_metering
+    code: meter
+    tables:
+      - meter_cur.fact_consumption
+  - product: customer_master
+    code: cust
+    tables:
+      - cust_cur.dim_account
+  - product: tariff_pricing
+    code: tariff
+    tables:
+      - tariff_cur.dim_tariff
+
+orchestrator:
+  type: airflow
+  file: orchestration/dag_bill.py
+
+# Primary (DAG-level) schedule plus per-step schedules.
+schedules:
+  primary: "0 4 * * *"
+  steps:
+    ingest_invoices: "0 1 * * *"
+    rate_invoices: "0 3 * * *"
+    build_fact_invoice: "0 4 * * *"

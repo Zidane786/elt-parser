@@ -42,3 +42,23 @@ def test_collect_constants_chains_in_order():
     )
     env = collect_constants(tree)
     assert env == {"DB": "ecom", "TABLE": "ecom.orders", "PATH": "s3://b/ecom.orders"}
+
+
+def test_format_specs_escapes_and_stale_constants():
+    assert _expr('f"t_{3:03d}"').text == "t_003"
+    assert _expr('"t_%s_%%" % "prod"').text == "t_prod_%"
+    assert not _expr('"t_%s_%s" % "prod"').complete
+    assert not _expr('"t_{".format()').complete
+    assert _expr('"xxTABLExx".strip("x")').text == "TABLE"
+    assert collect_constants(ast.parse('T="old"\nT=dynamic()')) == {}
+
+
+def test_numeric_formats_and_arithmetic_do_not_corrupt_table_names():
+    from etl_parser.scanner.strings import Folded
+
+    assert _expr('"t_%03d" % 2').text == "t_002"
+    assert _expr('"t_{:03d}".format(2)').text == "t_002"
+    assert _expr('f"t_{n:03d}"', {"n": Folded("2", True, value_type="int")}).text == "t_002"
+    assert _expr('f"t_{1 + 2}"').text == "t_3"
+    assert not _expr('"t_" + 2').complete
+    assert not _expr('f"t_{1:1000000000d}"').complete

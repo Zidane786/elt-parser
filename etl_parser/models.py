@@ -66,7 +66,7 @@ class Transformation(_Model):
 
 
 class Provenance(_Model):
-    parser: Parser
+    parser: str
     confidence: Confidence = "exact"
     dialect: str | None = None
     scan_commit: str | None = None
@@ -92,7 +92,7 @@ class TableEdge(_Model):
 
 class Schedule(_Model):
     id: str
-    orchestrator: Orchestrator
+    orchestrator: str
     dag_id: str | None = None
     task_id: str | None = None
     cron: str | None = None
@@ -113,7 +113,7 @@ class Job(_Model):
     name: str
     source_file: str
     language: Language = "unknown"
-    engine: Engine = "unknown"
+    engine: str = "unknown"
     dialect: str | None = None
     schedule_id: str | None = None
     product: str | None = None
@@ -137,6 +137,10 @@ class Unresolved(_Model):
     reason: str
     partial_text: str | None = None
     job_id: str | None = None
+    expression: str | None = None
+    symbols: list[str] = Field(default_factory=list)
+    assumptions: dict[str, str] = Field(default_factory=dict)
+    remediation: str | None = None
 
 
 class ProductDatabase(_Model):
@@ -192,6 +196,7 @@ class LineageDocument(_Model):
     datasets: list[DatasetRef] = Field(default_factory=list)
     jobs: list[Job] = Field(default_factory=list)
     schedules: dict[str, Schedule] = Field(default_factory=dict)
+    task_jobs: dict[str, str | None] = Field(default_factory=dict)
     job_dependencies: dict[str, list[JobDependency]] = Field(default_factory=dict)
     column_edges: list[ColumnEdge] = Field(default_factory=list)
     table_edges: list[TableEdge] = Field(default_factory=list)
@@ -205,6 +210,7 @@ class LineageDocument(_Model):
                 "datasets": sorted(self.datasets, key=lambda d: d.id),
                 "jobs": sorted(self.jobs, key=lambda j: j.id),
                 "schedules": dict(sorted(self.schedules.items())),
+                "task_jobs": dict(sorted(self.task_jobs.items())),
                 "job_dependencies": {
                     k: sorted(v, key=lambda d: d.job_id)
                     for k, v in sorted(self.job_dependencies.items())

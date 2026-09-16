@@ -1,0 +1,157 @@
+"""Helpers shared by every worker: header parsing, cron normalisation, result plumbing."""
+
+from __future__ import annotations
+
+import ast
+import re
+from pathlib import Path
+
+from etl_parser.models import Schedule
+
+HEADER_KEYS = {"source", "target", "owner", "grain", "schedule", "dependencies", "description"}
+_HEADER_LINE = re.compile(r"^\s*(?:--|#)?\s*(?P<key>[A-Za-z][A-Za-z _]*):\s*(?P<value>.+?)\s*$")
+
+CRON_PRESETS = {
+    "@once": None,
+    "@hourly": "0 * * * *",
+    "@daily": "0 0 * * *",
+    "@midnight": "0 0 * * *",
+    "@weekly": "0 0 * * 0",
+    "@monthly": "0 0 1 * *",
+    "@quarterly": "0 0 1 */3 *",
+    "@yearly": "0 0 1 1 *",
+    "@annually": "0 0 1 1 *",
+    "@continuous": None,
+    "hourly": "0 * * * *",
+    "daily": "0 0 * * *",
+    "weekly": "0 0 * * 0",
+    "monthly": "0 0 1 * *",
+}
+_CRON_5 = re.compile(r"^(\S+\s+){4}\S+$")
+_DAILY_AT = re.compile(r"^daily\s+(\d{1,2}):(\d{2})(?:\s+UTC)?$", re.I)
+_EVERY_N = re.compile(r"^every\s+(\d+)\s*(minute|min|hour|day)s?", re.I)
+
+
+def parse_header(text: str) -> dict[str, str]:
+    """Extract ``Key: value`` lines from a module docstring or SQL comment header.
+
+    Returns lower-cased keys. Only the leading block of the text is inspected so a
+    ``Source:`` inside later prose does not count.
+    """
+    out: dict[str, str] = {}
+    lines: list[str] = []
+    try:
+        doc = ast.get_docstring(ast.parse(text))
+    except SyntaxError:
+        doc = None
+    if doc:
+        lines = doc.splitlines()
+    else:
+        for raw in text.splitlines():
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            if stripped.startswith(("--", "#")):
+                lines.append(stripped.lstrip("-#").strip())
+            else:
+                break
+    for line in lines:
+        m = _HEADER_LINE.match(line)
+        if not m:
+            continue
+        key = m.group("key").strip().lower()
+        if key in HEADER_KEYS and key not in out:
+            out[key] = m.group("value").strip()
+    return out
+
+
+def first_docstring_line(text: str) -> str | None:
+    """The first non-empty line of a module docstring, used as a job description."""
+    try:
+        doc = ast.get_docstring(ast.parse(text))
+    except SyntaxError:
+        return None
+    if doc:
+        return next((line.strip() for line in doc.splitlines() if line.strip()), None)
+    return None
+
+
+def normalize_cron(text: str | None) -> str | None:
+    """Best-effort normalisation of a human or Airflow schedule string to five-field cron."""
+    if text is None:
+        return None
+    t = text.strip().strip('"').strip("'")
+    if not t:
+        return None
+    low = t.lower()
+    if low in CRON_PRESETS:
+        return CRON_PRESETS[low]
+    if _CRON_5.fullmatch(t) and _valid_cron(t):
+        return " ".join(t.split())
+    m = _DAILY_AT.match(low)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        return f"{minute} {hour} * * *" if hour < 24 and minute < 60 else None
+    m = _EVERY_N.fullmatch(low)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        if unit.startswith("min"):
+            return f"*/{n} * * * *" if 0 < n < 60 and 60 % n == 0 else None
+        if unit == "hour":
+            return f"0 */{n} * * *" if 0 < n < 24 and 24 % n == 0 else None
+        if unit == "day":
+            return "0 0 * * *" if n == 1 else None
+    # A timedelta is anchored to its start time; cron is a wall-clock schedule.
+    # Preserve the original interval_text without claiming they are equivalent.
+    return None
+
+
+def _valid_cron(text: str) -> bool:
+    bounds = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)]
+    names = {
+        name: str(i)
+        for i, name in enumerate(
+            ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1
+        )
+    }
+    days = {
+        name: str(i) for i, name in enumerate(["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"])
+    }
+    for index, (field, (low, high)) in enumerate(zip(text.upper().split(), bounds, strict=True)):
+        if index in (3, 4):
+            for name, value in (names if index == 3 else days).items():
+                field = field.replace(name, value)
+        for item in field.split(","):
+            base, slash, step = item.partition("/")
+            if slash and (not step.isdigit() or not 0 < int(step) <= high - low + 1):
+                return False
+            if base == "*":
+                continue
+            ends = base.split("-")
+            if len(ends) > 2 or any(not x.isdigit() or not low <= int(x) <= high for x in ends):
+                return False
+            if len(ends) == 2 and int(ends[0]) > int(ends[1]):
+                return False
+    return True
+
+
+def comment_schedule(job_id: str, text: str, source_file: str | None) -> Schedule:
+    return Schedule(
+        id=f"comment.{job_id}",
+        orchestrator="cron_comment",
+        cron=normalize_cron(text),
+        interval_text=text,
+        source_file=source_file,
+    )
+
+
+def repo_relative(path: Path, root: Path | None) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve())) if root else str(path)
+    except ValueError:
+        return str(path)
+
+
+def job_id_for(path: Path, root: Path | None) -> str:
+    rel = repo_relative(path, root)
+    return re.sub(r"\.(py|sql)$", "", rel).replace("\\", "/")

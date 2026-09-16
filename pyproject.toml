@@ -34,9 +34,13 @@ packages = ["etl_parser"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["tests/fixtures"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["typer.Option", "typer.Argument"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

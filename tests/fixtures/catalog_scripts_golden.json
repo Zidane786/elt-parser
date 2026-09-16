@@ -1,0 +1,825 @@
+[
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "derive_refund_fraud_flag",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.raw_refunds",
+        "type": "table"
+      }
+    ],
+    "schedule": "hourly",
+    "script_name": "derive_refund_fraud_flag",
+    "script_path": "derive_refund_fraud_flag.py",
+    "writes_to": [
+      {
+        "target": "ecommerce.staging_refunds_with_flags",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "dim_campaign",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.raw_marketing_campaigns",
+        "type": "table"
+      }
+    ],
+    "schedule": "daily",
+    "script_name": "dim_campaign",
+    "script_path": "dim_campaign.py",
+    "writes_to": [
+      {
+        "target": "analytics_warehouse.dim_campaign",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [
+      "stage_customers"
+    ],
+    "depends_on_detail": [
+      {
+        "in_place_writer": false,
+        "job_id": "stage_customers",
+        "sources": [
+          "data"
+        ],
+        "via_datasets": [
+          "glue://ecommerce/staging_customers"
+        ]
+      }
+    ],
+    "description": "",
+    "job_id": "dim_customer_scd2",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "analytics_warehouse.dim_customer",
+        "type": "table"
+      },
+      {
+        "target": "ecommerce.staging_customers",
+        "type": "table"
+      }
+    ],
+    "schedule": "daily",
+    "script_name": "dim_customer_scd2",
+    "script_path": "dim_customer_scd2.py",
+    "writes_to": [
+      {
+        "target": "analytics_warehouse.dim_customer",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "dim_date",
+    "language": "pyspark",
+    "reads_from": [],
+    "schedule": "on-demand (regenerated when the calendar horizon extends)",
+    "script_name": "dim_date",
+    "script_path": "dim_date.py",
+    "writes_to": [
+      {
+        "target": "analytics_warehouse.dim_date",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "dim_product",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.raw_product_variants",
+        "type": "table"
+      },
+      {
+        "target": "ecommerce.raw_products",
+        "type": "table"
+      },
+      {
+        "target": "ecommerce.raw_suppliers",
+        "type": "table"
+      }
+    ],
+    "schedule": "daily",
+    "script_name": "dim_product",
+    "script_path": "dim_product.py",
+    "writes_to": [
+      {
+        "target": "analytics_warehouse.dim_product",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "dq_check_null_spike",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.raw_orders",
+        "type": "table"
+      }
+    ],
+    "schedule": "hourly",
+    "script_name": "dq_check_null_spike",
+    "script_path": "dq_check_null_spike.py",
+    "writes_to": []
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "dq_check_orphan_refunds",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.raw_orders",
+        "type": "table"
+      },
+      {
+        "target": "ecommerce.raw_refunds",
+        "type": "table"
+      }
+    ],
+    "schedule": "daily",
+    "script_name": "dq_check_orphan_refunds",
+    "script_path": "dq_check_orphan_refunds.py",
+    "writes_to": []
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "fact_inventory",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.staging_product_inventory",
+        "type": "table"
+      }
+    ],
+    "schedule": "daily",
+    "script_name": "fact_inventory",
+    "script_path": "fact_inventory.py",
+    "writes_to": [
+      {
+        "target": "analytics_warehouse.fact_inventory",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "fact_marketing_spend",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.raw_marketing_campaigns",
+        "type": "table"
+      }
+    ],
+    "schedule": "daily",
+    "script_name": "fact_marketing_spend",
+    "script_path": "fact_marketing_spend.py",
+    "writes_to": [
+      {
+        "target": "analytics_warehouse.fact_marketing_spend",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [
+      "stage_orders"
+    ],
+    "depends_on_detail": [
+      {
+        "in_place_writer": false,
+        "job_id": "stage_orders",
+        "sources": [
+          "data"
+        ],
+        "via_datasets": [
+          "glue://ecommerce/staging_orders"
+        ]
+      }
+    ],
+    "description": "",
+    "job_id": "fact_orders",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.staging_orders",
+        "type": "table"
+      }
+    ],
+    "schedule": "hourly",
+    "script_name": "fact_orders",
+    "script_path": "fact_orders.py",
+    "writes_to": [
+      {
+        "target": "analytics_warehouse.fact_orders",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [
+      "derive_refund_fraud_flag",
+      "stage_orders"
+    ],
+    "depends_on_detail": [
+      {
+        "in_place_writer": false,
+        "job_id": "derive_refund_fraud_flag",
+        "sources": [
+          "data"
+        ],
+        "via_datasets": [
+          "glue://ecommerce/staging_refunds_with_flags"
+        ]
+      },
+      {
+        "in_place_writer": false,
+        "job_id": "stage_orders",
+        "sources": [
+          "data"
+        ],
+        "via_datasets": [
+          "glue://ecommerce/staging_orders"
+        ]
+      }
+    ],
+    "description": "",
+    "job_id": "fact_refunds",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.staging_orders",
+        "type": "table"
+      },
+      {
+        "target": "ecommerce.staging_refunds_with_flags",
+        "type": "table"
+      }
+    ],
+    "schedule": "hourly",
+    "script_name": "fact_refunds",
+    "script_path": "fact_refunds.py",
+    "writes_to": [
+      {
+        "target": "analytics_warehouse.fact_refunds",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [
+      "stage_order_items",
+      "stage_orders"
+    ],
+    "depends_on_detail": [
+      {
+        "in_place_writer": false,
+        "job_id": "stage_order_items",
+        "sources": [
+          "data"
+        ],
+        "via_datasets": [
+          "glue://ecommerce/staging_order_items"
+        ]
+      },
+      {
+        "in_place_writer": false,
+        "job_id": "stage_orders",
+        "sources": [
+          "data"
+        ],
+        "via_datasets": [
+          "glue://ecommerce/staging_orders"
+        ]
+      }
+    ],
+    "description": "",
+    "job_id": "fact_revenue",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.staging_order_items",
+        "type": "table"
+      },
+      {
+        "target": "ecommerce.staging_orders",
+        "type": "table"
+      }
+    ],
+    "schedule": "hourly",
+    "script_name": "fact_revenue",
+    "script_path": "fact_revenue.py",
+    "writes_to": [
+      {
+        "target": "analytics_warehouse.fact_revenue",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "ingest_marketing_attribution",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "s3://ad-server-exports/attribution/",
+        "type": "s3"
+      }
+    ],
+    "schedule": "hourly",
+    "script_name": "ingest_marketing_attribution",
+    "script_path": "ingest_marketing_attribution.py",
+    "writes_to": [
+      {
+        "target": "ecommerce.raw_marketing_attribution",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "ingest_support_tickets",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "s3://zendesk-exports/tickets/",
+        "type": "s3"
+      }
+    ],
+    "schedule": "hourly",
+    "script_name": "ingest_support_tickets",
+    "script_path": "ingest_support_tickets.py",
+    "writes_to": [
+      {
+        "target": "ecommerce.raw_support_tickets",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [
+      "fact_orders"
+    ],
+    "depends_on_detail": [
+      {
+        "in_place_writer": false,
+        "job_id": "fact_orders",
+        "sources": [
+          "data"
+        ],
+        "via_datasets": [
+          "glue://analytics_warehouse/fact_orders"
+        ]
+      }
+    ],
+    "description": "",
+    "job_id": "mart_cohort_retention",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "analytics_warehouse.dim_customer",
+        "type": "table"
+      },
+      {
+        "target": "analytics_warehouse.fact_orders",
+        "type": "table"
+      }
+    ],
+    "schedule": "daily",
+    "script_name": "mart_cohort_retention",
+    "script_path": "mart_cohort_retention.py",
+    "writes_to": [
+      {
+        "target": "analytics_warehouse.mart_cohort_retention",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [
+      "fact_orders",
+      "fact_refunds"
+    ],
+    "depends_on_detail": [
+      {
+        "in_place_writer": false,
+        "job_id": "fact_orders",
+        "sources": [
+          "data"
+        ],
+        "via_datasets": [
+          "glue://analytics_warehouse/fact_orders"
+        ]
+      },
+      {
+        "in_place_writer": false,
+        "job_id": "fact_refunds",
+        "sources": [
+          "data"
+        ],
+        "via_datasets": [
+          "glue://analytics_warehouse/fact_refunds"
+        ]
+      }
+    ],
+    "description": "",
+    "job_id": "mart_customer_ltv",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "analytics_warehouse.dim_customer",
+        "type": "table"
+      },
+      {
+        "target": "analytics_warehouse.fact_orders",
+        "type": "table"
+      },
+      {
+        "target": "analytics_warehouse.fact_refunds",
+        "type": "table"
+      }
+    ],
+    "schedule": "daily",
+    "script_name": "mart_customer_ltv",
+    "script_path": "mart_customer_ltv.py",
+    "writes_to": [
+      {
+        "target": "analytics_warehouse.mart_customer_lifetime_value",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [
+      "fact_orders",
+      "fact_refunds"
+    ],
+    "depends_on_detail": [
+      {
+        "in_place_writer": false,
+        "job_id": "fact_orders",
+        "sources": [
+          "data"
+        ],
+        "via_datasets": [
+          "glue://analytics_warehouse/fact_orders"
+        ]
+      },
+      {
+        "in_place_writer": false,
+        "job_id": "fact_refunds",
+        "sources": [
+          "data"
+        ],
+        "via_datasets": [
+          "glue://analytics_warehouse/fact_refunds"
+        ]
+      }
+    ],
+    "description": "",
+    "job_id": "mart_daily_revenue",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "analytics_warehouse.fact_orders",
+        "type": "table"
+      },
+      {
+        "target": "analytics_warehouse.fact_refunds",
+        "type": "table"
+      }
+    ],
+    "schedule": "daily",
+    "script_name": "mart_daily_revenue",
+    "script_path": "mart_daily_revenue.py",
+    "writes_to": [
+      {
+        "target": "analytics_warehouse.mart_daily_revenue",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "mart_funnel_conversion",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "analytics_warehouse.fact_sessions",
+        "type": "table"
+      },
+      {
+        "target": "ecommerce.raw_page_views",
+        "type": "table"
+      }
+    ],
+    "schedule": "daily",
+    "script_name": "mart_funnel_conversion",
+    "script_path": "mart_funnel_conversion.py",
+    "writes_to": [
+      {
+        "target": "analytics_warehouse.mart_funnel_conversion",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [
+      "fact_revenue"
+    ],
+    "depends_on_detail": [
+      {
+        "in_place_writer": false,
+        "job_id": "fact_revenue",
+        "sources": [
+          "data"
+        ],
+        "via_datasets": [
+          "glue://analytics_warehouse/fact_revenue"
+        ]
+      }
+    ],
+    "description": "",
+    "job_id": "mart_top_products",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "analytics_warehouse.fact_revenue",
+        "type": "table"
+      }
+    ],
+    "schedule": "daily",
+    "script_name": "mart_top_products",
+    "script_path": "mart_top_products.py",
+    "writes_to": [
+      {
+        "target": "analytics_warehouse.mart_top_products",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "purge_pii_after_retention",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.raw_customers",
+        "type": "table"
+      }
+    ],
+    "schedule": "on-demand (kicked off via the privacy team Jira queue)",
+    "script_name": "purge_pii_after_retention",
+    "script_path": "purge_pii_after_retention.py",
+    "writes_to": [
+      {
+        "target": "ecommerce.raw_customers",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "stage_customers",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.raw_customers",
+        "type": "table"
+      }
+    ],
+    "schedule": "daily",
+    "script_name": "stage_customers",
+    "script_path": "stage_customers.py",
+    "writes_to": [
+      {
+        "target": "ecommerce.staging_customers",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [
+      "ingest_marketing_attribution"
+    ],
+    "depends_on_detail": [
+      {
+        "in_place_writer": false,
+        "job_id": "ingest_marketing_attribution",
+        "sources": [
+          "data"
+        ],
+        "via_datasets": [
+          "glue://ecommerce/raw_marketing_attribution"
+        ]
+      }
+    ],
+    "description": "",
+    "job_id": "stage_marketing_attribution",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.raw_marketing_attribution",
+        "type": "table"
+      }
+    ],
+    "schedule": "hourly",
+    "script_name": "stage_marketing_attribution",
+    "script_path": "stage_marketing_attribution.py",
+    "writes_to": [
+      {
+        "target": "ecommerce.staging_marketing_attribution",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "stage_order_items",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.raw_order_items",
+        "type": "table"
+      }
+    ],
+    "schedule": "hourly",
+    "script_name": "stage_order_items",
+    "script_path": "stage_order_items.py",
+    "writes_to": [
+      {
+        "target": "ecommerce.staging_order_items",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "stage_orders",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "analytics_warehouse.dim_currency",
+        "type": "table"
+      },
+      {
+        "target": "ecommerce.raw_orders",
+        "type": "table"
+      }
+    ],
+    "schedule": "hourly",
+    "script_name": "stage_orders",
+    "script_path": "stage_orders.py",
+    "writes_to": [
+      {
+        "target": "ecommerce.staging_orders",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "stage_payments",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.raw_payments",
+        "type": "table"
+      }
+    ],
+    "schedule": "hourly",
+    "script_name": "stage_payments",
+    "script_path": "stage_payments.py",
+    "writes_to": [
+      {
+        "target": "ecommerce.staging_payments",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "stage_sessions",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.raw_sessions",
+        "type": "table"
+      }
+    ],
+    "schedule": "hourly",
+    "script_name": "stage_sessions",
+    "script_path": "stage_sessions.py",
+    "writes_to": [
+      {
+        "target": "ecommerce.staging_sessions",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [],
+    "depends_on_detail": [],
+    "description": "",
+    "job_id": "stage_shipments",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.raw_shipments",
+        "type": "table"
+      }
+    ],
+    "schedule": "hourly",
+    "script_name": "stage_shipments",
+    "script_path": "stage_shipments.py",
+    "writes_to": [
+      {
+        "target": "ecommerce.staging_shipments",
+        "type": "table"
+      }
+    ]
+  },
+  {
+    "depends_on": [
+      "ingest_support_tickets"
+    ],
+    "depends_on_detail": [
+      {
+        "in_place_writer": false,
+        "job_id": "ingest_support_tickets",
+        "sources": [
+          "data"
+        ],
+        "via_datasets": [
+          "glue://ecommerce/raw_support_tickets"
+        ]
+      }
+    ],
+    "description": "",
+    "job_id": "stage_support_tickets",
+    "language": "pyspark",
+    "reads_from": [
+      {
+        "target": "ecommerce.raw_support_tickets",
+        "type": "table"
+      }
+    ],
+    "schedule": "hourly",
+    "script_name": "stage_support_tickets",
+    "script_path": "stage_support_tickets.py",
+    "writes_to": [
+      {
+        "target": "ecommerce.staging_support_tickets",
+        "type": "table"
+      }
+    ]
+  }
+]

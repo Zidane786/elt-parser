@@ -1,0 +1,29 @@
+[project]
+name = "de-meter-data-product"
+version = "0.1.0"
+description = "smart_metering (meter) data product — PySpark/Glue ETLs, Airflow-orchestrated, Athena medallion layers."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "smart-metering-team", email = "smart-metering-team@utility.example.com" }]
+
+dependencies = [
+    "pyspark>=3.5",
+    "apache-airflow>=2.8",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+delta = [
+    "delta-spark>=3.1",
+]
+
+[tool.uv]
+package = false
+dev-dependencies = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

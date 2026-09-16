@@ -1,0 +1,3611 @@
+{
+  "databases": [
+    {
+      "db_name": "ecommerce",
+      "db_type": "sqlite",
+      "description": "Production e-commerce database (modelled as Postgres in prod). PII columns are tokenised at the MCP boundary. Contains raw OLTP tables (raw_*) and cleaned staging tables (staging_*).",
+      "tables": [
+        {
+          "table_name": "raw_customers",
+          "description": "OLTP customer registry — source of truth for identity. PII tokenised at MCP boundary.",
+          "schema": [
+            {
+              "field_name": "customer_id",
+              "datatype": "bigint",
+              "description": "Primary key",
+              "verify": true
+            },
+            {
+              "field_name": "email",
+              "datatype": "varchar",
+              "description": "Login email",
+              "to_tokenize": true,
+              "verify": true,
+              "pii_tag": "email"
+            },
+            {
+              "field_name": "first_name",
+              "datatype": "varchar",
+              "description": "Given name",
+              "to_tokenize": true,
+              "verify": true,
+              "pii_tag": "name"
+            },
+            {
+              "field_name": "last_name",
+              "datatype": "varchar",
+              "description": "Family name",
+              "to_tokenize": true,
+              "verify": true,
+              "pii_tag": "name"
+            },
+            {
+              "field_name": "phone",
+              "datatype": "varchar",
+              "description": "E.164 phone with country code",
+              "to_tokenize": true,
+              "verify": true,
+              "pii_tag": "phone"
+            },
+            {
+              "field_name": "signup_date",
+              "datatype": "date",
+              "description": "Date the customer registered",
+              "is_partition": true,
+              "verify": true
+            },
+            {
+              "field_name": "country",
+              "datatype": "varchar",
+              "description": "ISO-3166 country code",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "US",
+                "CA",
+                "UK",
+                "DE",
+                "FR",
+                "IN",
+                "BR",
+                "JP",
+                "AU"
+              ]
+            },
+            {
+              "field_name": "tier",
+              "datatype": "varchar",
+              "description": "Pricing tier",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "free",
+                "pro",
+                "enterprise"
+              ]
+            }
+          ]
+        },
+        {
+          "table_name": "raw_orders",
+          "description": "OLTP orders. One row per order placed via the storefront.",
+          "schema": [
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "Primary key",
+              "verify": true
+            },
+            {
+              "field_name": "customer_id",
+              "datatype": "bigint",
+              "description": "FK → raw_customers.customer_id",
+              "verify": true
+            },
+            {
+              "field_name": "order_date",
+              "datatype": "date",
+              "description": "Date the order was placed",
+              "is_partition": true,
+              "verify": true
+            },
+            {
+              "field_name": "status",
+              "datatype": "varchar",
+              "description": "Order lifecycle status",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "pending",
+                "completed",
+                "cancelled",
+                "refunded"
+              ]
+            },
+            {
+              "field_name": "total_cents",
+              "datatype": "bigint",
+              "description": "Order total in cents (in `currency`)",
+              "verify": true
+            },
+            {
+              "field_name": "currency",
+              "datatype": "varchar",
+              "description": "ISO-4217 currency code",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "USD",
+                "EUR",
+                "GBP",
+                "JPY",
+                "INR",
+                "BRL",
+                "CAD",
+                "AUD"
+              ]
+            },
+            {
+              "field_name": "region",
+              "datatype": "varchar",
+              "description": "Business region",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "NA",
+                "EMEA",
+                "APAC",
+                "LATAM"
+              ]
+            }
+          ]
+        },
+        {
+          "table_name": "raw_order_items",
+          "description": "Line items inside each order. Grain = order line.",
+          "schema": [
+            {
+              "field_name": "item_id",
+              "datatype": "bigint",
+              "description": "Primary key",
+              "verify": true
+            },
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "FK → raw_orders.order_id",
+              "verify": true
+            },
+            {
+              "field_name": "product_id",
+              "datatype": "bigint",
+              "description": "FK → raw_products.product_id",
+              "verify": true
+            },
+            {
+              "field_name": "quantity",
+              "datatype": "int",
+              "description": "Units ordered",
+              "verify": true
+            },
+            {
+              "field_name": "unit_price_cents",
+              "datatype": "bigint",
+              "description": "Per-unit price in cents",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "raw_products",
+          "description": "OLTP product catalog — one row per SKU.",
+          "schema": [
+            {
+              "field_name": "product_id",
+              "datatype": "bigint",
+              "description": "Primary key",
+              "verify": true
+            },
+            {
+              "field_name": "sku",
+              "datatype": "varchar",
+              "description": "Stock-keeping unit",
+              "verify": true
+            },
+            {
+              "field_name": "name",
+              "datatype": "varchar",
+              "description": "Display name",
+              "verify": true
+            },
+            {
+              "field_name": "category",
+              "datatype": "varchar",
+              "description": "Product category",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "apparel",
+                "electronics",
+                "home",
+                "beauty",
+                "outdoor",
+                "books",
+                "toys"
+              ]
+            },
+            {
+              "field_name": "list_price_cents",
+              "datatype": "bigint",
+              "description": "List price in cents (USD)",
+              "verify": true
+            },
+            {
+              "field_name": "cost_cents",
+              "datatype": "bigint",
+              "description": "Cost of goods in cents",
+              "verify": true
+            },
+            {
+              "field_name": "supplier_id",
+              "datatype": "bigint",
+              "description": "FK → raw_suppliers.supplier_id",
+              "verify": true
+            },
+            {
+              "field_name": "is_active",
+              "datatype": "int",
+              "description": "1 if currently sellable",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "raw_refunds",
+          "description": "Refund transactions. `deleted_at` is a soft-delete marker — downstream marts must filter it.",
+          "schema": [
+            {
+              "field_name": "refund_id",
+              "datatype": "bigint",
+              "description": "Primary key",
+              "verify": true
+            },
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "FK → raw_orders.order_id",
+              "verify": true
+            },
+            {
+              "field_name": "reason",
+              "datatype": "varchar",
+              "description": "Refund reason code",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "not_as_described",
+                "damaged",
+                "late_delivery",
+                "chargeback",
+                "dispute_won",
+                "duplicate"
+              ]
+            },
+            {
+              "field_name": "amount_cents",
+              "datatype": "bigint",
+              "description": "Refund amount in cents (in order currency)",
+              "verify": true
+            },
+            {
+              "field_name": "refund_date",
+              "datatype": "date",
+              "description": "Date the refund cleared",
+              "is_partition": true,
+              "verify": true
+            },
+            {
+              "field_name": "processed_by",
+              "datatype": "varchar",
+              "description": "Operator user-id (internal)",
+              "to_tokenize": true,
+              "verify": true,
+              "pii_tag": "user"
+            },
+            {
+              "field_name": "deleted_at",
+              "datatype": "timestamp",
+              "description": "Soft-delete marker. NULL → still active.",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "raw_payments",
+          "description": "Payment attempts and captures.",
+          "schema": [
+            {
+              "field_name": "payment_id",
+              "datatype": "bigint",
+              "description": "Primary key",
+              "verify": true
+            },
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "FK → raw_orders.order_id",
+              "verify": true
+            },
+            {
+              "field_name": "method",
+              "datatype": "varchar",
+              "description": "Payment method",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "card",
+                "paypal",
+                "bank_transfer",
+                "apple_pay",
+                "google_pay"
+              ]
+            },
+            {
+              "field_name": "status",
+              "datatype": "varchar",
+              "description": "Capture lifecycle",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "captured",
+                "failed",
+                "pending",
+                "refunded"
+              ]
+            },
+            {
+              "field_name": "amount_cents",
+              "datatype": "bigint",
+              "description": "Captured amount in cents",
+              "verify": true
+            },
+            {
+              "field_name": "processed_at",
+              "datatype": "timestamp",
+              "description": "When the gateway responded",
+              "verify": true
+            },
+            {
+              "field_name": "gateway_response",
+              "datatype": "varchar",
+              "description": "Free-form response message",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "raw_addresses",
+          "description": "Customer shipping/billing addresses.",
+          "schema": [
+            {
+              "field_name": "address_id",
+              "datatype": "bigint",
+              "description": "Primary key",
+              "verify": true
+            },
+            {
+              "field_name": "customer_id",
+              "datatype": "bigint",
+              "description": "FK → raw_customers.customer_id",
+              "verify": true
+            },
+            {
+              "field_name": "line1",
+              "datatype": "varchar",
+              "description": "Street, line 1",
+              "to_tokenize": true,
+              "verify": true,
+              "pii_tag": "address"
+            },
+            {
+              "field_name": "line2",
+              "datatype": "varchar",
+              "description": "Street, line 2 (apt, suite)",
+              "to_tokenize": true,
+              "verify": true,
+              "pii_tag": "address"
+            },
+            {
+              "field_name": "city",
+              "datatype": "varchar",
+              "description": "City",
+              "verify": true
+            },
+            {
+              "field_name": "state",
+              "datatype": "varchar",
+              "description": "State / province",
+              "verify": true
+            },
+            {
+              "field_name": "postal_code",
+              "datatype": "varchar",
+              "description": "ZIP / postal code",
+              "to_tokenize": true,
+              "verify": true,
+              "pii_tag": "postal"
+            },
+            {
+              "field_name": "country",
+              "datatype": "varchar",
+              "description": "ISO-3166 country code",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "US",
+                "CA",
+                "UK",
+                "DE",
+                "FR",
+                "IN",
+                "BR",
+                "JP",
+                "AU"
+              ]
+            }
+          ]
+        },
+        {
+          "table_name": "raw_shipments",
+          "description": "Shipment lifecycle per order.",
+          "schema": [
+            {
+              "field_name": "shipment_id",
+              "datatype": "bigint",
+              "description": "Primary key",
+              "verify": true
+            },
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "FK → raw_orders.order_id",
+              "verify": true
+            },
+            {
+              "field_name": "carrier",
+              "datatype": "varchar",
+              "description": "Shipping carrier",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "UPS",
+                "FedEx",
+                "DHL",
+                "USPS",
+                "Royal Mail"
+              ]
+            },
+            {
+              "field_name": "tracking_number",
+              "datatype": "varchar",
+              "description": "Carrier tracking number",
+              "verify": true
+            },
+            {
+              "field_name": "status",
+              "datatype": "varchar",
+              "description": "Shipment status",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "created",
+                "in_transit",
+                "delivered",
+                "exception",
+                "returned"
+              ]
+            },
+            {
+              "field_name": "shipped_at",
+              "datatype": "timestamp",
+              "description": "When the parcel left the warehouse",
+              "verify": true
+            },
+            {
+              "field_name": "delivered_at",
+              "datatype": "timestamp",
+              "description": "When the parcel was delivered (nullable)",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "raw_marketing_campaigns",
+          "description": "Marketing campaign master.",
+          "schema": [
+            {
+              "field_name": "campaign_id",
+              "datatype": "bigint",
+              "description": "Primary key",
+              "verify": true
+            },
+            {
+              "field_name": "name",
+              "datatype": "varchar",
+              "description": "Campaign display name",
+              "verify": true
+            },
+            {
+              "field_name": "channel",
+              "datatype": "varchar",
+              "description": "Marketing channel",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "paid_search",
+                "paid_social",
+                "email",
+                "organic",
+                "affiliate",
+                "display"
+              ]
+            },
+            {
+              "field_name": "spend_cents",
+              "datatype": "bigint",
+              "description": "Planned budget in cents (USD)",
+              "verify": true
+            },
+            {
+              "field_name": "start_date",
+              "datatype": "date",
+              "description": "Campaign start",
+              "verify": true
+            },
+            {
+              "field_name": "end_date",
+              "datatype": "date",
+              "description": "Campaign end",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "raw_marketing_attribution",
+          "description": "Per-order marketing touchpoints. Multi-touch.",
+          "schema": [
+            {
+              "field_name": "attribution_id",
+              "datatype": "bigint",
+              "description": "Primary key",
+              "verify": true
+            },
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "FK → raw_orders.order_id",
+              "verify": true
+            },
+            {
+              "field_name": "campaign_id",
+              "datatype": "bigint",
+              "description": "FK → raw_marketing_campaigns.campaign_id",
+              "verify": true
+            },
+            {
+              "field_name": "touchpoint_at",
+              "datatype": "timestamp",
+              "description": "When the customer was exposed",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "raw_support_tickets",
+          "description": "Customer-support ticket queue.",
+          "schema": [
+            {
+              "field_name": "ticket_id",
+              "datatype": "bigint",
+              "description": "Primary key",
+              "verify": true
+            },
+            {
+              "field_name": "customer_id",
+              "datatype": "bigint",
+              "description": "FK → raw_customers.customer_id",
+              "verify": true
+            },
+            {
+              "field_name": "subject",
+              "datatype": "varchar",
+              "description": "Subject line (may contain PII)",
+              "to_tokenize": true,
+              "verify": true,
+              "pii_tag": "freeform"
+            },
+            {
+              "field_name": "priority",
+              "datatype": "varchar",
+              "description": "Triage priority",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "low",
+                "medium",
+                "high",
+                "urgent"
+              ]
+            },
+            {
+              "field_name": "status",
+              "datatype": "varchar",
+              "description": "Ticket lifecycle status",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "open",
+                "pending",
+                "resolved",
+                "closed"
+              ]
+            },
+            {
+              "field_name": "opened_at",
+              "datatype": "timestamp",
+              "description": "When the ticket was created",
+              "verify": true
+            },
+            {
+              "field_name": "closed_at",
+              "datatype": "timestamp",
+              "description": "When the ticket was closed (nullable)",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "raw_product_variants",
+          "description": "Product variants (color × size). PARTIALLY VERIFIED — only product_id and variant_id reviewed.",
+          "schema": [
+            {
+              "field_name": "variant_id",
+              "datatype": "bigint",
+              "description": "Primary key",
+              "verify": true
+            },
+            {
+              "field_name": "product_id",
+              "datatype": "bigint",
+              "description": "FK → raw_products.product_id",
+              "verify": true
+            },
+            {
+              "field_name": "color",
+              "datatype": "varchar",
+              "description": "Color name"
+            },
+            {
+              "field_name": "size",
+              "datatype": "varchar",
+              "description": "Size code"
+            },
+            {
+              "field_name": "sku_suffix",
+              "datatype": "varchar",
+              "description": "SKU suffix appended to product SKU"
+            }
+          ]
+        },
+        {
+          "table_name": "raw_sessions",
+          "description": "Web sessions. PARTIALLY VERIFIED — only IDs reviewed; user_agent / ip not yet PII-classified.",
+          "schema": [
+            {
+              "field_name": "session_id",
+              "datatype": "bigint",
+              "description": "Primary key",
+              "verify": true
+            },
+            {
+              "field_name": "customer_id",
+              "datatype": "bigint",
+              "description": "FK → raw_customers.customer_id; NULL if anonymous",
+              "verify": true
+            },
+            {
+              "field_name": "started_at",
+              "datatype": "timestamp",
+              "description": "Session start"
+            },
+            {
+              "field_name": "ended_at",
+              "datatype": "timestamp",
+              "description": "Session end"
+            },
+            {
+              "field_name": "user_agent",
+              "datatype": "varchar",
+              "description": "Raw User-Agent header"
+            },
+            {
+              "field_name": "ip",
+              "datatype": "varchar",
+              "description": "Originating IP (potential PII — not yet classified)"
+            }
+          ]
+        },
+        {
+          "table_name": "raw_page_views",
+          "description": "Page-view events. PARTIALLY VERIFIED.",
+          "schema": [
+            {
+              "field_name": "view_id",
+              "datatype": "bigint",
+              "description": "Primary key",
+              "verify": true
+            },
+            {
+              "field_name": "session_id",
+              "datatype": "bigint",
+              "description": "FK → raw_sessions.session_id",
+              "verify": true
+            },
+            {
+              "field_name": "url",
+              "datatype": "varchar",
+              "description": "Request URL"
+            },
+            {
+              "field_name": "viewed_at",
+              "datatype": "timestamp",
+              "description": "Event timestamp"
+            },
+            {
+              "field_name": "dwell_ms",
+              "datatype": "int",
+              "description": "Time-on-page in milliseconds"
+            }
+          ]
+        },
+        {
+          "table_name": "raw_reviews",
+          "description": "Product reviews. PARTIALLY VERIFIED.",
+          "schema": [
+            {
+              "field_name": "review_id",
+              "datatype": "bigint",
+              "description": "Primary key",
+              "verify": true
+            },
+            {
+              "field_name": "product_id",
+              "datatype": "bigint",
+              "description": "FK → raw_products.product_id",
+              "verify": true
+            },
+            {
+              "field_name": "customer_id",
+              "datatype": "bigint",
+              "description": "FK → raw_customers.customer_id",
+              "verify": true
+            },
+            {
+              "field_name": "rating",
+              "datatype": "int",
+              "description": "1-5 star rating"
+            },
+            {
+              "field_name": "body",
+              "datatype": "varchar",
+              "description": "Free-text review body — may contain PII"
+            },
+            {
+              "field_name": "submitted_at",
+              "datatype": "timestamp",
+              "description": "Submission timestamp"
+            }
+          ]
+        },
+        {
+          "table_name": "raw_suppliers",
+          "description": "Supplier directory. PARTIALLY VERIFIED.",
+          "schema": [
+            {
+              "field_name": "supplier_id",
+              "datatype": "bigint",
+              "description": "Primary key",
+              "verify": true
+            },
+            {
+              "field_name": "name",
+              "datatype": "varchar",
+              "description": "Supplier business name"
+            },
+            {
+              "field_name": "contact_email",
+              "datatype": "varchar",
+              "description": "Supplier contact email"
+            },
+            {
+              "field_name": "country",
+              "datatype": "varchar",
+              "description": "Supplier country",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "US",
+                "CA",
+                "UK",
+                "DE",
+                "FR",
+                "IN",
+                "BR",
+                "JP",
+                "AU"
+              ]
+            },
+            {
+              "field_name": "lead_time_days",
+              "datatype": "int",
+              "description": "Typical lead time"
+            }
+          ]
+        },
+        {
+          "table_name": "staging_customers",
+          "description": "Cleaned customers — lowercased email, concatenated full_name.",
+          "schema": [
+            {
+              "field_name": "customer_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "email_norm",
+              "datatype": "varchar",
+              "description": "Lowercased email",
+              "to_tokenize": true,
+              "verify": true,
+              "pii_tag": "email"
+            },
+            {
+              "field_name": "full_name",
+              "datatype": "varchar",
+              "description": "first + last",
+              "to_tokenize": true,
+              "verify": true,
+              "pii_tag": "name"
+            },
+            {
+              "field_name": "phone",
+              "datatype": "varchar",
+              "description": "Phone",
+              "to_tokenize": true,
+              "verify": true,
+              "pii_tag": "phone"
+            },
+            {
+              "field_name": "signup_date",
+              "datatype": "date",
+              "description": "Signup",
+              "is_partition": true,
+              "verify": true
+            },
+            {
+              "field_name": "country",
+              "datatype": "varchar",
+              "description": "Country code",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "US",
+                "CA",
+                "UK",
+                "DE",
+                "FR",
+                "IN",
+                "BR",
+                "JP",
+                "AU"
+              ]
+            },
+            {
+              "field_name": "tier",
+              "datatype": "varchar",
+              "description": "Pricing tier",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "free",
+                "pro",
+                "enterprise"
+              ]
+            },
+            {
+              "field_name": "is_active",
+              "datatype": "int",
+              "description": "1 if not soft-deleted",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "staging_orders",
+          "description": "USD-converted orders. Source-of-truth for revenue marts.",
+          "schema": [
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "customer_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "order_date",
+              "datatype": "date",
+              "description": "Order date",
+              "is_partition": true,
+              "verify": true
+            },
+            {
+              "field_name": "status",
+              "datatype": "varchar",
+              "description": "Lifecycle",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "pending",
+                "completed",
+                "cancelled",
+                "refunded"
+              ]
+            },
+            {
+              "field_name": "total_usd_cents",
+              "datatype": "bigint",
+              "description": "Total converted to USD cents",
+              "verify": true
+            },
+            {
+              "field_name": "original_currency",
+              "datatype": "varchar",
+              "description": "Source currency",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "USD",
+                "EUR",
+                "GBP",
+                "JPY",
+                "INR",
+                "BRL",
+                "CAD",
+                "AUD"
+              ]
+            },
+            {
+              "field_name": "region",
+              "datatype": "varchar",
+              "description": "Region",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "NA",
+                "EMEA",
+                "APAC",
+                "LATAM"
+              ]
+            }
+          ]
+        },
+        {
+          "table_name": "staging_order_items",
+          "description": "Order line items with derived line_total.",
+          "schema": [
+            {
+              "field_name": "item_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "product_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "quantity",
+              "datatype": "int",
+              "description": "Units",
+              "verify": true
+            },
+            {
+              "field_name": "unit_price_cents",
+              "datatype": "bigint",
+              "description": "Per-unit cents",
+              "verify": true
+            },
+            {
+              "field_name": "line_total_cents",
+              "datatype": "bigint",
+              "description": "quantity × unit_price",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "staging_refunds_with_flags",
+          "description": "Refunds with derived `is_fraud_flagged` heuristic (amount > $500 AND reason in chargeback/dispute_won).",
+          "schema": [
+            {
+              "field_name": "refund_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "reason",
+              "datatype": "varchar",
+              "description": "Reason",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "not_as_described",
+                "damaged",
+                "late_delivery",
+                "chargeback",
+                "dispute_won",
+                "duplicate"
+              ]
+            },
+            {
+              "field_name": "amount_cents",
+              "datatype": "bigint",
+              "description": "Refund cents",
+              "verify": true
+            },
+            {
+              "field_name": "refund_date",
+              "datatype": "date",
+              "description": "Refund date",
+              "is_partition": true,
+              "verify": true
+            },
+            {
+              "field_name": "is_fraud_flagged",
+              "datatype": "int",
+              "description": "1 if heuristic flagged",
+              "verify": true
+            },
+            {
+              "field_name": "deleted_at",
+              "datatype": "timestamp",
+              "description": "Soft-delete marker",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "staging_marketing_attribution",
+          "description": "Deduplicated marketing attribution touchpoints.",
+          "schema": [
+            {
+              "field_name": "attribution_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "campaign_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "touchpoint_at",
+              "datatype": "timestamp",
+              "description": "Touch time",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "staging_payments",
+          "description": "Payment events with derived is_successful flag.",
+          "schema": [
+            {
+              "field_name": "payment_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "method",
+              "datatype": "varchar",
+              "description": "Method",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "card",
+                "paypal",
+                "bank_transfer",
+                "apple_pay",
+                "google_pay"
+              ]
+            },
+            {
+              "field_name": "status",
+              "datatype": "varchar",
+              "description": "Status",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "captured",
+                "failed",
+                "pending",
+                "refunded"
+              ]
+            },
+            {
+              "field_name": "amount_cents",
+              "datatype": "bigint",
+              "description": "Captured cents",
+              "verify": true
+            },
+            {
+              "field_name": "processed_at",
+              "datatype": "timestamp",
+              "description": "Processing time",
+              "verify": true
+            },
+            {
+              "field_name": "is_successful",
+              "datatype": "int",
+              "description": "1 if status=captured",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "staging_shipments",
+          "description": "Shipments with derived transit_days.",
+          "schema": [
+            {
+              "field_name": "shipment_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "carrier",
+              "datatype": "varchar",
+              "description": "Carrier",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "UPS",
+                "FedEx",
+                "DHL",
+                "USPS",
+                "Royal Mail"
+              ]
+            },
+            {
+              "field_name": "status",
+              "datatype": "varchar",
+              "description": "Status",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "created",
+                "in_transit",
+                "delivered",
+                "exception",
+                "returned"
+              ]
+            },
+            {
+              "field_name": "shipped_at",
+              "datatype": "timestamp",
+              "description": "Shipped time",
+              "verify": true
+            },
+            {
+              "field_name": "delivered_at",
+              "datatype": "timestamp",
+              "description": "Delivered time",
+              "verify": true
+            },
+            {
+              "field_name": "transit_days",
+              "datatype": "int",
+              "description": "Derived: delivered - shipped",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "staging_sessions",
+          "description": "Sessions with derived duration_sec / is_authenticated. PARTIALLY VERIFIED.",
+          "schema": [
+            {
+              "field_name": "session_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "customer_id",
+              "datatype": "bigint",
+              "description": "FK (NULL = anon)",
+              "verify": true
+            },
+            {
+              "field_name": "started_at",
+              "datatype": "timestamp",
+              "description": "Start"
+            },
+            {
+              "field_name": "ended_at",
+              "datatype": "timestamp",
+              "description": "End"
+            },
+            {
+              "field_name": "duration_sec",
+              "datatype": "int",
+              "description": "Derived duration"
+            },
+            {
+              "field_name": "is_authenticated",
+              "datatype": "int",
+              "description": "1 if a customer_id is attached"
+            }
+          ]
+        },
+        {
+          "table_name": "staging_support_tickets",
+          "description": "Support tickets with derived resolution_hours.",
+          "schema": [
+            {
+              "field_name": "ticket_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "customer_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "priority",
+              "datatype": "varchar",
+              "description": "Priority",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "low",
+                "medium",
+                "high",
+                "urgent"
+              ]
+            },
+            {
+              "field_name": "status",
+              "datatype": "varchar",
+              "description": "Status",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "open",
+                "pending",
+                "resolved",
+                "closed"
+              ]
+            },
+            {
+              "field_name": "opened_at",
+              "datatype": "timestamp",
+              "description": "Opened time",
+              "verify": true
+            },
+            {
+              "field_name": "closed_at",
+              "datatype": "timestamp",
+              "description": "Closed time (nullable)",
+              "verify": true
+            },
+            {
+              "field_name": "resolution_hours",
+              "datatype": "int",
+              "description": "Derived resolution time in hours",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "staging_product_inventory",
+          "description": "Per-warehouse stock snapshot. UNVERIFIED — defensive tokenization applies.",
+          "schema": [
+            {
+              "field_name": "product_id",
+              "datatype": "bigint",
+              "description": "FK"
+            },
+            {
+              "field_name": "warehouse_id",
+              "datatype": "bigint",
+              "description": "FK"
+            },
+            {
+              "field_name": "on_hand",
+              "datatype": "int",
+              "description": "Units on hand"
+            },
+            {
+              "field_name": "reorder_level",
+              "datatype": "int",
+              "description": "Reorder threshold"
+            },
+            {
+              "field_name": "snapshot_date",
+              "datatype": "date",
+              "description": "Snapshot date",
+              "is_partition": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "db_name": "analytics_warehouse",
+      "db_type": "sqlite",
+      "description": "Analytics warehouse (modelled as Snowflake in prod). dim_*, fact_*, and mart_* tables built by the ETL scripts under ./etl.",
+      "tables": [
+        {
+          "table_name": "dim_customer",
+          "description": "Type-2 SCD customer dimension. One row per (customer × tier-change period).",
+          "schema": [
+            {
+              "field_name": "customer_sk",
+              "datatype": "bigint",
+              "description": "Surrogate key",
+              "verify": true
+            },
+            {
+              "field_name": "customer_id",
+              "datatype": "bigint",
+              "description": "Natural key",
+              "verify": true
+            },
+            {
+              "field_name": "email_norm",
+              "datatype": "varchar",
+              "description": "Lowercased email",
+              "to_tokenize": true,
+              "verify": true,
+              "pii_tag": "email"
+            },
+            {
+              "field_name": "full_name",
+              "datatype": "varchar",
+              "description": "Concatenated full name",
+              "to_tokenize": true,
+              "verify": true,
+              "pii_tag": "name"
+            },
+            {
+              "field_name": "country",
+              "datatype": "varchar",
+              "description": "Country",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "US",
+                "CA",
+                "UK",
+                "DE",
+                "FR",
+                "IN",
+                "BR",
+                "JP",
+                "AU"
+              ]
+            },
+            {
+              "field_name": "tier",
+              "datatype": "varchar",
+              "description": "Tier at the time of this SCD slice",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "free",
+                "pro",
+                "enterprise"
+              ]
+            },
+            {
+              "field_name": "effective_from",
+              "datatype": "timestamp",
+              "description": "SCD2 lower bound",
+              "verify": true
+            },
+            {
+              "field_name": "effective_to",
+              "datatype": "timestamp",
+              "description": "SCD2 upper bound (NULL = current)",
+              "verify": true
+            },
+            {
+              "field_name": "is_current",
+              "datatype": "int",
+              "description": "1 if this row is the current slice",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "dim_product",
+          "description": "Product dimension — denormalised with supplier.",
+          "schema": [
+            {
+              "field_name": "product_sk",
+              "datatype": "bigint",
+              "description": "Surrogate key",
+              "verify": true
+            },
+            {
+              "field_name": "product_id",
+              "datatype": "bigint",
+              "description": "Natural key",
+              "verify": true
+            },
+            {
+              "field_name": "sku",
+              "datatype": "varchar",
+              "description": "SKU",
+              "verify": true
+            },
+            {
+              "field_name": "name",
+              "datatype": "varchar",
+              "description": "Display name",
+              "verify": true
+            },
+            {
+              "field_name": "category",
+              "datatype": "varchar",
+              "description": "Category",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "apparel",
+                "electronics",
+                "home",
+                "beauty",
+                "outdoor",
+                "books",
+                "toys"
+              ]
+            },
+            {
+              "field_name": "list_price_cents",
+              "datatype": "bigint",
+              "description": "List price",
+              "verify": true
+            },
+            {
+              "field_name": "supplier_name",
+              "datatype": "varchar",
+              "description": "Supplier business name",
+              "verify": true
+            },
+            {
+              "field_name": "is_active",
+              "datatype": "int",
+              "description": "1 if sellable",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "dim_date",
+          "description": "Calendar dimension. Date keys are YYYYMMDD integers.",
+          "schema": [
+            {
+              "field_name": "date_key",
+              "datatype": "int",
+              "description": "YYYYMMDD integer",
+              "verify": true
+            },
+            {
+              "field_name": "full_date",
+              "datatype": "date",
+              "description": "Calendar date",
+              "verify": true
+            },
+            {
+              "field_name": "year",
+              "datatype": "int",
+              "description": "Calendar year",
+              "verify": true
+            },
+            {
+              "field_name": "quarter",
+              "datatype": "int",
+              "description": "1-4",
+              "verify": true
+            },
+            {
+              "field_name": "month",
+              "datatype": "int",
+              "description": "1-12",
+              "verify": true
+            },
+            {
+              "field_name": "day",
+              "datatype": "int",
+              "description": "1-31",
+              "verify": true
+            },
+            {
+              "field_name": "day_of_week",
+              "datatype": "int",
+              "description": "0=Mon … 6=Sun",
+              "verify": true
+            },
+            {
+              "field_name": "is_weekend",
+              "datatype": "int",
+              "description": "1 if Sat/Sun",
+              "verify": true
+            },
+            {
+              "field_name": "iso_week",
+              "datatype": "int",
+              "description": "ISO-8601 week number",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "dim_campaign",
+          "description": "Marketing campaign dimension.",
+          "schema": [
+            {
+              "field_name": "campaign_sk",
+              "datatype": "bigint",
+              "description": "Surrogate key",
+              "verify": true
+            },
+            {
+              "field_name": "campaign_id",
+              "datatype": "bigint",
+              "description": "Natural key",
+              "verify": true
+            },
+            {
+              "field_name": "name",
+              "datatype": "varchar",
+              "description": "Campaign name",
+              "verify": true
+            },
+            {
+              "field_name": "channel",
+              "datatype": "varchar",
+              "description": "Channel",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "paid_search",
+                "paid_social",
+                "email",
+                "organic",
+                "affiliate",
+                "display"
+              ]
+            },
+            {
+              "field_name": "spend_cents",
+              "datatype": "bigint",
+              "description": "Total spend in USD cents",
+              "verify": true
+            },
+            {
+              "field_name": "start_date",
+              "datatype": "date",
+              "description": "Campaign start",
+              "verify": true
+            },
+            {
+              "field_name": "end_date",
+              "datatype": "date",
+              "description": "Campaign end",
+              "verify": true
+            },
+            {
+              "field_name": "is_active",
+              "datatype": "int",
+              "description": "1 if today ∈ [start, end]",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "dim_supplier",
+          "description": "Supplier dimension.",
+          "schema": [
+            {
+              "field_name": "supplier_sk",
+              "datatype": "bigint",
+              "description": "Surrogate key",
+              "verify": true
+            },
+            {
+              "field_name": "supplier_id",
+              "datatype": "bigint",
+              "description": "Natural key",
+              "verify": true
+            },
+            {
+              "field_name": "name",
+              "datatype": "varchar",
+              "description": "Business name",
+              "verify": true
+            },
+            {
+              "field_name": "country",
+              "datatype": "varchar",
+              "description": "Country",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "US",
+                "CA",
+                "UK",
+                "DE",
+                "FR",
+                "IN",
+                "BR",
+                "JP",
+                "AU"
+              ]
+            },
+            {
+              "field_name": "lead_time_days",
+              "datatype": "int",
+              "description": "Typical lead time",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "dim_geo",
+          "description": "Country / region / continent lookup.",
+          "schema": [
+            {
+              "field_name": "geo_key",
+              "datatype": "int",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "country_code",
+              "datatype": "varchar",
+              "description": "ISO-3166-1 alpha-2",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "US",
+                "CA",
+                "UK",
+                "DE",
+                "FR",
+                "IN",
+                "BR",
+                "JP",
+                "AU"
+              ]
+            },
+            {
+              "field_name": "country_name",
+              "datatype": "varchar",
+              "description": "Country name",
+              "verify": true
+            },
+            {
+              "field_name": "region",
+              "datatype": "varchar",
+              "description": "Business region",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "NA",
+                "EMEA",
+                "APAC",
+                "LATAM"
+              ]
+            },
+            {
+              "field_name": "continent",
+              "datatype": "varchar",
+              "description": "Continent",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "North America",
+                "South America",
+                "Europe",
+                "Asia",
+                "Africa",
+                "Oceania"
+              ]
+            }
+          ]
+        },
+        {
+          "table_name": "dim_warehouse",
+          "description": "Fulfillment warehouse dimension. PARTIALLY VERIFIED.",
+          "schema": [
+            {
+              "field_name": "warehouse_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "name",
+              "datatype": "varchar",
+              "description": "Warehouse display name"
+            },
+            {
+              "field_name": "country",
+              "datatype": "varchar",
+              "description": "Country",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "US",
+                "CA",
+                "UK",
+                "DE",
+                "FR",
+                "IN",
+                "BR",
+                "JP",
+                "AU"
+              ]
+            },
+            {
+              "field_name": "region",
+              "datatype": "varchar",
+              "description": "Region",
+              "is_categorical": true,
+              "categorical_values": [
+                "NA",
+                "EMEA",
+                "APAC",
+                "LATAM"
+              ]
+            },
+            {
+              "field_name": "capacity_units",
+              "datatype": "int",
+              "description": "Storage capacity"
+            }
+          ]
+        },
+        {
+          "table_name": "dim_currency",
+          "description": "Currency lookup with USD FX rate. PARTIALLY VERIFIED.",
+          "schema": [
+            {
+              "field_name": "currency_code",
+              "datatype": "varchar",
+              "description": "ISO-4217 code",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "USD",
+                "EUR",
+                "GBP",
+                "JPY",
+                "INR",
+                "BRL",
+                "CAD",
+                "AUD"
+              ]
+            },
+            {
+              "field_name": "name",
+              "datatype": "varchar",
+              "description": "Display name"
+            },
+            {
+              "field_name": "usd_fx_rate",
+              "datatype": "double",
+              "description": "Rate to USD"
+            }
+          ]
+        },
+        {
+          "table_name": "dim_payment_method",
+          "description": "Payment-method lookup (UNVERIFIED — pending PII review).",
+          "schema": [
+            {
+              "field_name": "method_key",
+              "datatype": "int",
+              "description": "PK"
+            },
+            {
+              "field_name": "method_name",
+              "datatype": "varchar",
+              "description": "Method display name"
+            },
+            {
+              "field_name": "processor",
+              "datatype": "varchar",
+              "description": "Payment processor name"
+            },
+            {
+              "field_name": "supports_refund",
+              "datatype": "int",
+              "description": "1 if refunds supported"
+            }
+          ]
+        },
+        {
+          "table_name": "dim_channel",
+          "description": "Channel lookup. UNVERIFIED.",
+          "schema": [
+            {
+              "field_name": "channel_key",
+              "datatype": "int",
+              "description": "PK"
+            },
+            {
+              "field_name": "channel_name",
+              "datatype": "varchar",
+              "description": "Channel name"
+            },
+            {
+              "field_name": "family",
+              "datatype": "varchar",
+              "description": "Family bucket"
+            },
+            {
+              "field_name": "is_paid",
+              "datatype": "int",
+              "description": "1 if paid channel"
+            }
+          ]
+        },
+        {
+          "table_name": "fact_orders",
+          "description": "Fact table — grain = order. USD-converted totals.",
+          "schema": [
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "customer_id",
+              "datatype": "bigint",
+              "description": "FK → dim_customer",
+              "verify": true
+            },
+            {
+              "field_name": "order_date",
+              "datatype": "date",
+              "description": "Order date",
+              "is_partition": true,
+              "verify": true
+            },
+            {
+              "field_name": "status",
+              "datatype": "varchar",
+              "description": "Order status",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "pending",
+                "completed",
+                "cancelled",
+                "refunded"
+              ]
+            },
+            {
+              "field_name": "total_usd_cents",
+              "datatype": "bigint",
+              "description": "Total in USD cents",
+              "verify": true
+            },
+            {
+              "field_name": "region",
+              "datatype": "varchar",
+              "description": "Region",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "NA",
+                "EMEA",
+                "APAC",
+                "LATAM"
+              ]
+            },
+            {
+              "field_name": "currency",
+              "datatype": "varchar",
+              "description": "Original currency",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "USD",
+                "EUR",
+                "GBP",
+                "JPY",
+                "INR",
+                "BRL",
+                "CAD",
+                "AUD"
+              ]
+            }
+          ]
+        },
+        {
+          "table_name": "fact_revenue",
+          "description": "Fact table — grain = order line. Used as the source of truth for revenue.",
+          "schema": [
+            {
+              "field_name": "revenue_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "product_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "order_date",
+              "datatype": "date",
+              "description": "Order date",
+              "is_partition": true,
+              "verify": true
+            },
+            {
+              "field_name": "quantity",
+              "datatype": "int",
+              "description": "Units",
+              "verify": true
+            },
+            {
+              "field_name": "line_total_usd_cents",
+              "datatype": "bigint",
+              "description": "Line revenue in USD cents",
+              "verify": true
+            },
+            {
+              "field_name": "region",
+              "datatype": "varchar",
+              "description": "Region",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "NA",
+                "EMEA",
+                "APAC",
+                "LATAM"
+              ]
+            },
+            {
+              "field_name": "iso_week",
+              "datatype": "int",
+              "description": "ISO week of order_date",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "fact_refunds",
+          "description": "Fact table — grain = refund. NOTE: built BEFORE the soft-delete filter was introduced; downstream marts must dedup against raw_refunds.deleted_at.",
+          "schema": [
+            {
+              "field_name": "refund_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "refund_date",
+              "datatype": "date",
+              "description": "Refund date",
+              "is_partition": true,
+              "verify": true
+            },
+            {
+              "field_name": "reason",
+              "datatype": "varchar",
+              "description": "Reason",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "not_as_described",
+                "damaged",
+                "late_delivery",
+                "chargeback",
+                "dispute_won",
+                "duplicate"
+              ]
+            },
+            {
+              "field_name": "amount_usd_cents",
+              "datatype": "bigint",
+              "description": "USD-converted amount",
+              "verify": true
+            },
+            {
+              "field_name": "is_fraud_flagged",
+              "datatype": "int",
+              "description": "Derived fraud flag",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "fact_marketing_spend",
+          "description": "Fact — grain = campaign × day.",
+          "schema": [
+            {
+              "field_name": "spend_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "campaign_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "spend_date",
+              "datatype": "date",
+              "description": "Spend date",
+              "is_partition": true,
+              "verify": true
+            },
+            {
+              "field_name": "channel",
+              "datatype": "varchar",
+              "description": "Channel",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "paid_search",
+                "paid_social",
+                "email",
+                "organic",
+                "affiliate",
+                "display"
+              ]
+            },
+            {
+              "field_name": "spend_usd_cents",
+              "datatype": "bigint",
+              "description": "USD spend in cents",
+              "verify": true
+            },
+            {
+              "field_name": "impressions",
+              "datatype": "bigint",
+              "description": "Ad impressions",
+              "verify": true
+            },
+            {
+              "field_name": "clicks",
+              "datatype": "bigint",
+              "description": "Ad clicks",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "fact_inventory",
+          "description": "Fact — grain = product × warehouse × snapshot day.",
+          "schema": [
+            {
+              "field_name": "snapshot_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "product_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "warehouse_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "snapshot_date",
+              "datatype": "date",
+              "description": "Snapshot date",
+              "is_partition": true,
+              "verify": true
+            },
+            {
+              "field_name": "on_hand",
+              "datatype": "int",
+              "description": "Units physically present",
+              "verify": true
+            },
+            {
+              "field_name": "allocated",
+              "datatype": "int",
+              "description": "Units reserved for open orders",
+              "verify": true
+            },
+            {
+              "field_name": "available",
+              "datatype": "int",
+              "description": "on_hand - allocated",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "fact_payments",
+          "description": "Fact — grain = payment attempt.",
+          "schema": [
+            {
+              "field_name": "payment_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "method",
+              "datatype": "varchar",
+              "description": "Method",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "card",
+                "paypal",
+                "bank_transfer",
+                "apple_pay",
+                "google_pay"
+              ]
+            },
+            {
+              "field_name": "amount_usd_cents",
+              "datatype": "bigint",
+              "description": "USD cents",
+              "verify": true
+            },
+            {
+              "field_name": "processed_at",
+              "datatype": "timestamp",
+              "description": "Processed time",
+              "verify": true
+            },
+            {
+              "field_name": "status",
+              "datatype": "varchar",
+              "description": "Status",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "captured",
+                "failed",
+                "pending",
+                "refunded"
+              ]
+            }
+          ]
+        },
+        {
+          "table_name": "fact_shipments",
+          "description": "Fact — grain = shipment.",
+          "schema": [
+            {
+              "field_name": "shipment_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "shipped_date",
+              "datatype": "timestamp",
+              "description": "Shipped time",
+              "verify": true
+            },
+            {
+              "field_name": "delivered_date",
+              "datatype": "timestamp",
+              "description": "Delivered time",
+              "verify": true
+            },
+            {
+              "field_name": "carrier",
+              "datatype": "varchar",
+              "description": "Carrier",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "UPS",
+                "FedEx",
+                "DHL",
+                "USPS",
+                "Royal Mail"
+              ]
+            },
+            {
+              "field_name": "transit_days",
+              "datatype": "int",
+              "description": "Derived transit days",
+              "verify": true
+            },
+            {
+              "field_name": "status",
+              "datatype": "varchar",
+              "description": "Status",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "created",
+                "in_transit",
+                "delivered",
+                "exception",
+                "returned"
+              ]
+            }
+          ]
+        },
+        {
+          "table_name": "fact_sessions",
+          "description": "Fact — grain = session. PARTIALLY VERIFIED.",
+          "schema": [
+            {
+              "field_name": "session_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "customer_id",
+              "datatype": "bigint",
+              "description": "FK (NULL = anon)",
+              "verify": true
+            },
+            {
+              "field_name": "session_date",
+              "datatype": "date",
+              "description": "Session date",
+              "is_partition": true
+            },
+            {
+              "field_name": "duration_sec",
+              "datatype": "int",
+              "description": "Seconds"
+            },
+            {
+              "field_name": "page_view_count",
+              "datatype": "int",
+              "description": "Page views in session"
+            },
+            {
+              "field_name": "converted",
+              "datatype": "int",
+              "description": "1 if a purchase occurred in the session"
+            }
+          ]
+        },
+        {
+          "table_name": "fact_support_tickets",
+          "description": "Fact — grain = ticket.",
+          "schema": [
+            {
+              "field_name": "ticket_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "customer_id",
+              "datatype": "bigint",
+              "description": "FK",
+              "verify": true
+            },
+            {
+              "field_name": "opened_date",
+              "datatype": "date",
+              "description": "Open date",
+              "is_partition": true,
+              "verify": true
+            },
+            {
+              "field_name": "priority",
+              "datatype": "varchar",
+              "description": "Priority",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "low",
+                "medium",
+                "high",
+                "urgent"
+              ]
+            },
+            {
+              "field_name": "status",
+              "datatype": "varchar",
+              "description": "Status",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "open",
+                "pending",
+                "resolved",
+                "closed"
+              ]
+            },
+            {
+              "field_name": "resolution_hours",
+              "datatype": "int",
+              "description": "Resolution hours",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "fact_reviews",
+          "description": "Fact — grain = review. UNVERIFIED.",
+          "schema": [
+            {
+              "field_name": "review_id",
+              "datatype": "bigint",
+              "description": "PK"
+            },
+            {
+              "field_name": "product_id",
+              "datatype": "bigint",
+              "description": "FK"
+            },
+            {
+              "field_name": "customer_id",
+              "datatype": "bigint",
+              "description": "FK"
+            },
+            {
+              "field_name": "rating",
+              "datatype": "int",
+              "description": "1-5"
+            },
+            {
+              "field_name": "submitted_date",
+              "datatype": "date",
+              "description": "Submission date"
+            },
+            {
+              "field_name": "body_length",
+              "datatype": "int",
+              "description": "Length of free-text body"
+            }
+          ]
+        },
+        {
+          "table_name": "mart_customer_lifetime_value",
+          "description": "Customer LTV mart. Computed from fact_orders and fact_refunds.",
+          "schema": [
+            {
+              "field_name": "customer_id",
+              "datatype": "bigint",
+              "description": "PK",
+              "verify": true
+            },
+            {
+              "field_name": "first_order_date",
+              "datatype": "date",
+              "description": "First order",
+              "verify": true
+            },
+            {
+              "field_name": "last_order_date",
+              "datatype": "date",
+              "description": "Most recent order",
+              "verify": true
+            },
+            {
+              "field_name": "order_count",
+              "datatype": "int",
+              "description": "Lifetime order count",
+              "verify": true
+            },
+            {
+              "field_name": "gross_revenue_usd_cents",
+              "datatype": "bigint",
+              "description": "Gross revenue",
+              "verify": true
+            },
+            {
+              "field_name": "refund_amount_usd_cents",
+              "datatype": "bigint",
+              "description": "Refunded amount",
+              "verify": true
+            },
+            {
+              "field_name": "net_ltv_usd_cents",
+              "datatype": "bigint",
+              "description": "Gross − refunds",
+              "verify": true
+            },
+            {
+              "field_name": "tier",
+              "datatype": "varchar",
+              "description": "Current customer tier",
+              "verify": true,
+              "is_categorical": true,
+              "categorical_values": [
+                "free",
+                "pro",
+                "enterprise"
+              ]
+            }
+          ]
+        },
+        {
+          "table_name": "mart_cohort_retention",
+          "description": "Monthly signup cohorts × months-since-signup retention.",
+          "schema": [
+            {
+              "field_name": "signup_month",
+              "datatype": "varchar",
+              "description": "YYYY-MM cohort label",
+              "verify": true
+            },
+            {
+              "field_name": "months_since_signup",
+              "datatype": "int",
+              "description": "0-11 months after cohort start",
+              "verify": true
+            },
+            {
+              "field_name": "cohort_size",
+              "datatype": "int",
+              "description": "Customers in the cohort",
+              "verify": true
+            },
+            {
+              "field_name": "retained",
+              "datatype": "int",
+              "description": "Customers still active in that month",
+              "verify": true
+            },
+            {
+              "field_name": "retention_rate",
+              "datatype": "double",
+              "description": "retained / cohort_size",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "mart_daily_revenue",
+          "description": "Per-day revenue summary.",
+          "schema": [
+            {
+              "field_name": "revenue_date",
+              "datatype": "date",
+              "description": "Calendar date",
+              "is_partition": true,
+              "verify": true
+            },
+            {
+              "field_name": "order_count",
+              "datatype": "int",
+              "description": "Orders that day",
+              "verify": true
+            },
+            {
+              "field_name": "gross_revenue_usd_cents",
+              "datatype": "bigint",
+              "description": "Gross USD cents",
+              "verify": true
+            },
+            {
+              "field_name": "refund_amount_usd_cents",
+              "datatype": "bigint",
+              "description": "Refunds USD cents",
+              "verify": true
+            },
+            {
+              "field_name": "net_revenue_usd_cents",
+              "datatype": "bigint",
+              "description": "Gross − refunds",
+              "verify": true
+            }
+          ]
+        },
+        {
+          "table_name": "mart_funnel_conversion",
+          "description": "Daily funnel: visit → product_view → add_to_cart → checkout_start → purchase. UNVERIFIED.",
+          "schema": [
+            {
+              "field_name": "funnel_date",
+              "datatype": "date",
+              "description": "Calendar date"
+            },
+            {
+              "field_name": "step",
+              "datatype": "varchar",
+              "description": "Funnel step",
+              "is_categorical": true,
+              "categorical_values": [
+                "visit",
+                "product_view",
+                "add_to_cart",
+                "checkout_start",
+                "purchase"
+              ]
+            },
+            {
+              "field_name": "step_order",
+              "datatype": "int",
+              "description": "Ordinal 1-5"
+            },
+            {
+              "field_name": "users_entered",
+              "datatype": "int",
+              "description": "Users at this step"
+            },
+            {
+              "field_name": "users_completed",
+              "datatype": "int",
+              "description": "Users continuing to next step"
+            },
+            {
+              "field_name": "conversion_rate",
+              "datatype": "double",
+              "description": "completed / entered"
+            }
+          ]
+        },
+        {
+          "table_name": "mart_top_products",
+          "description": "Top-N products per calendar month. UNVERIFIED.",
+          "schema": [
+            {
+              "field_name": "product_id",
+              "datatype": "bigint",
+              "description": "FK"
+            },
+            {
+              "field_name": "period_start",
+              "datatype": "date",
+              "description": "Month start"
+            },
+            {
+              "field_name": "period_end",
+              "datatype": "date",
+              "description": "Month end"
+            },
+            {
+              "field_name": "quantity_sold",
+              "datatype": "int",
+              "description": "Units"
+            },
+            {
+              "field_name": "gross_revenue_usd_cents",
+              "datatype": "bigint",
+              "description": "Gross USD cents"
+            },
+            {
+              "field_name": "rank",
+              "datatype": "int",
+              "description": "1 = best-seller in period"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "description": "Test bed for the duke-agent CLI. E-commerce SaaS schema with 51 SQLite tables,\n~30 ETL scripts, and a mix of tokenisation modes per duke_agent_cli.md §12.x.\n\nTokenisation-mode mix:\n  - FULLY VERIFIED (mode B precise) — every column has verify=true; only true\n    PII columns also have to_tokenize=true:\n      raw_customers, raw_orders, raw_order_items, raw_products, raw_refunds,\n      raw_payments, raw_addresses, raw_shipments, raw_marketing_campaigns,\n      raw_marketing_attribution, raw_support_tickets,\n      staging_customers, staging_orders, staging_order_items,\n      staging_refunds_with_flags, staging_marketing_attribution,\n      staging_payments, staging_shipments, staging_support_tickets,\n      dim_customer, dim_product, dim_date, dim_campaign, dim_supplier, dim_geo,\n      fact_orders, fact_revenue, fact_refunds, fact_marketing_spend,\n      fact_inventory, fact_payments, fact_shipments, fact_support_tickets,\n      mart_customer_lifetime_value, mart_cohort_retention, mart_daily_revenue.\n\n  - PARTIALLY VERIFIED (mode B because at least one column is verified, but\n    most columns are unflagged — the table is \"escalated\" so the text-type\n    fallback is dropped):\n      raw_product_variants, raw_sessions, raw_page_views, raw_reviews,\n      raw_suppliers, staging_sessions, dim_warehouse, dim_currency,\n      fact_sessions.\n\n  - UNVERIFIED (mode A — defensive tokenize-all-VARCHARs):\n      staging_product_inventory, dim_payment_method, dim_channel, fact_reviews,\n      mart_funnel_conversion, mart_top_products.",
+  "relations": [
+    {
+      "from_table": "ecommerce.raw_orders",
+      "from_column": "customer_id",
+      "to_table": "ecommerce.raw_customers",
+      "to_column": "customer_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.raw_order_items",
+      "from_column": "order_id",
+      "to_table": "ecommerce.raw_orders",
+      "to_column": "order_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.raw_order_items",
+      "from_column": "product_id",
+      "to_table": "ecommerce.raw_products",
+      "to_column": "product_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.raw_products",
+      "from_column": "supplier_id",
+      "to_table": "ecommerce.raw_suppliers",
+      "to_column": "supplier_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.raw_product_variants",
+      "from_column": "product_id",
+      "to_table": "ecommerce.raw_products",
+      "to_column": "product_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.raw_refunds",
+      "from_column": "order_id",
+      "to_table": "ecommerce.raw_orders",
+      "to_column": "order_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.raw_payments",
+      "from_column": "order_id",
+      "to_table": "ecommerce.raw_orders",
+      "to_column": "order_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.raw_addresses",
+      "from_column": "customer_id",
+      "to_table": "ecommerce.raw_customers",
+      "to_column": "customer_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.raw_shipments",
+      "from_column": "order_id",
+      "to_table": "ecommerce.raw_orders",
+      "to_column": "order_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.raw_marketing_attribution",
+      "from_column": "order_id",
+      "to_table": "ecommerce.raw_orders",
+      "to_column": "order_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.raw_marketing_attribution",
+      "from_column": "campaign_id",
+      "to_table": "ecommerce.raw_marketing_campaigns",
+      "to_column": "campaign_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.raw_sessions",
+      "from_column": "customer_id",
+      "to_table": "ecommerce.raw_customers",
+      "to_column": "customer_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.raw_page_views",
+      "from_column": "session_id",
+      "to_table": "ecommerce.raw_sessions",
+      "to_column": "session_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.raw_support_tickets",
+      "from_column": "customer_id",
+      "to_table": "ecommerce.raw_customers",
+      "to_column": "customer_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.raw_reviews",
+      "from_column": "product_id",
+      "to_table": "ecommerce.raw_products",
+      "to_column": "product_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.raw_reviews",
+      "from_column": "customer_id",
+      "to_table": "ecommerce.raw_customers",
+      "to_column": "customer_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.staging_customers",
+      "from_column": "customer_id",
+      "to_table": "ecommerce.raw_customers",
+      "to_column": "customer_id",
+      "relation_type": "one_to_one"
+    },
+    {
+      "from_table": "ecommerce.staging_orders",
+      "from_column": "order_id",
+      "to_table": "ecommerce.raw_orders",
+      "to_column": "order_id",
+      "relation_type": "one_to_one"
+    },
+    {
+      "from_table": "ecommerce.staging_orders",
+      "from_column": "customer_id",
+      "to_table": "ecommerce.raw_customers",
+      "to_column": "customer_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.staging_order_items",
+      "from_column": "order_id",
+      "to_table": "ecommerce.staging_orders",
+      "to_column": "order_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.staging_refunds_with_flags",
+      "from_column": "order_id",
+      "to_table": "ecommerce.staging_orders",
+      "to_column": "order_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.staging_marketing_attribution",
+      "from_column": "order_id",
+      "to_table": "ecommerce.staging_orders",
+      "to_column": "order_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.staging_marketing_attribution",
+      "from_column": "campaign_id",
+      "to_table": "ecommerce.raw_marketing_campaigns",
+      "to_column": "campaign_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.staging_payments",
+      "from_column": "order_id",
+      "to_table": "ecommerce.staging_orders",
+      "to_column": "order_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.staging_shipments",
+      "from_column": "order_id",
+      "to_table": "ecommerce.staging_orders",
+      "to_column": "order_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.staging_sessions",
+      "from_column": "customer_id",
+      "to_table": "ecommerce.raw_customers",
+      "to_column": "customer_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.staging_support_tickets",
+      "from_column": "customer_id",
+      "to_table": "ecommerce.raw_customers",
+      "to_column": "customer_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "ecommerce.staging_product_inventory",
+      "from_column": "product_id",
+      "to_table": "ecommerce.raw_products",
+      "to_column": "product_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.dim_customer",
+      "from_column": "customer_id",
+      "to_table": "ecommerce.staging_customers",
+      "to_column": "customer_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.dim_product",
+      "from_column": "product_id",
+      "to_table": "ecommerce.staging_orders",
+      "to_column": "order_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.dim_campaign",
+      "from_column": "campaign_id",
+      "to_table": "ecommerce.raw_marketing_campaigns",
+      "to_column": "campaign_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.dim_supplier",
+      "from_column": "supplier_id",
+      "to_table": "ecommerce.raw_suppliers",
+      "to_column": "supplier_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.fact_orders",
+      "from_column": "customer_id",
+      "to_table": "analytics_warehouse.dim_customer",
+      "to_column": "customer_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.fact_revenue",
+      "from_column": "order_id",
+      "to_table": "analytics_warehouse.fact_orders",
+      "to_column": "order_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.fact_revenue",
+      "from_column": "product_id",
+      "to_table": "analytics_warehouse.dim_product",
+      "to_column": "product_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.fact_refunds",
+      "from_column": "order_id",
+      "to_table": "analytics_warehouse.fact_orders",
+      "to_column": "order_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.fact_marketing_spend",
+      "from_column": "campaign_id",
+      "to_table": "analytics_warehouse.dim_campaign",
+      "to_column": "campaign_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.fact_inventory",
+      "from_column": "product_id",
+      "to_table": "analytics_warehouse.dim_product",
+      "to_column": "product_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.fact_inventory",
+      "from_column": "warehouse_id",
+      "to_table": "analytics_warehouse.dim_warehouse",
+      "to_column": "warehouse_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.fact_payments",
+      "from_column": "order_id",
+      "to_table": "analytics_warehouse.fact_orders",
+      "to_column": "order_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.fact_shipments",
+      "from_column": "order_id",
+      "to_table": "analytics_warehouse.fact_orders",
+      "to_column": "order_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.fact_sessions",
+      "from_column": "customer_id",
+      "to_table": "analytics_warehouse.dim_customer",
+      "to_column": "customer_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.fact_support_tickets",
+      "from_column": "customer_id",
+      "to_table": "analytics_warehouse.dim_customer",
+      "to_column": "customer_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.fact_reviews",
+      "from_column": "product_id",
+      "to_table": "analytics_warehouse.dim_product",
+      "to_column": "product_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.fact_reviews",
+      "from_column": "customer_id",
+      "to_table": "analytics_warehouse.dim_customer",
+      "to_column": "customer_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.mart_customer_lifetime_value",
+      "from_column": "customer_id",
+      "to_table": "analytics_warehouse.dim_customer",
+      "to_column": "customer_id",
+      "relation_type": "many_to_one"
+    },
+    {
+      "from_table": "analytics_warehouse.mart_top_products",
+      "from_column": "product_id",
+      "to_table": "analytics_warehouse.dim_product",
+      "to_column": "product_id",
+      "relation_type": "many_to_one"
+    }
+  ],
+  "scripts": [
+    {
+      "script_name": "stage_customers",
+      "script_path": "etl/stage_customers.py",
+      "description": "Lowercase email, concat full name, derive is_active.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_customers"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "ecommerce.staging_customers"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "stage_orders",
+      "script_path": "etl/stage_orders.py",
+      "description": "Convert order totals to USD via dim_currency.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_orders"
+        },
+        {
+          "type": "table",
+          "target": "analytics_warehouse.dim_currency"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "ecommerce.staging_orders"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "stage_order_items",
+      "script_path": "etl/stage_order_items.py",
+      "description": "Compute line_total = quantity × unit_price.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_order_items"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "ecommerce.staging_order_items"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "derive_refund_fraud_flag",
+      "script_path": "etl/derive_refund_fraud_flag.py",
+      "description": "Tag refunds where amount > $500 AND reason in (chargeback, dispute_won).",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_refunds"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "ecommerce.staging_refunds_with_flags"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "stage_marketing_attribution",
+      "script_path": "etl/stage_marketing_attribution.py",
+      "description": "Dedup attribution touchpoints on (order_id, campaign_id).",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_marketing_attribution"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "ecommerce.staging_marketing_attribution"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "stage_payments",
+      "script_path": "etl/stage_payments.py",
+      "description": "Derive is_successful boolean from status.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_payments"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "ecommerce.staging_payments"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "stage_shipments",
+      "script_path": "etl/stage_shipments.py",
+      "description": "Compute transit_days = delivered_at - shipped_at.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_shipments"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "ecommerce.staging_shipments"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "stage_sessions",
+      "script_path": "etl/stage_sessions.py",
+      "description": "Compute duration_sec and is_authenticated.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_sessions"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "ecommerce.staging_sessions"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "stage_support_tickets",
+      "script_path": "etl/stage_support_tickets.py",
+      "description": "Compute resolution_hours = closed_at - opened_at.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_support_tickets"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "ecommerce.staging_support_tickets"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "dim_customer_scd2",
+      "script_path": "etl/dim_customer_scd2.py",
+      "description": "Build the SCD-2 customer dimension.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.staging_customers"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.dim_customer"
+        }
+      ],
+      "depends_on": [
+        "stage_customers"
+      ]
+    },
+    {
+      "script_name": "dim_product",
+      "script_path": "etl/dim_product.py",
+      "description": "Denormalise products with supplier and variant info.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_products"
+        },
+        {
+          "type": "table",
+          "target": "ecommerce.raw_suppliers"
+        },
+        {
+          "type": "table",
+          "target": "ecommerce.raw_product_variants"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.dim_product"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "dim_date",
+      "script_path": "etl/dim_date.py",
+      "description": "Generate the calendar dimension for 2024-2026.",
+      "language": "pyspark",
+      "schedule": "on-demand",
+      "reads_from": [],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.dim_date"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "dim_campaign",
+      "script_path": "etl/dim_campaign.py",
+      "description": "Build the campaign dimension with is_active derived.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_marketing_campaigns"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.dim_campaign"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "fact_orders",
+      "script_path": "etl/fact_orders.py",
+      "description": "Materialise fact_orders from staging_orders.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.staging_orders"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.fact_orders"
+        }
+      ],
+      "depends_on": [
+        "stage_orders"
+      ]
+    },
+    {
+      "script_name": "fact_revenue",
+      "script_path": "etl/fact_revenue.py",
+      "description": "Join staging_orders × staging_order_items → fact_revenue.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.staging_orders"
+        },
+        {
+          "type": "table",
+          "target": "ecommerce.staging_order_items"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.fact_revenue"
+        }
+      ],
+      "depends_on": [
+        "stage_orders",
+        "stage_order_items"
+      ]
+    },
+    {
+      "script_name": "fact_refunds",
+      "script_path": "etl/fact_refunds.py",
+      "description": "Materialise fact_refunds. MUST filter raw_refunds.deleted_at IS NULL.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.staging_refunds_with_flags"
+        },
+        {
+          "type": "table",
+          "target": "ecommerce.staging_orders"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.fact_refunds"
+        }
+      ],
+      "depends_on": [
+        "derive_refund_fraud_flag"
+      ]
+    },
+    {
+      "script_name": "fact_marketing_spend",
+      "script_path": "etl/fact_marketing_spend.py",
+      "description": "Allocate campaign budget across each active day.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_marketing_campaigns"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.fact_marketing_spend"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "fact_inventory",
+      "script_path": "etl/fact_inventory.py",
+      "description": "Snapshot product × warehouse stock.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.staging_product_inventory"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.fact_inventory"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "mart_customer_ltv",
+      "script_path": "etl/mart_customer_ltv.py",
+      "description": "Aggregate fact_orders + fact_refunds per customer.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.fact_orders"
+        },
+        {
+          "type": "table",
+          "target": "analytics_warehouse.fact_refunds"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.mart_customer_lifetime_value"
+        }
+      ],
+      "depends_on": [
+        "fact_orders",
+        "fact_refunds"
+      ]
+    },
+    {
+      "script_name": "mart_cohort_retention",
+      "script_path": "etl/mart_cohort_retention.py",
+      "description": "Monthly signup cohorts × months-since-signup retention.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.dim_customer"
+        },
+        {
+          "type": "table",
+          "target": "analytics_warehouse.fact_orders"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.mart_cohort_retention"
+        }
+      ],
+      "depends_on": [
+        "dim_customer_scd2",
+        "fact_orders"
+      ]
+    },
+    {
+      "script_name": "mart_daily_revenue",
+      "script_path": "etl/mart_daily_revenue.py",
+      "description": "Daily revenue + refunds + net.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.fact_orders"
+        },
+        {
+          "type": "table",
+          "target": "analytics_warehouse.fact_refunds"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.mart_daily_revenue"
+        }
+      ],
+      "depends_on": [
+        "fact_orders",
+        "fact_refunds"
+      ]
+    },
+    {
+      "script_name": "mart_funnel_conversion",
+      "script_path": "etl/mart_funnel_conversion.py",
+      "description": "Visit → product_view → add_to_cart → checkout → purchase funnel.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.fact_sessions"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.mart_funnel_conversion"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "mart_top_products",
+      "script_path": "etl/mart_top_products.py",
+      "description": "Top-N products per calendar month, ranked by gross USD revenue.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.fact_revenue"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "analytics_warehouse.mart_top_products"
+        }
+      ],
+      "depends_on": [
+        "fact_revenue"
+      ]
+    },
+    {
+      "script_name": "dq_check_orphan_refunds",
+      "script_path": "etl/dq_check_orphan_refunds.py",
+      "description": "Data-quality check: refunds referencing non-existent orders.",
+      "language": "pyspark",
+      "schedule": "daily",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_refunds"
+        },
+        {
+          "type": "table",
+          "target": "ecommerce.raw_orders"
+        }
+      ],
+      "writes_to": [],
+      "depends_on": []
+    },
+    {
+      "script_name": "dq_check_null_spike",
+      "script_path": "etl/dq_check_null_spike.py",
+      "description": "Alert if a column's NULL rate jumps > 5pp week-over-week.",
+      "language": "pyspark",
+      "schedule": "hourly",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_orders"
+        }
+      ],
+      "writes_to": [],
+      "depends_on": []
+    },
+    {
+      "script_name": "ingest_marketing_attribution",
+      "script_path": "etl/ingest_marketing_attribution.py",
+      "description": "Pull marketing attribution from the ad-server export.",
+      "language": "pyspark",
+      "schedule": "hourly",
+      "reads_from": [],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_marketing_attribution"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "ingest_support_tickets",
+      "script_path": "etl/ingest_support_tickets.py",
+      "description": "Pull tickets from Zendesk API.",
+      "language": "pyspark",
+      "schedule": "hourly",
+      "reads_from": [],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_support_tickets"
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "script_name": "purge_pii_after_retention",
+      "script_path": "etl/purge_pii_after_retention.py",
+      "description": "DESTRUCTIVE: scrub PII columns for customers > 7 years inactive.",
+      "language": "pyspark",
+      "schedule": "on-demand",
+      "reads_from": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_customers"
+        }
+      ],
+      "writes_to": [
+        {
+          "type": "table",
+          "target": "ecommerce.raw_customers"
+        }
+      ],
+      "depends_on": []
+    }
+  ]
+}

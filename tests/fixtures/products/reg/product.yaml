@@ -1,0 +1,59 @@
+name: regulatory_reporting
+code: reg
+domain: regulatory
+description: >-
+  Regulatory reporting marts for the utility: SAIDI/SAIFI reliability indices,
+  energy-sold filings and a collections summary. Fans in from billing,
+  smart_metering and outage_management curated facts.
+owners:
+  - regulatory-reporting@utility.example.com
+
+databases:
+  - name: reg_raw
+    type: athena
+    layer: raw
+    description: Staged regulatory inputs (e.g. the reporting-period calendar).
+  - name: reg_stg
+    type: athena
+    layer: staging
+    description: Conformed reliability inputs per feeder/period.
+  - name: reg_cur
+    type: athena
+    layer: curated
+    description: Curated regulatory marts (SAIDI/SAIFI, energy sold, collections).
+
+cross_product_dependencies:
+  - product: outage_management
+    reads:
+      - outage_cur.fact_outage
+  - product: billing
+    reads:
+      - bill_cur.fact_invoice
+  - product: smart_metering
+    reads:
+      - meter_cur.fact_consumption
+
+orchestrator:
+  type: airflow
+  file: orchestration/dag_reg.py
+
+schedules:
+  primary: "0 4 1 * *"
+  steps:
+    - step: stage_reliability_events
+      file: glue/stage_reliability_events.py
+      schedule: "0 4 1 * *"
+      depends_on: []
+    - step: mart_saidi_saifi
+      file: sql/mart_saidi_saifi.sql
+      schedule: "0 5 1 * *"
+      depends_on:
+        - stage_reliability_events
+    - step: mart_energy_sold
+      file: sql/mart_energy_sold.sql
+      schedule: "0 5 1 * *"
+      depends_on: []
+    - step: mart_collections_summary
+      file: glue/mart_collections_summary.py
+      schedule: "0 6 1 * *"
+      depends_on: []
