@@ -2,21 +2,36 @@
 
 import copy
 
-from etl_parser.identity import agent_table_name, split_dataset_id
+from etl_parser.identity import ENGINE_SCHEME, GLUE_ENGINES, agent_table_name, split_dataset_id
 
 
 def export_agent_catalog(doc, prior=None):
     catalog = copy.deepcopy(prior) if prior is not None else {"databases": [], "relations": []}
     databases = catalog.setdefault("databases", [])
     prior_scripts = {s["script_path"]: s for s in catalog.get("scripts", [])}
+    prior_jobs = {s["job_id"]: s for s in catalog.get("scripts", []) if s.get("job_id")}
+
+    def database_scheme(database):
+        kind = database.get("db_type", "").lower()
+        return "glue" if kind in GLUE_ENGINES else ENGINE_SCHEME.get(kind, kind)
+
     for dataset in doc.datasets:
         if dataset.kind != "table" or dataset.id.startswith("frame://"):
             continue
         scheme, namespace, name = split_dataset_id(dataset.id)
-        database = next((d for d in databases if d["db_name"] == namespace), None)
+        database = next(
+            (
+                d
+                for d in databases
+                if d["db_name"] == namespace and database_scheme(d) in {"", scheme}
+            ),
+            None,
+        )
         if database is None:
             database = {"db_name": namespace, "db_type": scheme, "description": "", "tables": []}
             databases.append(database)
+        elif not database.get("db_type"):
+            database["db_type"] = scheme
         if dataset.product:
             database["product"] = dataset.product
         if dataset.layer:
@@ -45,7 +60,7 @@ def export_agent_catalog(doc, prior=None):
     jobs = {j.id: j for j in doc.jobs}
     scripts = []
     for job in sorted(doc.jobs, key=lambda j: j.id):
-        old = prior_scripts.get(job.source_file, {})
+        old = prior_jobs.get(job.id, prior_scripts.get(job.source_file, {}))
         schedule = doc.schedules.get(job.schedule_id)
         deps = doc.job_dependencies.get(job.id, [])
         scripts.append(

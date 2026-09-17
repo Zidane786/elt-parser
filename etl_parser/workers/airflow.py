@@ -8,7 +8,7 @@ import shlex
 from pathlib import Path
 
 from etl_parser.models import Job, Schedule, Unresolved, WorkerResult
-from etl_parser.scanner.strings import collect_constants, fold_string
+from etl_parser.scanner.strings import fold_string
 from etl_parser.workers.base import normalize_cron
 from etl_parser.workers.sql import SqlWorker
 
@@ -33,7 +33,13 @@ class AirflowWorker:
                 )
             )
             return result
-        env = {**collect_constants(tree), **self.bindings}
+        env = dict(self.bindings)
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id not in self.bindings:
+                        env[target.id] = fold_string(node.value, env)
         symbols = {}
         dag_ranges = []
         decorated = {}
@@ -208,6 +214,9 @@ class AirflowWorker:
                     "TrinoOperator": "trino",
                     "PostgresOperator": "postgres",
                 }.get(operator)
+                if operator == "SQLExecuteQueryOperator":
+                    connection = value(kw.get("conn_id"))
+                    dialect = self.bindings.get(f"connection:{connection}")
                 if dialect is None:
                     issue(
                         call,
@@ -221,7 +230,7 @@ class AirflowWorker:
                         issue(call, "Operator SQL depends on runtime values", "dynamic_sql")
                     else:
                         job = ident
-                        engine = "postgres" if dialect == "postgres" else "athena"
+                        engine = "athena" if dialect in {"trino", "presto"} else dialect
                         analyzed = self.sql.analyze(
                             query,
                             dialect=dialect,
@@ -347,7 +356,19 @@ class AirflowWorker:
                 method = name(node.func)
                 if method in {"chain", "cross_downstream"}:
                     for left, right in zip(node.args, node.args[1:], strict=False):
-                        connect(refs(left), refs(right))
+                        left_refs, right_refs = refs(left), refs(right)
+                        if (
+                            method == "chain"
+                            and isinstance(left, (ast.List, ast.Tuple))
+                            and isinstance(right, (ast.List, ast.Tuple))
+                        ):
+                            if len(left_refs) != len(right_refs):
+                                issue(node, "chain() lists must have equal lengths")
+                            else:
+                                for a, b in zip(left_refs, right_refs, strict=True):
+                                    connect([a], [b])
+                        else:
+                            connect(left_refs, right_refs)
                 elif method in {"set_upstream", "set_downstream"} and node.args:
                     left, right = refs(node.func.value), refs(node.args[0])
                     connect(right, left) if method == "set_upstream" else connect(left, right)

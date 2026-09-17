@@ -35,7 +35,9 @@ def export_openlineage(doc):
                         if edge.job_id != job.id or edge.target.dataset_id != ident:
                             continue
                         refs = []
-                        for ref in edge.sources + edge.indirect_sources:
+                        roles = [(r, "DIRECT") for r in edge.sources]
+                        roles += [(r, "INDIRECT") for r in edge.indirect_sources]
+                        for ref, role in roles:
                             source = datasets.get(ref.dataset_id) or dataset_ref_from_id(
                                 ref.dataset_id
                             )
@@ -46,12 +48,12 @@ def export_openlineage(doc):
                                     field=ref.name,
                                     transformations=[
                                         cl.Transformation(
-                                            type="DIRECT" if ref in edge.sources else "INDIRECT",
+                                            type=role,
                                             subtype={
                                                 "identity": "IDENTITY",
                                                 "aggregation": "AGGREGATION",
                                             }.get(edge.transformation.kind, "TRANSFORMATION")
-                                            if ref in edge.sources
+                                            if role == "DIRECT"
                                             else None,
                                             description=edge.transformation.expression,
                                         )
@@ -61,11 +63,35 @@ def export_openlineage(doc):
                         prior = fields.get(edge.target.name)
                         if prior:
                             refs = prior.inputFields + refs
-                        refs = list({(r.namespace, r.name, r.field): r for r in refs}.values())
+                        merged = {}
+                        for ref in refs:
+                            key = (ref.namespace, ref.name, ref.field)
+                            if key in merged:
+                                transforms = merged[key].transformations + ref.transformations
+                                merged[key].transformations = list(
+                                    {
+                                        (t.type, t.subtype, t.description): t for t in transforms
+                                    }.values()
+                                )
+                            else:
+                                merged[key] = ref
+                        expressions = [edge.transformation.expression]
+                        if prior:
+                            expressions.append(prior.transformationDescription)
                         fields[edge.target.name] = cl.Fields(
-                            inputFields=refs,
-                            transformationDescription=edge.transformation.expression,
-                            transformationType=edge.transformation.kind.upper(),
+                            inputFields=list(merged.values()),
+                            transformationDescription="\n".join(
+                                dict.fromkeys(
+                                    expression for expression in expressions if expression
+                                )
+                            )
+                            or None,
+                            transformationType=(
+                                "MIXED"
+                                if prior
+                                and prior.transformationType != edge.transformation.kind.upper()
+                                else edge.transformation.kind.upper()
+                            ),
                         )
                     if fields:
                         facets["columnLineage"] = cl.ColumnLineageDatasetFacet(

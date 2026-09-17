@@ -39,19 +39,44 @@ def build_graph(
 ) -> LineageGraph:
     combined = WorkerResult()
     for result in results:
-        combined.extend(result)
+        combined.extend(result.model_copy(deep=True))
     datasets = DatasetRegistry()
     for dataset in combined.datasets:
         datasets.add(dataset)
+    aliases = defaultdict(set)
+    for dataset in combined.datasets:
+        for alias in dataset.aliases:
+            if "://" in alias and alias != dataset.id:
+                aliases[alias].add(dataset.id)
+    for alias, owners in sorted(aliases.items()):
+        if len(owners) == 1:
+            datasets.merge_alias(alias, next(iter(owners)))
+        else:
+            combined.unresolved.append(
+                Unresolved(
+                    kind="unsupported_syntax",
+                    reason=f"Conflicting dataset alias {alias}: {sorted(owners)}",
+                    remediation="Declare one canonical dataset for this alias.",
+                )
+            )
     for edge in combined.table_edges:
+        if scan_commit and edge.provenance.scan_commit is None:
+            edge.provenance.scan_commit = scan_commit
+        edge.source = datasets.resolve_id(edge.source)
+        edge.target = datasets.resolve_id(edge.target)
         datasets.get_or_create(edge.source)
         datasets.get_or_create(edge.target)
     for edge in combined.column_edges:
+        if scan_commit and edge.provenance.scan_commit is None:
+            edge.provenance.scan_commit = scan_commit
         for ref in [edge.target, *edge.sources, *edge.indirect_sources]:
+            ref.dataset_id = datasets.resolve_id(ref.dataset_id)
             ds = datasets.get_or_create(ref.dataset_id)
             datasets.add(ds.model_copy(update={"columns": [ref.name]}))
     jobs = {}
     for job in combined.jobs:
+        job.inputs = sorted({datasets.resolve_id(i) for i in job.inputs})
+        job.outputs = sorted({datasets.resolve_id(i) for i in job.outputs})
         if job.id in jobs:
             old = jobs[job.id]
             old.inputs = sorted(set(old.inputs) | set(job.inputs))

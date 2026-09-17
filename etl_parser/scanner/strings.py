@@ -98,11 +98,12 @@ def fold_string(node: ast.AST | None, env: Mapping[str, str | Folded] | None = N
                 values.append(inner)
         return _combine("".join(parts), values)
 
-    if isinstance(node, ast.Name):
-        if node.id in env:
-            value = env[node.id]
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        key = _name_of(node)
+        if key in env:
+            value = env[key]
             return value if isinstance(value, Folded) else Folded(value, True)
-        return Folded(PLACEHOLDER, False, [node.id])
+        return Folded(PLACEHOLDER, False, [key])
 
     if isinstance(node, ast.BinOp):
         if isinstance(node.op, ast.Add):

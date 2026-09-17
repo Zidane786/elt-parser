@@ -1,33 +1,34 @@
-"""Description clients are explicit caller choices; lineage never invokes them."""
+"""Lazy configuration of the company's Agent SDK Lambda invoke runner.
 
-from typing import Protocol
+Install ``agent-sdk`` from the trusted internal distribution or its source checkout.
+Scanning does not need the SDK, AWS credentials, or an LLM.
+"""
 
+from __future__ import annotations
 
-class LLMClient(Protocol):
-    def complete(self, system: str, user: str) -> str: ...
+from typing import TYPE_CHECKING
 
-
-class StubClient:
-    def __init__(self, responses):
-        self.responses = iter(responses)
-        self.calls = []
-
-    def complete(self, system, user):
-        self.calls.append((system, user))
-        return next(self.responses)
+if TYPE_CHECKING:
+    from agent_sdk.runners.aicore_bedrock import BedrockInvokeLambdaRunner
 
 
-class BedrockClient:
-    def __init__(self, model_id, region=None):
-        import boto3
-
-        self.client = boto3.client("bedrock-runtime", region_name=region)
-        self.model_id = model_id
-
-    def complete(self, system, user):
-        response = self.client.converse(
-            modelId=self.model_id,
-            system=[{"text": system}],
-            messages=[{"role": "user", "content": [{"text": user}]}],
-        )
-        return "".join(block.get("text", "") for block in response["output"]["message"]["content"])
+def bedrock_lambda_runner(
+    lambda_arn: str,
+    *,
+    region: str = "us-east-1",
+    aws_profile: str | None = None,
+    web_adapter: bool = True,
+) -> BedrockInvokeLambdaRunner:
+    """Construct the SDK runner; transport and response handling belong to it."""
+    if not lambda_arn.strip():
+        raise ValueError("A Lambda function name or ARN is required")
+    try:
+        from agent_sdk.runners.aicore_bedrock import BedrockInvokeLambdaRunner
+    except ImportError as exc:
+        raise RuntimeError(
+            "Description generation requires your gdtc-agent-sdk (agent-sdk >=1.3.1,<2). "
+            "Install it from your trusted internal distribution or source checkout."
+        ) from exc
+    return BedrockInvokeLambdaRunner(
+        lambda_arn, region=region, aws_profile=aws_profile, web_adapter=web_adapter
+    )

@@ -16,7 +16,7 @@ This review supersedes the original plan's unchecked implementation checklist.
 | 7. Impact and drift | Upstream/downstream hops, column traversal, products, cross-product edges, declared/observed drift | Meter-to-regulatory fixture traversal and CLI tests |
 | 8. Exports and CLI | Native JSON, agent catalog, OpenLineage models, scan/export/impact/products commands | Deterministic round-trip, golden scripts, preservation and CLI tests |
 | 9. DataFrame column lineage | Shared PySpark/Pandas/Polars frame analysis, joins, aliases, calculations, grouping, unions, filters and windows | Physical-column projection/expression/window/union tests; unsupported methods emit diagnostics |
-| 10. Descriptions | Caller-supplied client, stub and optional Bedrock client, grounded prompts, identity inheritance, dependency order, malformed-response warnings | Description tests with no network calls |
+| 10. Descriptions | Agent SDK `BedrockInvokeLambdaRunner`, async/sync enrichment, grounded prompts, identity inheritance, dependency order, response validation | SDK `FakeLLMRunner` and real SDK with mocked Lambda transport, both envelope modes; no live model calls |
 | 11. Documentation and end-to-end | README, frozen corrected scripts output, fixture/integration tests, packaging and CI workflow | `pytest`, `ruff`, and `uv build` |
 
 ## Corrections to the plan and fixtures
@@ -41,6 +41,21 @@ This review supersedes the original plan's unchecked implementation checklist.
   engines and orchestration plugins can share the model without editing Literal enums.
 - ZIP dependencies were not in the original plan. Sources are indexed directly from ZIP
   members with limits and explicit archive provenance; archive code is never executed.
+- The second review fixes imported helper names such as `load`, imported constants,
+  module-qualified constants, relative file identities, Spark read builders/multiple
+  paths/positional renames, literal bounded loops, Pandas merge suffixes, and Polars
+  keyword expressions. Regression tests cover each supported form.
+- `chain([a,b], [c,d])` connects pairwise; `cross_downstream` remains all-to-all. Generic
+  SQL operators accept an explicit `connection:<conn_id>` dialect in scan bindings.
+  Airflow environment defaults retain their assumption status.
+- Declared dataset aliases now canonicalize jobs and both edge types before dependency
+  inference. Conflicting aliases remain diagnostic, and graph construction does not
+  mutate worker results. Table edges also retain transformation text and source spans.
+- Catalog export separates same-name databases across engines. OpenLineage keeps both
+  direct and indirect roles and multiple expressions instead of overwriting evidence.
+- Per the SDK integration request, the original custom client protocol and direct boto3
+  Bedrock client are replaced with the private Agent SDK Lambda invoke runner. Installation
+  is explicitly separate from the public/base dependencies; no private source is vendored.
 
 ## Explicit limits
 
@@ -59,8 +74,8 @@ Logical schema names in the product fixtures sometimes appear in both Postgres a
 Those physical datasets are not merged based only on matching spelling. Native dataset
 identity remains engine-aware; cross-system aliases need explicit evidence.
 
-The live Glue and Bedrock adapters are tested through local stubs/model contracts, not
-against a production AWS account. OpenLineage exports are synthetic static events, not
+The live Glue and Agent SDK Lambda/Bedrock integrations are tested through mocked transports,
+not against a production AWS account. OpenLineage exports are synthetic static events, not
 execution records. Runtime OpenLineage ingestion was explicitly deferred by the design.
 
 ## Extension architecture
@@ -75,3 +90,12 @@ The Python frame interpreter and SQL worker stay separate from the graph. A new 
 may replace a built-in handler, while a new orchestrator may add schedules and task-job
 links using the same contract. Explicit CLI plugin factories are trusted user-installed
 code; scanned repository modules are always data.
+
+## Verification of the second pass (2026-09-17)
+
+- Full local suite with the trusted Agent SDK 1.3.1 installed: **105 passed**.
+- Isolated base environment without the private SDK: **97 passed, 1 module skipped**
+  (the eight SDK-dependent tests); no-SDK scanning and dependency diagnostics still run.
+- Ruff checks and `git diff --check` pass; wheel and source distribution build offline.
+- No live Lambda, Bedrock, or Glue request was made during these checks. Production
+  invocation still needs the caller's Lambda function, model ID, and AWS credentials.

@@ -53,6 +53,8 @@ class DictSchemaProvider:
     def __init__(self, source: Mapping | str | Path):
         if isinstance(source, (str, Path)):
             source = json.loads(Path(source).read_text())
+        if not isinstance(source, Mapping):
+            raise ValueError("Schema must be a mapping of databases to table column lists")
         self._cols: dict[str, list[str]] = {}
         if "databases" in source:
             for db in source["databases"]:
@@ -61,7 +63,13 @@ class DictSchemaProvider:
                     self._cols[key] = [c["field_name"] for c in t.get("schema", [])]
         else:
             for db, tables in source.items():
+                if not isinstance(tables, Mapping):
+                    raise ValueError(f"Schema database {db!r} must map tables to column lists")
                 for t, cols in tables.items():
+                    if not isinstance(cols, (list, tuple, Mapping)) or not all(
+                        isinstance(c, str) and c for c in cols
+                    ):
+                        raise ValueError(f"Schema {db}.{t}: expected a list of column names")
                     self._cols[f"{db}.{t}".lower()] = (
                         list(cols.keys()) if isinstance(cols, Mapping) else list(cols)
                     )
@@ -465,6 +473,12 @@ class SqlWorker:
                             job_id=job_id,
                             source_file=source_file,
                             line=stmt.line_start,
+                            transformation=Transformation(
+                                expression=body.sql(dialect=dialect),
+                                source_file=source_file,
+                                line_start=stmt.line_start,
+                                line_end=stmt.line_end,
+                            ),
                         )
                     )
             return
@@ -544,6 +558,12 @@ class SqlWorker:
                         job_id=job_id,
                         source_file=source_file,
                         line=stmt.line_start,
+                        transformation=Transformation(
+                            expression=body.sql(dialect=dialect),
+                            source_file=source_file,
+                            line_start=stmt.line_start,
+                            line_end=stmt.line_end,
+                        ),
                     )
                 )
             if is_temp:

@@ -111,7 +111,7 @@ LineageGraph (networkx) ◄── ProductRegistry (product.yaml files)
    ├─► AgentCatalogExporter  catalog.json  (de_agent format)
    ├─► OpenLineageExporter   events/*.json
    ├─► ImpactAnalyzer        downstream / upstream queries
-   └─► DescriptionEngine     prompts ──► LLMClient (caller-supplied) ──► descriptions
+   └─► DescriptionEngine     prompts ──► Agent SDK Lambda invoke runner ──► descriptions
 ```
 
 Every worker returns the same `WorkerResult`: datasets, jobs, column edges, table edges,
@@ -149,7 +149,7 @@ etl_parser/
     openlineage_out.py RunEvent files with column lineage facets
   describe/
     prompt.py        build grounded prompt from edge + schema + upstream docs
-    client.py        LLMClient protocol
+    client.py        lazy Agent SDK Lambda runner factory
     engine.py        topological order, batching, unreviewed marking
   cli.py             typer app: scan, export, impact, describe
 tests/
@@ -389,9 +389,11 @@ Impact API:
 
 Deterministic parts live in the package. The LLM call does not.
 
-- `LLMClient` protocol: `complete(system: str, user: str) -> str`. The caller passes any
-  object with that method. A Bedrock example using boto3 and a stub for tests ship in
-  `describe/client.py`. No provider SDK is a dependency.
+- Agent SDK integration (amended by user request): `describe/client.py` lazily configures
+  the private SDK's `BedrockInvokeLambdaRunner`. The engine awaits the SDK's `complete`
+  API with `Message` inputs and consumes `LLMResponse`. Tests use `FakeLLMRunner` and
+  real SDK envelope parsing with mocked Lambda transport. No custom/direct Bedrock
+  client remains; the SDK is installed separately from a trusted internal distribution.
 - `PromptBuilder` takes a target column, its `ColumnEdge` list, the source column
   datatypes and existing descriptions, the table description, and the product domain. It
   produces a system prompt that demands JSON with `description`, `business_rule`, and
@@ -412,7 +414,7 @@ etl-parser export catalog <lineage.json> [--prior catalog.json] --out catalog.js
 etl-parser export openlineage <lineage.json> --out events/
 etl-parser impact <lineage.json> <dataset_or_column_id> [--upstream] [--depth N]
 etl-parser products <lineage.json>            # derived vs declared dependency table
-etl-parser describe <lineage.json> --catalog catalog.json --client <module:factory>
+etl-parser describe <lineage.json> --catalog catalog.json --lambda-arn <arn> --model <id> --out enriched.json
 ```
 
 Exit code is non-zero if any `unresolved` item has kind `unsupported_syntax`, so CI can
@@ -482,7 +484,8 @@ Matches the five agreed steps, with the scanner split so each step has a testabl
 5. SparkStaticWorker column-level tracking over the DataFrame API, with pandas column
    tracking sharing the same tracker. Golden column edges for `stage_orders`,
    `fact_orders`, `mart_customer_ltv`, and `dim_customer_scd2`.
-6. Description engine with prompt builder, protocol, Bedrock example, stub client tests.
+6. Description engine with prompt builder, Agent SDK Lambda invoke runner, SDK test doubles
+   and transport-contract tests. No LLM is used to infer lineage.
 
 OpenLineageIngest follows step 5 once real Spark events are available to test against.
 

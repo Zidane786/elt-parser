@@ -56,6 +56,7 @@ class Frame:
     partial: bool = False
     open_columns: bool = True
     group: list[str] = field(default_factory=list)
+    parallel_sources: bool = False
 
     def column(self, name: str) -> Column:
         alias, dot, tail = name.partition(".")
@@ -63,14 +64,19 @@ class Frame:
             return self.aliases[alias].column(tail)
         if name in self.columns:
             return copy.deepcopy(self.columns[name])
-        if self.open_columns and len(self.sources) == 1 and not dot:
-            return Column({(next(iter(self.sources)), name)}, name, name=name)
+        if self.open_columns and (len(self.sources) == 1 or self.parallel_sources) and not dot:
+            return Column({(source, name) for source in self.sources}, name, name=name)
         return Column(text=name, partial=True, name=name)
 
 
 @dataclass
 class Connection:
     engine: str
+
+
+@dataclass
+class Reader:
+    options: dict[str, ast.AST] = field(default_factory=dict)
 
 
 class PythonWorker:
@@ -117,6 +123,7 @@ class PythonWorker:
         default_engine = "spark" if language == "pyspark" else "unknown"
         invoked: set[tuple[str, str]] = set()
         active: set[tuple[str, str]] = set()
+        loading_modules: set[str] = set()
 
         def issue(node, reason, kind="unsupported_syntax", folded=None):
             result.unresolved.append(
@@ -149,7 +156,17 @@ class PythonWorker:
         state = State(source)
 
         def strings():
-            return {k: v for k, v in state.env.items() if isinstance(v, (str, Folded))}
+            values = {k: v for k, v in state.env.items() if isinstance(v, (str, Folded))}
+            for key, module in state.env.items():
+                if isinstance(module, State):
+                    values.update(
+                        {
+                            f"{key}.{k}": v
+                            for k, v in module.env.items()
+                            if isinstance(v, (str, Folded))
+                        }
+                    )
+            return values
 
         def folded(node):
             return fold_string(node, strings())
@@ -491,6 +508,12 @@ class PythonWorker:
                         job_id=job_id,
                         source_file=state.source.path,
                         line=node.lineno,
+                        transformation=Transformation(
+                            expression=ast.unparse(node),
+                            source_file=state.source.path,
+                            line_start=node.lineno,
+                            line_end=getattr(node, "end_lineno", node.lineno),
+                        ),
                         provenance=Provenance(
                             parser="python_ast", confidence="partial" if partial else "exact"
                         ),
@@ -565,6 +588,22 @@ class PythonWorker:
                 active.remove(key)
                 state = old
 
+        def imported_state(module, level=0):
+            if not self.index:
+                return None
+            helper = self.index.resolve_module(module, state.source, level)
+            if helper is None:
+                return None
+            if helper.path in loading_modules or state.depth >= self.max_import_depth:
+                return None
+            module_state = State(helper, depth=state.depth + 1)
+            loading_modules.add(helper.path)
+            try:
+                load_module(helper, module_state, definitions_only=True)
+            finally:
+                loading_modules.remove(helper.path)
+            return module_state
+
         def evaluate(node):
             if node is None:
                 return None
@@ -594,7 +633,11 @@ class PythonWorker:
                     return out
                 return folded(node)
             if isinstance(node, ast.Attribute):
+                if node.attr == "read" and ast.unparse(node.value) in {"spark", "sqlContext"}:
+                    return Reader()
                 base = evaluate(node.value)
+                if isinstance(base, State):
+                    return base.env.get(node.attr, folded(node))
                 return base if node.attr in {"write", "read", "loc", "iloc"} else folded(node)
             if not isinstance(node, ast.Call):
                 return folded(node)
@@ -603,6 +646,46 @@ class PythonWorker:
                 node.func.attr if isinstance(node.func, ast.Attribute) else name.rsplit(".", 1)[-1]
             )
             keywords = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+            # Resolve repository helpers before generic I/O suffixes such as load/save.
+            if isinstance(node.func, ast.Name) and node.func.id in state.functions:
+                return invoke(
+                    state.functions[node.func.id],
+                    [evaluate(a) for a in node.args],
+                    {k: evaluate(v) for k, v in keywords.items()},
+                    state,
+                )
+            first = ast.unparse(node.func).split(".")[0]
+            imported = state.imports.get(first)
+            if imported and self.index:
+                module_name, level = imported
+                lookup = (
+                    module_name
+                    if isinstance(node.func, ast.Attribute)
+                    else module_name.rsplit(".", 1)[0]
+                )
+                helper_state = imported_state(lookup, level)
+                if helper_state:
+                    function = helper_state.functions.get(method)
+                    if function:
+                        return invoke(
+                            function,
+                            [evaluate(a) for a in node.args],
+                            {k: evaluate(v) for k, v in keywords.items()},
+                            helper_state,
+                        )
+                    issue(
+                        node,
+                        f"Helper {method!r} not found in {helper_state.source.path}",
+                        "unresolved_import",
+                    )
+                    return None
+                if lookup in self.index.module_map:
+                    issue(
+                        node,
+                        f"Helper import is ambiguous or exceeds depth limit: {lookup}",
+                        "unresolved_import",
+                    )
+                    return None
             if method in {"create_engine", "connect"} and node.args:
                 url = folded(node.args[0]).text
                 engine = next(
@@ -610,6 +693,20 @@ class PythonWorker:
                 )
                 return Connection(engine)
             receiver = evaluate(node.func.value) if isinstance(node.func, ast.Attribute) else None
+            if isinstance(receiver, Reader) and method in {"format", "option", "options"}:
+                reader = copy.deepcopy(receiver)
+                if method == "option" and len(node.args) >= 2:
+                    reader.options[folded(node.args[0]).text] = node.args[1]
+                elif method == "options":
+                    reader.options.update(keywords)
+                elif method == "format" and node.args:
+                    reader.options["format"] = node.args[0]
+                # Capture values at the builder call rather than re-read reassigned variables.
+                for key, value in list(reader.options.items()):
+                    resolved = concrete(value, "dynamic_path")
+                    if resolved is not None:
+                        reader.options[key] = ast.Constant(resolved)
+                return reader
             if isinstance(receiver, Column):
                 return col_expr(node, Frame())
             if isinstance(receiver, Frame) and method not in {
@@ -660,6 +757,26 @@ class PythonWorker:
                         selected = select_frame(receiver, node.args)
                         out.columns.update(selected.columns)
                         out.partial |= selected.partial
+                        for key, value in keywords.items():
+                            out.columns[key] = col_expr(value, receiver)
+                elif method == "toDF":
+                    names = [folded(a) for a in node.args]
+                    if (
+                        receiver.open_columns
+                        or len(names) != len(receiver.columns)
+                        or any(not n.complete for n in names)
+                    ):
+                        out.partial = True
+                        issue(
+                            node,
+                            "toDF requires known input columns and matching literal names",
+                            "unknown_column",
+                        )
+                    else:
+                        out.columns = {
+                            name.text: column
+                            for name, column in zip(names, out.columns.values(), strict=True)
+                        }
                 elif method in {"withColumnRenamed", "rename"}:
                     mapping = {}
                     if method == "withColumnRenamed":
@@ -693,6 +810,7 @@ class PythonWorker:
                 elif method in {"join", "merge"}:
                     right = evaluate(node.args[0] if node.args else keywords.get("right"))
                     if isinstance(right, Frame):
+                        out.parallel_sources = False
                         out.sources |= right.sources
                         out.aliases.update(right.aliases)
                         out.indirect |= right.indirect
@@ -726,6 +844,26 @@ class PythonWorker:
                                     arg.elts if isinstance(arg, (ast.List, ast.Tuple)) else [arg]
                                 ):
                                     out.indirect |= frame.column(folded(item).text).sources
+                        if method == "merge":
+                            suffixes = keywords.get("suffixes")
+                            suffixes = (
+                                [folded(a).text for a in suffixes.elts]
+                                if isinstance(suffixes, (ast.List, ast.Tuple))
+                                else ["_x", "_y"]
+                            )
+                            join_names = {k.value for k in keys if isinstance(k, ast.Constant)}
+                            if on is None and not {"left_on", "right_on"} & keywords.keys():
+                                join_names = receiver.columns.keys() & right.columns.keys()
+                                for key in join_names:
+                                    out.indirect |= receiver.column(key).sources
+                                    out.indirect |= right.column(key).sources
+                                    out.columns[key] = receiver.column(key)
+                            if len(suffixes) == 2:
+                                overlap = receiver.columns.keys() & right.columns.keys()
+                                for key in overlap - join_names:
+                                    out.columns.pop(key, None)
+                                    out.columns[key + suffixes[0]] = receiver.column(key)
+                                    out.columns[key + suffixes[1]] = right.column(key)
                     else:
                         out.partial = True
                         issue(node, "Join input could not be resolved", "unknown_column")
@@ -803,7 +941,6 @@ class PythonWorker:
                     "persist",
                     "collect",
                     "lazy",
-                    "toDF",
                 }:
                     pass
                 else:
@@ -812,12 +949,26 @@ class PythonWorker:
                 return out
 
             sink = match_sink(name)
+            if isinstance(receiver, Reader) and method in {
+                "load",
+                "parquet",
+                "csv",
+                "json",
+                "orc",
+                "text",
+                "table",
+            }:
+                sink = match_sink("read." + method)
+            if method in {"load", "save"} and not isinstance(receiver, (Reader, Frame)):
+                sink = None
             if sink:
                 arg = (
                     node.args[sink.arg]
                     if isinstance(sink.arg, int) and sink.arg < len(node.args)
                     else keywords.get(sink.arg if isinstance(sink.arg, str) else sink.alt_arg)
                 )
+                if arg is None and isinstance(receiver, Reader):
+                    arg = receiver.options.get("path")
                 if arg is None:
                     # Builder calls such as .load() require option tracking, not a guessed path.
                     issue(node, "Dataset argument is unavailable", "dynamic_table_name")
@@ -829,7 +980,18 @@ class PythonWorker:
                     if sink.scheme != "table"
                     else "dynamic_table_name"
                 )
-                value = concrete(arg, kind)
+                path_args = (
+                    (
+                        list(arg.elts)
+                        if isinstance(arg, (ast.List, ast.Tuple))
+                        else list(node.args)
+                        if isinstance(receiver, Reader) and method == "parquet"
+                        else [arg]
+                    )
+                    if sink.direction == "read" and sink.scheme == "path"
+                    else [arg]
+                )
+                value = concrete(path_args[0], kind) if path_args else None
                 if value is None:
                     return None
                 engine = sink.engine
@@ -894,50 +1056,35 @@ class PythonWorker:
                         if sink.scheme == "table"
                         else f"s3://{namespace}/{value}"
                     )
-                ds = normalize_dataset_id(value, engine=engine, default_db=self.default_db)
+
+                def dataset_id(text):
+                    if sink.scheme == "path" and "://" not in text:
+                        return "file://" + text
+                    return normalize_dataset_id(text, engine=engine, default_db=self.default_db)
+
+                ds = dataset_id(value)
                 if sink.direction == "read":
-                    return frame_from_dataset(ds)
+                    frame = frame_from_dataset(ds)
+                    for extra in path_args[1:]:
+                        path = concrete(extra, kind)
+                        if path is None:
+                            frame.partial = True
+                            continue
+                        other = frame_from_dataset(dataset_id(path))
+                        frame.sources |= other.sources
+                        for key, column in other.columns.items():
+                            if key in frame.columns:
+                                frame.columns[key].sources |= column.sources
+                            else:
+                                frame.columns[key] = column
+                        frame.open_columns |= other.open_columns
+                    frame.parallel_sources = len(path_args) > 1
+                    return frame
+                if not isinstance(receiver, Frame) and "df" in keywords:
+                    receiver = evaluate(keywords["df"])
                 write_frame(receiver, ds, node)
                 return receiver
 
-            if isinstance(node.func, ast.Name) and node.func.id in state.functions:
-                return invoke(
-                    state.functions[node.func.id],
-                    [evaluate(a) for a in node.args],
-                    {k: evaluate(v) for k, v in keywords.items()},
-                    state,
-                )
-            first = ast.unparse(node.func).split(".")[0]
-            imported = state.imports.get(first)
-            if imported and self.index:
-                module_name, level = imported
-                function_name = (
-                    method
-                    if isinstance(node.func, ast.Attribute)
-                    else module_name.rsplit(".", 1)[-1]
-                )
-                lookup = (
-                    module_name
-                    if isinstance(node.func, ast.Attribute)
-                    else module_name.rsplit(".", 1)[0]
-                )
-                helper = self.index.resolve_module(lookup, state.source, level)
-                if helper:
-                    old = state
-                    args = [evaluate(a) for a in node.args]
-                    kwargs = {k: evaluate(v) for k, v in keywords.items()}
-                    module_state = State(helper, depth=state.depth + 1)
-                    load_module(helper, module_state, definitions_only=True)
-                    function = module_state.functions.get(function_name)
-                    if function:
-                        return invoke(function, args, kwargs, module_state)
-                    issue(
-                        node,
-                        f"Helper {function_name!r} not found in {helper.path}",
-                        "unresolved_import",
-                    )
-                elif lookup in self.index.module_map:
-                    issue(node, f"Ambiguous helper import: {lookup}", "unresolved_import")
             if name.startswith(
                 ("F.", "pl.", "pyspark.sql.functions.", "Window.", "pyspark.sql.Window.")
             ):
@@ -952,12 +1099,18 @@ class PythonWorker:
                     elif isinstance(node, ast.Import):
                         for alias in node.names:
                             state.imports[alias.asname or alias.name] = (alias.name, 0)
+                            module = imported_state(alias.name)
+                            if module:
+                                state.env[alias.asname or alias.name] = module
                     elif isinstance(node, ast.ImportFrom):
                         for alias in node.names:
                             state.imports[alias.asname or alias.name] = (
                                 f"{node.module or ''}.{alias.name}".strip("."),
                                 node.level,
                             )
+                            module = imported_state(node.module or "", node.level)
+                            if module and alias.name in module.env:
+                                state.env[alias.asname or alias.name] = module.env[alias.name]
                     elif isinstance(node, (ast.Assign, ast.AnnAssign)):
                         value = evaluate(node.value)
                         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
@@ -994,6 +1147,22 @@ class PythonWorker:
                                         state.env[key] = Folded("{{?}}", False, [key])
                     elif isinstance(node, (ast.With, ast.AsyncWith)):
                         statements(node.body)
+                    elif (
+                        isinstance(node, ast.For)
+                        and isinstance(node.target, ast.Name)
+                        and isinstance(node.iter, (ast.List, ast.Tuple))
+                        and len(node.iter.elts) <= 100
+                        and all(isinstance(n, ast.Constant) for n in node.iter.elts)
+                        and not any(
+                            isinstance(n, (ast.Break, ast.Continue, ast.Return))
+                            for child in node.body
+                            for n in ast.walk(child)
+                        )
+                    ):
+                        for item in node.iter.elts:
+                            state.env[node.target.id] = evaluate(item)
+                            statements(node.body)
+                        statements(node.orelse)
                     elif isinstance(node, (ast.For, ast.While, ast.Try)):
                         issue(node, "Dynamic control flow analyzed conservatively")
                         statements(node.body)

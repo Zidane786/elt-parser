@@ -8,6 +8,7 @@ from pathlib import Path
 
 import typer
 
+from etl_parser.describe.client import bedrock_lambda_runner
 from etl_parser.describe.engine import DescriptionEngine
 from etl_parser.export.agent_catalog import export_agent_catalog
 from etl_parser.export.native import read_native, write_native
@@ -146,11 +147,24 @@ def products(lineage: Path):
 def describe(
     lineage: Path,
     catalog: Path = typer.Option(...),
-    client: str = typer.Option(...),
     out: Path = typer.Option(...),
+    lambda_arn: str = typer.Option(..., envvar="ETL_PARSER_LAMBDA_ARN"),
+    model: str = typer.Option(..., envvar="ETL_PARSER_MODEL"),
+    region: str = typer.Option("us-east-1", envvar="AWS_REGION"),
+    aws_profile: str | None = typer.Option(None, envvar="AWS_PROFILE"),
+    web_adapter: bool = typer.Option(True, help="Use the SDK Lambda Web Adapter envelope"),
+    max_tokens: int = typer.Option(1024, min=1),
 ):
-    """Enrich descriptions using an explicitly chosen client; may call its external provider."""
-    engine = DescriptionEngine(_factory(client))
-    _write(engine.run(read_native(lineage), _json(catalog)), out)
+    """Generate descriptions through Agent SDK's Lambda Bedrock invoke runner (paid calls)."""
+    doc, existing = read_native(lineage), _json(catalog)
+    try:
+        runner = bedrock_lambda_runner(
+            lambda_arn, region=region, aws_profile=aws_profile, web_adapter=web_adapter
+        )
+        engine = DescriptionEngine(runner, model=model, max_tokens=max_tokens)
+        enriched = engine.run(doc, existing)
+    except (RuntimeError, ValueError, ImportError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _write(enriched, out)
     for warning in engine.warnings:
         typer.echo(warning, err=True)

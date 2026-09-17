@@ -1,19 +1,40 @@
 """Optional topological description enrichment, preserving existing descriptions."""
 
+import asyncio
 import copy
 import json
+from typing import TYPE_CHECKING
 
 import networkx as nx
 
 from etl_parser.describe.prompt import build_prompt
 
+if TYPE_CHECKING:
+    from agent_sdk import LLMRunnerProtocol
+
 
 class DescriptionEngine:
-    def __init__(self, client):
-        self.client = client
+    def __init__(self, runner: "LLMRunnerProtocol", *, model: str, max_tokens: int = 1024):
+        if not model.strip():
+            raise ValueError("An explicit SDK model ID or registered model slug is required")
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
+        self.runner = runner
+        self.model = model
+        self.max_tokens = max_tokens
         self.warnings = []
 
     def run(self, doc, catalog):
+        """Synchronous entry point. Async applications should await ``arun``."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.arun(doc, catalog))
+        raise RuntimeError("An event loop is running; use await engine.arun(doc, catalog)")
+
+    async def arun(self, doc, catalog):
+        from agent_sdk.types import Message
+
         self.warnings = []
         catalog = copy.deepcopy(catalog)
         columns = {}
@@ -70,11 +91,27 @@ class DescriptionEngine:
                 edges[0].target, edges, column, known, by_table[target[0]].get("description")
             )
             try:
-                response = json.loads(self.client.complete(prompt.system, prompt.user))
-                if not isinstance(response, dict) or not isinstance(
-                    response.get("description"), str
+                completion = await self.runner.complete(
+                    messages=[Message(role="user", content=prompt.user)],
+                    system=prompt.system,
+                    tools=[],
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    temperature=0.0,
+                )
+                if completion.stop_reason not in {None, "end_turn", "stop", "stop_sequence"}:
+                    raise ValueError(f"Incomplete or blocked response: {completion.stop_reason}")
+                if any(b.get("type") == "tool_use" for b in completion.content):
+                    raise ValueError("Unexpected tool request; descriptions cannot execute tools")
+                response = json.loads(
+                    "".join(b["text"] for b in completion.content if b.get("type") == "text")
+                )
+                if (
+                    not isinstance(response, dict)
+                    or not isinstance(response.get("description"), str)
+                    or not response["description"].strip()
                 ):
-                    raise ValueError("Response must contain a description string")
+                    raise ValueError("Response must contain a non-empty description string")
                 column.update(description=response["description"], description_source="ai")
             except Exception as exc:
                 self.warnings.append(f"Skipped {target}: {exc}")

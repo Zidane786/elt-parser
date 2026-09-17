@@ -10,9 +10,13 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-15-etl-parser-design.md`
 
+**Implementation status:** This is the original planning checklist, not a live task list.
+See `docs/implementation-review.md` for delivered evidence, corrections, and explicit
+static-analysis limits. Task 10 below is amended to the requested Agent SDK integration.
+
 ## Global Constraints
 
-- No LLM call anywhere in `etl_parser` except through the caller-supplied `LLMClient` in `describe/`.
+- No LLM calls outside `describe/`, which uses the private Agent SDK's Lambda Bedrock invoke runner. Lineage is deterministic.
 - Workers never raise on user code; emit `Unresolved(kind=...)` and continue.
 - Every `ColumnEdge` and `TableEdge` carries `Provenance(parser, confidence, dialect)` and a `Transformation` with `source_file`, `line_start`, `line_end` where known.
 - Dialect is decided by the executing call site, never by the table.
@@ -53,7 +57,7 @@ etl_parser/export/native.py         LineageDocument <-> lineage.json
 etl_parser/export/agent_catalog.py  catalog.json exporter
 etl_parser/export/openlineage_out.py
 etl_parser/describe/__init__.py
-etl_parser/describe/client.py       LLMClient protocol, StubClient, BedrockClient example
+etl_parser/describe/client.py       lazy Agent SDK BedrockInvokeLambdaRunner factory
 etl_parser/describe/prompt.py       PromptBuilder
 etl_parser/describe/engine.py       DescriptionEngine
 etl_parser/cli.py                   typer app
@@ -154,14 +158,14 @@ Behaviour: parse all statements; normalize CTAS/INSERT/MERGE to (target, select)
 
 **Files:** `etl_parser/describe/client.py`, `prompt.py`, `engine.py`, tests.
 
-**Produces:** `LLMClient` protocol `complete(system: str, user: str) -> str`; `StubClient(responses)`; `BedrockClient(model_id, region)` (boto3 imported lazily); `build_prompt(target: ColumnRef, edges: list[ColumnEdge], schema: dict, upstream_descriptions: dict, table_description: str | None, domain: str | None) -> Prompt(system, user)`; `DescriptionEngine(client).run(doc, catalog: dict) -> dict` (returns catalog with `description` + `description_source="ai"` filled; identity-only columns inherit upstream; topological order over jobs).
+**Produces (amended):** A lazy factory for the private Agent SDK's `BedrockInvokeLambdaRunner`; no custom LLM protocol or direct provider transport. `build_prompt(...) -> Prompt(system, user)`; `DescriptionEngine(runner, model=...).run(doc, catalog) -> dict` and async `arun(...)` use SDK `Message`/`LLMResponse` types. Only descriptions are enriched, with `description_source="ai"`; identity columns inherit upstream. Tests use SDK `FakeLLMRunner` and mocked Lambda transport through the real SDK.
 
-- [ ] Tests: prompt contains verbatim expression and source descriptions; identity column inherits without client call; topological order (stage before fact); stub JSON parsed; malformed JSON -> column skipped with warning list.
+- [ ] Tests: grounded prompts; identity inheritance; dependency order; SDK JSON responses; malformed/truncated/blocked/tool responses skipped; both Lambda envelopes; scan without SDK/AWS imports.
 - [ ] Implement, commit `feat: grounded description engine`.
 
 ### Task 11: README, fixture golden files, end-to-end
 
-- [ ] `README.md`: install (uv, Nexus note), CLI usage, output formats, extending the sink table, plugging an LLM client.
+- [ ] `README.md`: install (uv, Nexus note), CLI usage, output formats, extending the sink table, configuring the Agent SDK Lambda runner.
 - [ ] End-to-end test: `scan tests/fixtures/etl` -> `export catalog` equals golden.
 - [ ] `ruff check`, `pytest` green, commit `docs: readme and e2e`.
 

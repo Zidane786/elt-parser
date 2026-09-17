@@ -13,7 +13,7 @@ uv sync
 uv run etl-parser --help
 # Or install from a local checkout:
 pip install .
-# Optional AWS Glue schema lookup and Bedrock description client:
+# Optional AWS Glue schema lookup:
 pip install '.[glue]'
 ```
 
@@ -63,6 +63,10 @@ Supply explicit values in `bindings.json`:
 For an unknown Python variable named `env`, use `{"env": "prod"}`. Simple SQL-file
 templates `${env}` and `{{ env }}` use the same bindings. Run separate scans for separate
 environments; the parser cannot enumerate runtime deployment values.
+
+For Airflow `SQLExecuteQueryOperator(conn_id="warehouse", ...)`, explicitly bind the
+connection dialect using `{"connection:warehouse": "postgres"}`. Credentials are not
+needed: this tells the parser which SQL grammar and dataset namespace to use.
 
 Without a binding, a runtime name produces a diagnostic with `expression`, `partial_text`,
 `symbols`, `assumptions`, `source_file`, `line`, and `remediation`. Environment defaults
@@ -155,23 +159,47 @@ replace a built-in handler where necessary. Extend the declarative `SINKS` list 
 
 ## Optional descriptions
 
+Mappings are deterministic: SQLGlot and Python AST/DataFrame tracking resolve lineage.
+The LLM only proposes descriptions from that evidence; it never creates or repairs mappings.
+
+All description calls use your **gdtc-agent-sdk**, tested against distribution
+`agent-sdk==1.3.1`, and its `BedrockInvokeLambdaRunner`. The old direct Bedrock client
+and custom client protocol have been removed. No model or Lambda ARN is hard-coded.
+Install the SDK from your trusted internal distribution or local checkout, **not an
+unverified public package with the same name**:
+
+```sh
+uv pip install --python .venv/bin/python /path/to/gdtc-agent-sdk
+.venv/bin/etl-parser describe lineage.json --catalog catalog.json --out enriched.json \
+  --lambda-arn YOUR_FUNCTION_NAME_OR_ARN --model YOUR_BEDROCK_MODEL_ID \
+  --region ap-south-1 --aws-profile YOUR_PROFILE
+```
+
+`ETL_PARSER_LAMBDA_ARN`, `ETL_PARSER_MODEL`, `AWS_REGION`, and `AWS_PROFILE` are also
+supported. Credentials use the SDK's normal AWS credential chain; omit `--aws-profile`
+for an IAM role. The default envelope targets the SDK's Lambda Web Adapter `/bedrock`
+route. Use `--no-web-adapter` for a plain Lambda handler accepting `{modelId, payload}`.
+This command sends lineage evidence to your configured model service and may incur charges.
+
 ```python
-from etl_parser.describe.client import StubClient
+from etl_parser.describe.client import bedrock_lambda_runner
 from etl_parser.describe.engine import DescriptionEngine
 from etl_parser.export.agent_catalog import export_agent_catalog
 
-client = StubClient(['{"description": "Amount converted into cents"}'])
-engine = DescriptionEngine(client)
+runner = bedrock_lambda_runner("YOUR_FUNCTION_NAME_OR_ARN", region="ap-south-1")
+engine = DescriptionEngine(runner, model="YOUR_BEDROCK_MODEL_ID")
 catalog = engine.run(document, export_agent_catalog(document))
+# Inside an async application: catalog = await engine.arun(document, catalog)
 print(engine.warnings)
 ```
 
-Provide any client implementing `complete(system, user) -> str`, or use the optional
-`BedrockClient`. `etl-parser describe lineage.json --catalog catalog.json
---client my_package:client_factory --out enriched.json` explicitly invokes that client.
-Lineage scanning never calls an LLM. Existing descriptions are preserved; exact identity
+For offline tests, inject `agent_sdk.testing.FakeLLMRunner` into the same engine.
+The SDK is installed separately because it is a private dependency; base scans and CI do
+not require access to your private registry. Lineage scanning never imports the SDK or
+calls an LLM. Existing descriptions are preserved; exact identity
 columns inherit descriptions; computed columns receive prompts containing their recorded
-expressions and upstream descriptions. Invalid responses are skipped with warnings.
+expressions and upstream descriptions. Invalid, empty, truncated, blocked, or tool-request
+responses are skipped with warnings. Partial lineage is never sent for enrichment.
 
 ## Development
 
@@ -179,9 +207,14 @@ expressions and upstream descriptions. Invalid responses are skipped with warnin
 uv run pytest -q
 uv run ruff check etl_parser tests
 uv build
+# After installing the private SDK, also run its integration contracts:
+.venv/bin/python -m pytest tests/test_describe.py -q
 ```
 
 The test suite includes the 28-script ETL corpus, three product fixtures, regression tests
 for alias/dynamic-name handling, local ZIP helpers, DAG dependencies, exports and the CLI.
 See [implementation review](docs/implementation-review.md) for the review of the original
 11-step plan and explicit deviations.
+SDK-dependent tests are explicitly skipped when the private SDK is absent; the base suite
+still tests the missing-dependency message and the no-SDK/no-AWS scanning boundary. The
+integration tests use the real SDK with mocked Lambda transport, not paid model calls.

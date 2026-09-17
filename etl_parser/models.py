@@ -88,6 +88,7 @@ class TableEdge(_Model):
     job_id: str
     source_file: str | None = None
     line: int | None = None
+    transformation: Transformation = Field(default_factory=Transformation)
 
 
 class Schedule(_Model):
@@ -204,6 +205,33 @@ class LineageDocument(_Model):
 
     def sorted(self) -> LineageDocument:
         """Return a copy with every list ordered so serialization is deterministic."""
+        self = self.model_copy(deep=True)
+        for dataset in self.datasets:
+            dataset.aliases = sorted(set(dataset.aliases))
+            dataset.columns = sorted(set(dataset.columns))
+        for job in self.jobs:
+            job.inputs = sorted(set(job.inputs))
+            job.outputs = sorted(set(job.outputs))
+        for schedule in self.schedules.values():
+            schedule.tags = sorted(set(schedule.tags))
+            schedule.declared_upstream = sorted(set(schedule.declared_upstream))
+            schedule.declared_downstream = sorted(set(schedule.declared_downstream))
+        for dependencies in self.job_dependencies.values():
+            for dependency in dependencies:
+                dependency.sources = sorted(set(dependency.sources))
+                dependency.via_datasets = sorted(set(dependency.via_datasets))
+        for edge in self.column_edges:
+            edge.sources = sorted(edge.sources, key=lambda r: r.model_dump_json())
+            edge.indirect_sources = sorted(edge.indirect_sources, key=lambda r: r.model_dump_json())
+        for product in self.products:
+            product.owners = sorted(set(product.owners))
+            product.databases = sorted(product.databases, key=lambda d: d.name)
+            for dependency in product.declared_dependencies:
+                dependency.tables = sorted(set(dependency.tables))
+            product.declared_dependencies.sort(key=lambda d: d.model_dump_json())
+        for unresolved in self.unresolved:
+            unresolved.symbols = sorted(set(unresolved.symbols))
+            unresolved.assumptions = dict(sorted(unresolved.assumptions.items()))
         return self.model_copy(
             update={
                 "products": sorted(self.products, key=lambda p: p.code),
@@ -217,10 +245,16 @@ class LineageDocument(_Model):
                 },
                 "column_edges": sorted(
                     self.column_edges,
-                    key=lambda e: (e.job_id, e.target.dataset_id, e.target.name),
+                    key=lambda e: (
+                        e.job_id,
+                        e.target.dataset_id,
+                        e.target.name,
+                        e.model_dump_json(),
+                    ),
                 ),
                 "table_edges": sorted(
-                    self.table_edges, key=lambda e: (e.job_id, e.source, e.target)
+                    self.table_edges,
+                    key=lambda e: (e.job_id, e.source, e.target, e.model_dump_json()),
                 ),
                 "unresolved": sorted(
                     self.unresolved,
