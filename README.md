@@ -86,7 +86,9 @@ as entry files.
 ZIP traversal paths, symlinks and ambiguous member names are rejected. Defaults limit each
 source to 5 MB, each archive to 50 MB uncompressed and 2,000 members. Duplicate module
 names require an unambiguous local match. Helper recursion/import depth is bounded.
-Remote ZIP downloads, compiled extensions and nested ZIPs are not executed or unpacked.
+ZIP blobs inside a GitHub repository can also be inspected through the GitHub source
+provider. Arbitrary external ZIP downloads, compiled extensions and nested ZIPs are
+not executed or unpacked.
 
 ## Coverage and confidence
 
@@ -201,6 +203,167 @@ columns inherit descriptions; computed columns receive prompts containing their 
 expressions and upstream descriptions. Invalid, empty, truncated, blocked, or tool-request
 responses are skipped with warnings. Partial lineage is never sent for enrichment.
 
+## Logs and metrics
+
+Console logging is on by default (JSON events on **stderr**, leaving stdout JSON clean).
+All CLI commands accept `--log-dir` and `--log-level`. Detailed file logs include DEBUG
+findings even when the console level is INFO or WARNING.
+
+```sh
+etl-parser scan ./etl-repo --schema catalog.json --out lineage.json \
+  --log-dir ./run-logs --log-level INFO
+etl-parser describe lineage.json --catalog catalog.json --out enriched.json \
+  --lambda-arn YOUR_FUNCTION --model YOUR_MODEL --aws-profile YOUR_PROFILE \
+  --log-dir ./run-logs
+```
+
+Each run gets a unique UTC/run-ID directory containing `events.jsonl`, `metrics.json`,
+and `manifest.json`. Events identify the actor, stage, file/job, reason, run/span IDs
+and AI request IDs. They cover source discovery/imports/ZIPs, parser findings,
+diagnostics, graph building, exports, description eligibility, model invocation and
+response acceptance/rejection. The manifest includes redacted configuration.
+
+Metrics include file/byte counts, raw findings and final graph counts, confidence
+buckets, diagnostic categories, per-stage timing, whole-run throughput, bounded
+recent latency percentiles, AI attempts/completions/failures, SDK-reported token/cache
+usage, and existing/inherited/generated/skipped/failed description counts. Cost and
+independently measured accuracy remain `null` when unavailable—not fabricated values.
+Zero SDK usage can mean missing provider reporting; it is counted separately.
+
+`scan`, `run` and `describe` accept `--log-max-bytes` (default 10 MB per event file) and
+`--log-max-files` (default 20 per run). A single event may exceed the rotation threshold;
+fields are bounded and truncation is marked. Reaching the file limit or encountering
+a disk error visibly marks persisted logging incomplete; deterministic work can
+continue, but subsequent description calls are skipped if their persistent audit
+has failed. Logs are never silently deleted to make space. Retention across runs is
+caller-managed. No raw source, prompts, responses, provider exception messages or
+SDK raw usage payloads are logged. Metadata redaction is best-effort: treat logs as
+sensitive because dataset names, file paths and other structural identifiers remain.
+
+Python callers can use `scan(path, log_dir=..., log_level="INFO")` and
+`engine.run(doc, catalog, log_dir=...)` / `await engine.arun(...)`. Advanced callers
+can supply a `RunObserver` to share counters and customize rotation limits, then
+call `observer.finish()` when their run ends. Existing application logging handlers
+are not replaced. No telemetry is uploaded.
+
+## Optional AI lineage and shared descriptions
+
+`run` always parses deterministically first. Both AI lineage and descriptions default
+off. AI modes are additive, evidence-checked assistance—not proof of correctness.
+
+| Controls | Behavior |
+| --- | --- |
+| Defaults | Deterministic lineage only; zero AI calls |
+| `--descriptions` | Generate missing supported descriptions; reuse the same call for a separate background lineage comparison where feasible |
+| `--descriptions --no-background-comparison` | Descriptions without asking for shadow lineage |
+| `--ai-lineage fallback` | Review only files with diagnostics, partial mappings or input/output jobs missing column edges |
+| `--ai-lineage improve` | Review selected ETL files, including confidently parsed files |
+| `--ai-lineage fallback --descriptions` | Share lineage and description work in one response per selected file |
+| `--dry-run` | Parse and explain proposed AI work without constructing/calling the SDK |
+
+```sh
+# Defaults: no credentials or AI required.
+etl-parser run ./etl --schema catalog.json --out-dir ./artifacts --log-dir ./logs
+
+# File-level fallback, with descriptions in the same response where requested.
+etl-parser run ./etl --ai-lineage fallback --descriptions \
+  --lambda-arn YOUR_FUNCTION --model YOUR_MODEL --aws-profile YOUR_PROFILE \
+  --max-calls 20 --out-dir ./artifacts --log-dir ./logs
+
+# Descriptions and opportunistic background comparison; main lineage stays unchanged.
+etl-parser run ./etl --descriptions --lambda-arn YOUR_FUNCTION --model YOUR_MODEL
+
+# Broader review, restricted to selected files. Repeating globs adds alternatives.
+etl-parser run ./etl --ai-lineage improve --include 'jobs/*.py' --exclude '*secret*' \
+  --lambda-arn YOUR_FUNCTION --model YOUR_MODEL --dry-run
+```
+
+With AI lineage off, **no extra call is ever scheduled just to compare lineage**.
+If descriptions already exist or can be inherited, no background call is made.
+If source context is too large, comparison is dropped and description-only work
+is attempted within the same budget. Explicit lineage modes may make their own
+authorized calls. There is no implicit paid retry, repair call, or source chunking.
+
+Policy code chooses files and accepts changes; the model has no tools and cannot
+expand its scope. Responses must match a strict versioned schema. Evidence checks
+cover file/job ownership, source digest, lines, exact quotes, physical identifiers
+and known schema columns. This does not prove semantic correctness. Exact baseline
+mappings and all original diagnostics remain; conflicting changes are deferred.
+Accepted AI additions are marked `inferred`, with model/request/evidence provenance.
+If a file's audit fails during processing, its AI mutations are rolled back.
+
+Descriptions preserve prior text (`--prior catalog.json`) and inherit exact identity
+descriptions without a model. Source-backed `run` batches remaining requested targets
+by file and asks for structured descriptions plus optional lineage. Descriptions
+contradicting the effective mappings are not published; partial mappings need accepted
+AI support. Legacy `describe lineage.json` remains evidence-only, per-column enrichment:
+it cannot compare missing source snapshots and never schedules a source audit.
+
+Controls and default bounds:
+
+- `--max-calls 20`, `--max-output-tokens 4096`, `--max-context-chars 60000`.
+- `--max-total-tokens` optionally bounds conservative reservations and reported usage.
+  Missing usage retains the reservation; this is not a billing guarantee.
+- `--timeout-seconds 60`, `--deadline-seconds 600` for the AI stage; calls are serial.
+  Cancelling a timed-out request cannot guarantee an already-running Lambda stops billing.
+- `--include` / `--exclude` select AI files, not deterministic source inventory.
+- `--strict` exits nonzero for unresolved or incomplete work; without it partial artifacts
+  remain usable. Configuration/scan failures still fail normally.
+- `--config settings.json` accepts `AnalysisConfig` fields; explicit CLI flags override
+  environment-backed provider settings, then config, then defaults. Unknown fields fail.
+- Existing schema/bindings/products/engine/dialect/Glue/trusted-plugin controls also work.
+
+Each `--out-dir` gets an exclusive `run_<id>/` folder with `lineage.json` (effective),
+`lineage.deterministic.json`, `catalog.json`, `decisions.json`, `changes.json`,
+`work-plan.json`, and a final atomic `manifest.json` with config/source/output digests.
+When reviewed, `lineage.ai.json` and `lineage.comparison.json` are separate artifacts.
+Comparisons report column/table additions, absences, agreements and textual expression
+differences; they are parser-assisted and **not independent accuracy measurements**.
+Raw code is absent from event logs, but lineage/change artifacts contain expressions;
+protect those artifacts as source-sensitive data. File permissions are owner-private.
+
+```python
+from etl_parser.ai_analysis import AnalysisConfig, analyze, analyze_async
+from etl_parser.artifacts import write_analysis
+
+result = analyze("./etl", config=AnalysisConfig(), log_dir="./logs")
+folder = write_analysis(result, "./artifacts")
+# In async applications: result = await analyze_async("./etl", config=...)
+```
+
+Use your trusted private Agent SDK installation described above. Enabling AI sends
+selected file content and lineage evidence to your configured Lambda/model service.
+`--aws-profile` selects credentials; it does not perform AWS SSO/login for you.
+
+## GitHub repositories without cloning
+
+```sh
+etl-parser scan https://github.com/OWNER/REPO --ref COMMIT_OR_BRANCH --path jobs \
+  --out lineage.json --log-dir ./logs
+etl-parser run https://github.com/OWNER/REPO --ref COMMIT_SHA --path jobs/example.py \
+  --out-dir ./artifacts --log-dir ./logs
+```
+
+Use a repository URL, with branch/tag/commit and file/directory/ZIP path as separate
+options. The default branch is resolved once; all subsequent tree/blob reads use
+that snapshot. No clone, checkout, source-file materialization or code execution occurs.
+The same source index supports Python helpers, in-repository ZIPs, SQL, DAGs and
+`product.yaml`. Unsupported files are counted/skipped rather than parsed as code.
+
+Private repositories use `GITHUB_TOKEN` or `GH_TOKEN`; never put tokens in the URL.
+API requests use the fixed GitHub API host and reject redirects. Truncated recursive
+trees fall back to subtree walking. Symlinks, submodules, LFS pointers, binary/oversized
+sources and read failures are reported; external objects are not fetched implicitly.
+
+Defaults: 20,000 inventory entries, 5 MB per source/blob, 100 MB cumulative downloaded
+and indexed archive source bytes, 30-second request timeout and two retries for
+retryable failures. Rate-limit waits over 30 seconds stop visibly instead of silently
+waiting for hours. Advanced Python callers can configure `GitHubSource` limits and
+pass it as `scan(..., source_provider=provider)` or through `analyze`. Requests are
+serial; GitHub Enterprise/App auth and cross-run disk caches are not implemented.
+Filesystem parity means equal semantics for the same supported snapshot—not equal
+network latency or access to unbounded/external dependencies.
+
 ## Development
 
 ```sh
@@ -215,6 +378,17 @@ The test suite includes the 28-script ETL corpus, three product fixtures, regres
 for alias/dynamic-name handling, local ZIP helpers, DAG dependencies, exports and the CLI.
 See [implementation review](docs/implementation-review.md) for the review of the original
 11-step plan and explicit deviations.
+The [follow-up delivery plan](docs/superpowers/plans/2026-09-17-ai-lineage-observability-github.md)
+records implemented AI modes, same-call background comparisons, logs/metrics and
+clone-free GitHub scanning. See the [plain-language delivery report](docs/reports/2026-09-18-delivery-report.md)
+for the request-to-feature mapping, test evidence and explicit limits.
 SDK-dependent tests are explicitly skipped when the private SDK is absent; the base suite
 still tests the missing-dependency message and the no-SDK/no-AWS scanning boundary. The
 integration tests use the real SDK with mocked Lambda transport, not paid model calls.
+
+For a repeatable local performance probe (not an accuracy/production-capacity claim):
+
+```sh
+python -m benchmarks.scan_benchmark --synthetic-files 500 --repeats 3
+python -m benchmarks.scan_benchmark --source ./etl --schema catalog.json
+```

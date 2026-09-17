@@ -114,3 +114,52 @@ def test_real_sdk_lambda_invoke_contract(tmp_path, monkeypatch, web_adapter):
         payload = json.loads(payload["body"])
     assert payload["modelId"] == model
     assert payload["payload"]["messages"][0]["role"] == "user"
+
+
+def test_description_usage_and_decisions_are_logged_without_payloads(tmp_path):
+    from agent_sdk.usage import Usage
+
+    (tmp_path / "job.sql").write_text("CREATE TABLE b.t AS SELECT x * 2 AS y FROM a.s")
+    doc = scan(tmp_path).document
+    runner = FakeLLMRunner(
+        [
+            LLMResponse(
+                content=[{"type": "text", "text": '{"description":"PRIVATE DESCRIPTION"}'}],
+                stop_reason="end_turn",
+                usage=Usage(
+                    input_tokens=20,
+                    output_tokens=5,
+                    cache_read_tokens=3,
+                    raw={"provider_private_value": "DO NOT LOG RAW"},
+                ),
+            )
+        ]
+    )
+    engine = DescriptionEngine(runner, model="test-model")
+    engine.run(doc, export_agent_catalog(doc), log_dir=tmp_path / "logs")
+    folder = next((tmp_path / "logs").iterdir())
+    metrics = json.loads((folder / "metrics.json").read_text())
+    events = (folder / "events.jsonl").read_text()
+    assert metrics["counters"]["ai.calls.attempted"] == 1
+    assert metrics["counters"]["ai.usage.input_tokens"] == 20
+    assert metrics["counters"]["ai.usage.cache_read_tokens"] == 3
+    assert metrics["counters"]["descriptions.generated"] == 1
+    assert "ai.request.started" in events and "description.accepted" in events
+    assert "PRIVATE DESCRIPTION" not in events
+    assert "DO NOT LOG RAW" not in events
+
+
+def test_provider_error_is_counted_without_logging_error_payload(tmp_path):
+    (tmp_path / "job.sql").write_text("CREATE TABLE b.t AS SELECT x * 2 AS y FROM a.s")
+    doc = scan(tmp_path).document
+
+    def unavailable(*args):
+        raise RuntimeError("SENSITIVE_PROVIDER_ERROR")
+
+    engine = DescriptionEngine(FakeLLMRunner([unavailable]), model="test-model")
+    engine.run(doc, export_agent_catalog(doc), log_dir=tmp_path / "logs")
+    folder = next((tmp_path / "logs").iterdir())
+    metrics = json.loads((folder / "metrics.json").read_text())
+    assert metrics["counters"]["ai.calls.failed"] == 1
+    assert metrics["status"] == "partial"
+    assert "SENSITIVE_PROVIDER_ERROR" not in (folder / "events.jsonl").read_text()

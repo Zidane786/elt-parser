@@ -14,6 +14,10 @@
 See `docs/implementation-review.md` for delivered evidence, corrections, and explicit
 static-analysis limits. Task 10 below is amended to the requested Agent SDK integration.
 
+**Follow-up proposal (2026-09-17):** [Optional AI lineage, observability, and GitHub
+sources](2026-09-17-ai-lineage-observability-github.md) records the subsequent discussion.
+It is planned work, not part of the shipped deterministic-only lineage behavior.
+
 ## Global Constraints
 
 - No LLM calls outside `describe/`, which uses the private Agent SDK's Lambda Bedrock invoke runner. Lineage is deterministic.

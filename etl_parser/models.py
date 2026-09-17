@@ -70,6 +70,9 @@ class Provenance(_Model):
     confidence: Confidence = "exact"
     dialect: str | None = None
     scan_commit: str | None = None
+    model_id: str | None = None
+    request_id: str | None = None
+    evidence_digest: str | None = None
 
 
 class ColumnEdge(_Model):
