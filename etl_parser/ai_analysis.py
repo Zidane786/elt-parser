@@ -916,6 +916,25 @@ async def analyze_async(
             http_status = getattr(exc, "status_code", None)
             if type(http_status) is not int or not 100 <= http_status <= 599:
                 http_status = None
+            # SDKs may wrap HTTP transport failures. Whitelist cause types only;
+            # exception messages can contain credentials and response payloads.
+            cause = exc.__cause__
+            transport_error = type(cause).__name__ if cause is not None else None
+            if type(cause).__module__.split(".")[0] != "httpx" or transport_error not in {
+                "ConnectTimeout",
+                "ReadTimeout",
+                "WriteTimeout",
+                "PoolTimeout",
+                "ConnectError",
+                "ReadError",
+                "WriteError",
+                "CloseError",
+                "RemoteProtocolError",
+                "LocalProtocolError",
+                "ProxyError",
+                "UnsupportedProtocol",
+            }:
+                transport_error = None
             retry_after = getattr(exc, "retry_after", None)
             if (
                 type(retry_after) not in {int, float}
@@ -956,6 +975,13 @@ async def analyze_async(
                         http_status=http_status,
                         retry_after_seconds=retry_after,
                     )
+            elif transport_error:
+                reason = (
+                    "timeout"
+                    if transport_error.endswith("Timeout")
+                    else "provider_transport_failure"
+                )
+                observer.count(f"ai.provider.transport.{transport_error}")
             validation_errors = (
                 [
                     {"location": e["loc"], "type": e["type"]}
@@ -977,6 +1003,7 @@ async def analyze_async(
                 validation_errors=validation_errors,
                 http_status=http_status,
                 retry_after_seconds=retry_after,
+                transport_error_type=transport_error,
             )
             result.warnings.append(f"{source.path}: {reason} ({type(exc).__name__})")
             result.decisions.append(
@@ -989,6 +1016,7 @@ async def analyze_async(
                     "validation_errors": validation_errors,
                     "http_status": http_status,
                     "retry_after_seconds": retry_after,
+                    "transport_error_type": transport_error,
                 }
             )
         finally:

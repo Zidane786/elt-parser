@@ -4,6 +4,9 @@ Static table and column lineage for SQL, PySpark, Pandas, Polars and Airflow.
 Scans a repository, directory or file without importing or running its ETL code.
 Local ZIP libraries are indexed and helper calls are followed within a bounded depth.
 
+Usage guides: [CLI commands and configuration](docs/cli.md) ·
+[Python SDK and backend integration](docs/sdk.md).
+
 Quick navigation: [commands and help](#complete-command-reference),
 [catalog template](#catalog-input-template), [runner selection](#runner-selection-and-gateway-settings),
 [supported analysis](#coverage-and-confidence), [AI modes](#optional-ai-lineage-and-shared-descriptions),
@@ -138,96 +141,9 @@ document = graph.to_document()
 
 ### Python SDK for backend services
 
-The same installed `etl-parser` package supports both CLI and direct Python use;
-no subprocess, CLI invocation, or additional HTTP service is required. Public imports:
-`ParserClient`, `AnalysisConfig`, `AnalysisRun`, `scan`, `analyze`, `analyze_async`.
-`scan` returns a `LineageGraph`; the analysis/client methods return `AnalysisRun`.
-
-```python
-from etl_parser import AnalysisConfig, ParserClient
-from etl_parser.workers.sql import DictSchemaProvider
-
-client = ParserClient(
-    config=AnalysisConfig(),  # AI lineage and descriptions both OFF
-    log_dir="./logs",         # omit for console-only logging
-    log_level="INFO",
-)
-result = client.run(
-    "./etl-repo",
-    schema=DictSchemaProvider("catalog.json"),
-    bindings={"env:ENV": "prod"},
-    out_dir="./artifacts",    # omit for in-memory results only
-)
-payload = result.to_dict()    # JSON-compatible response for your backend
-print(result.status, result.run_id, result.metrics)
-```
-
-Inside an async backend, reuse the client and **await `client.arun`**:
-
-```python
-async def analyze_job(trusted_source_path):
-    result = await client.arun(trusted_source_path)
-    return result.to_dict()
-```
-
-Synchronous filesystem/GitHub scanning and artifact export run in worker threads,
-not on the event loop. Each client invocation has isolated provider clients, metrics,
-logs and results, including concurrent invocations. Client configuration is copied
-on construction and per invocation. A call's `config=` replaces the client default
-configuration (it is not a partial merge). No source snapshots, credentials or custom
-header values are included in `to_dict()`; lineage expressions/descriptions are still
-sensitive. No artifact files are written unless `out_dir` is supplied, and no log
-files are written unless `log_dir` is supplied.
-
-Optional AI uses the same policy and runner controls as the CLI:
-
-```python
-import os
-from etl_parser import AnalysisConfig, ParserClient
-
-ai_client = ParserClient(config=AnalysisConfig(
-    runner="anthropic",
-    base_url=os.environ["ANTHROPIC_API_BASE_URL"],
-    api_key=os.environ["ANTHROPIC_API_KEY"],
-    model=os.environ["ETL_PARSER_MODEL"],
-    extra_headers={},          # optional JSON-compatible string dictionary
-    ai_lineage="improve",     # or "fallback"; "off" preserves deterministic main lineage
-    descriptions=True,
-    max_output_tokens=16000,   # configurable, e.g. 8000 or 24000 if your model allows
-    timeout_seconds=300,
-    deadline_seconds=3600,
-    max_calls=20,
-))
-# result = await ai_client.arun("./etl-repo")
-
-lambda_config = AnalysisConfig(
-    runner="lbi",             # alias for lambda-bedrock-invoke
-    lambda_arn=os.environ["ETL_PARSER_LAMBDA_ARN"],  # non-streaming ARN
-    model=os.environ["ETL_PARSER_MODEL"],
-    aws_profile="development",  # omit for a backend IAM role
-    ai_lineage="fallback",
-)
-```
-
-SDK settings are explicit: unlike CLI options, `AnalysisConfig` does not implicitly
-load environment credentials. Scanner options (`schema`, `bindings`, `parsers`,
-`source_provider`, `sql_engine`, `sql_dialect`, `default_db`, `products`, `ref`,
-`source_path`, `scan_commit`) are forwarded unchanged. GitHub example:
-`await client.arun("https://github.com/owner/repo", ref="main", source_path="etl")`.
-Use `prior=<catalog dict>` to preserve descriptions. Log directory/level and rotation
-limits can be overridden per invocation. Advanced caller-owned observers remain
-available through `analyze`/`analyze_async`; `ParserClient` owns its own observer.
-An injected `runner=` remains caller-owned: close it yourself and ensure it supports
-your concurrency/event-loop usage.
-
-Check `result.status`, `warnings`, `decisions`, and `document.unresolved` before treating
-results as complete. AI file failures return partial results; invalid configuration,
-scan/export failures, and cancellation raise to the caller. SDK log summaries finalize
-on errors/cancellation. Cancelling does not forcibly stop a synchronous scan already
-running in a worker thread, or guarantee that the remote provider stops billing.
-For production, bound job concurrency in your backend/queue, authorize source paths
-and GitHub repositories, and keep runner credentials/configuration server-controlled.
-There is no bundled HTTP server, distributed job queue, or tenant-authentication layer.
+See the [complete SDK guide](docs/sdk.md) for synchronous and asynchronous clients,
+all configuration fields, service integration, exports, logging and source providers.
+The [CLI guide](docs/cli.md) covers shell usage and its differences from the SDK.
 
 Every parser or orchestrator returns the same `WorkerResult`. Add a plugin without changing
 the graph, impact analyzer or exporters:
@@ -472,11 +388,19 @@ etl-parser run ./etl --descriptions --runner lbi \
 # Set ANTHROPIC_API_KEY securely in your environment first; do not commit it.
 # Base URL includes the gateway prefix, not /v1/messages (the SDK adds that).
 etl-parser run ./etl --descriptions --runner anthropic \
-  --base-url https://gateway.example/aigw --model codex/gpt-5.6-terra \
+  --base-url https://gateway.example/api --model YOUR_MODEL \
   --log-dir ./logs --out-dir ./artifacts
 
 etl-parser describe lineage.json --catalog catalog.json --out enriched.json \
-  --runner anthropic --base-url https://gateway.example/aigw --model codex/gpt-5.6-terra
+  --runner anthropic --base-url https://gateway.example/api --model YOUR_MODEL
+
+# Alternatively, supply your compatible gateway through an environment variable.
+# Set ANTHROPIC_API_KEY securely; never put the key in committed settings.
+export ANTHROPIC_BASE_URL=https://gateway.example/api
+etl-parser run ./etl --runner anthropic --model YOUR_MODEL \
+  --base-url "$ANTHROPIC_BASE_URL" \
+  --ai-lineage improve --descriptions --max-output-tokens 16000 \
+  --log-dir ./logs --out-dir ./artifacts
 
 # Optional custom headers, only if your gateway requires them:
 etl-parser run ./etl --descriptions --runner anthropic \
@@ -488,7 +412,7 @@ etl-parser run ./etl --descriptions --runner anthropic \
   --base-url https://gateway.example/aigw --model YOUR_MODEL --extra-headers-file headers.json
 ```
 
-No extra headers are added by default. The gateway tested for this project uses **no
+No extra headers are added by default. The gateways tested for this project use **no
 extra headers**. Header values must be strings; JSON booleans such as `true` must be
 written as `"true"`. `--extra-headers` and `--extra-headers-file` are mutually exclusive.
 Header overrides are passed to the SDK, including custom auth/routing headers; transport
@@ -524,7 +448,7 @@ Example non-secret `settings.json`:
 {
   "runner": "anthropic",
   "base_url": "https://gateway.example/aigw",
-  "model": "codex/gpt-5.6-terra",
+  "model": "YOUR_MODEL",
   "ai_lineage": "fallback",
   "descriptions": true,
   "background_comparison": true,
@@ -613,154 +537,8 @@ network latency or access to unbounded/external dependencies.
 
 ## Complete command reference
 
-`etl-parser` and `python -m etl_parser` are equivalent. Every command/group supports
-`--help`, including commands with required positional arguments. Get help without
-credentials or network calls:
-
-```sh
-etl-parser --help
-etl-parser run --help
-etl-parser scan --help
-etl-parser describe --help
-etl-parser export --help
-etl-parser export catalog --help
-etl-parser export openlineage --help
-etl-parser impact --help
-etl-parser products --help
-```
-
-Top-level shell helpers: `--show-completion` prints shell-completion setup;
-`--install-completion` installs it. No command starts a live AI request just to show help.
-
-### All command forms
-
-| Command | Positional arguments | Purpose and result |
-| --- | --- | --- |
-| `run SOURCE` | Local path or GitHub repository URL | Deterministic analysis plus enabled AI stages; unique artifact directory and stdout summary |
-| `scan REPO` | Local path or GitHub repository URL | Deterministic-only native JSON; no LLM |
-| `describe LINEAGE` | Saved native lineage JSON | Enrich an existing catalog through the chosen SDK runner |
-| `export catalog LINEAGE` | Saved native lineage JSON | Agent catalog JSON, optionally preserving prior metadata |
-| `export openlineage LINEAGE` | Saved native lineage JSON | Directory of static OpenLineage event JSON files |
-| `impact LINEAGE NODE` | Saved native JSON and canonical dataset or `dataset#column` | Downstream by default; `--upstream` reverses traversal |
-| `products LINEAGE` | Saved native lineage JSON | Observed/declared product dependencies and orchestration drift |
-
-```sh
-etl-parser run ./etl --out-dir ./artifacts
-etl-parser scan ./etl --out lineage.json
-etl-parser describe lineage.json --catalog catalog.json --out enriched.json \
-  --runner lbi --lambda-arn MY_FUNCTION --model MY_MODEL
-etl-parser export catalog lineage.json --prior catalog.json --out catalog.updated.json
-etl-parser export openlineage lineage.json --out ./openlineage-events
-etl-parser impact lineage.json 'glue://raw/orders' --depth 2
-etl-parser impact lineage.json 'glue://analytics/order_totals#double_amount' --upstream
-etl-parser products lineage.json
-```
-
-### Source and schema options (`run`, `scan`)
-
-| Option | Default / behavior |
-| --- | --- |
-| `--schema PATH` | Optional JSON catalog or schema-only mapping; mutually exclusive with Glue lookup |
-| `--glue` / `--no-glue` | Off by default; explicitly fetch schemas from AWS Glue |
-| `--bindings PATH` | JSON string-to-string substitutions; defaults to none |
-| `--products PATH` | Optional explicit local product registry file; otherwise discover repository metadata |
-| `--default-db TEXT` | Default namespace for unqualified table names |
-| `--engine TEXT` | `athena`; table namespace/executing SQL engine |
-| `--dialect TEXT` | Optional SQL-file dialect override |
-| `--plugin MODULE:FACTORY` | Repeatable trusted installed parser/orchestrator factories |
-| `--ref TEXT` | GitHub branch/tag/commit, resolved once; GitHub-only |
-| `--path TEXT` | GitHub-relative file/directory/ZIP selection; GitHub-only |
-| `--region TEXT` | AWS region; `run` also uses this for Lambda, `scan` uses it for explicit Glue lookup |
-
-`scan --out PATH` defaults to `lineage.json`. `run --out-dir PATH` defaults to `artifacts`.
-`run --prior PATH` preserves an existing catalog. Schema/product/binding/prior inputs
-remain explicit local JSON/YAML configuration paths even when scanning GitHub source.
-GitHub limits and advanced provider configuration are documented above and in the Python API.
-
-### AI/run policy options (`run`)
-
-| Option | Default / behavior |
-| --- | --- |
-| `--config PATH` | Optional JSON `AnalysisConfig`; unknown fields rejected |
-| `--ai-lineage off\|fallback\|improve` | `off`; only explicit fallback/improve can add main lineage |
-| `--descriptions` / `--no-descriptions` | Off; generate missing supported descriptions |
-| `--background-comparison` / `--no-background-comparison` | Allowed by default only within a needed description call; never enables AI alone |
-| `--dry-run` / `--no-dry-run` | Off; enabled means deterministic scan/work plan and zero model calls |
-| `--max-calls INTEGER` | 20; zero means no calls; upper validation bound 10,000 |
-| `--max-output-tokens INTEGER` | 16,000 per response; must also fit the selected model's limits |
-| `--max-context-chars INTEGER` | 60,000 serialized context characters; valid range 1,024–1,000,000 |
-| `--max-total-tokens INTEGER` | Optional conservative reservation/accounting budget; not a provider billing guarantee |
-| `--timeout-seconds NUMBER` | 300 per model request; maximum 600 |
-| `--deadline-seconds NUMBER` | 3,600 for the AI stage; deterministic scan time is separate |
-| `--include GLOB` | Repeatable AI file inclusions; defaults to `*` |
-| `--exclude GLOB` | Repeatable AI file exclusions; exclusions win |
-| `--strict` / `--no-strict` | Off; fail for unresolved/incomplete work instead of only reporting partial status |
-
-The source still gets deterministic analysis even if an AI filter excludes it.
-`--max-calls` is a request limit, not a target: inheritance/skips can mean fewer calls.
-
-### Runner options (`run`, `describe`)
-
-| Option | Default / behavior |
-| --- | --- |
-| `--runner lambda-bedrock-invoke\|lbi\|anthropic` | `lambda-bedrock-invoke`; `lbi` is its alias |
-| `--model TEXT` | Required for actual AI work; provider-specific ID/registered slug, no hard-coded model |
-| `--lambda-arn TEXT` | Function name/ARN for Lambda Bedrock Invoke only |
-| `--aws-profile TEXT` | Optional AWS profile for Lambda; omitted uses credential chain |
-| `--region TEXT` | `us-east-1` unless configured; Lambda region |
-| `--web-adapter` / `--no-web-adapter` | On; `/bedrock` adapter envelope vs flat `{modelId,payload}` Lambda handler |
-| `--base-url HTTPS_URL` | Required Anthropic-compatible root; no silent public-endpoint fallback |
-| `--api-key TEXT` | Anthropic key; prefer `ANTHROPIC_API_KEY` environment variable |
-| `--extra-headers JSON` | Optional custom header string object; empty by default |
-| `--extra-headers-file PATH` | Optional JSON header file instead of inline JSON |
-
-Current calls are **non-streaming** `complete()` requests. LBI uses buffered Lambda
-`invoke` and the `/bedrock` route with the Web Adapter enabled—not
-`invoke_with_response_stream` or `/bedrock_stream`. Supply the buffered function ARN
-if your deployment has separate buffered/streaming functions. No `--stream` or separate
-`--stream-lambda-arn` option is implemented.
-
-### Description/export/query options
-
-| Command | Command-specific options |
-| --- | --- |
-| `describe` | Required `--catalog PATH`, `--out PATH`, `--model`; shared runner settings; `--max-tokens` defaults to 16,000 per column |
-| `export catalog` | Required `--out PATH`; optional `--prior PATH` to preserve metadata |
-| `export openlineage` | Required `--out DIRECTORY`; creates directory and writes one event per job |
-| `impact` | `--upstream` (otherwise downstream); optional `--depth INTEGER` ≥ 0; no limit when omitted |
-| `products` | No extra policy options; reads native product/DAG evidence |
-
-Legacy `describe` has no repository source context, combined lineage stage, or unified
-run budgets/strictness. Use `run` for those controls. Its provider failures leave affected
-descriptions unchanged and emit warnings; an empty description is not fabricated.
-
-### Logging and exit behavior
-
-All seven leaf commands accept `--log-dir DIRECTORY` (optional persistence) and
-`--log-level DEBUG|INFO|WARNING|ERROR|CRITICAL` (console default INFO). `run`, `scan`,
-and `describe` additionally accept `--log-max-bytes` (10,000,000) and `--log-max-files`
-(20). File logs retain DEBUG events independently of console verbosity.
-
-`run` writes useful partial results and reports status unless `--strict` is set.
-`scan` exits 1 for `unsupported_syntax`; other unresolved kinds remain in its summary.
-Command/configuration failures are nonzero. Inspect warnings, diagnostics and manifests,
-not just the exit code. JSON summaries/results go to stdout, logs to stderr.
-
-### Requests and prompt caching
-
-Source-backed AI analysis makes at most one attempted request per selected file per run,
-sharing lineage/descriptions when requested. Legacy descriptions can make one request
-per eligible column. Both paths log SDK input/output and cache-read/write usage when
-reported. There is no local answer cache, cross-run response cache, or explicit prompt
-cache configuration in this release; no cache tuning was added for the user's question.
-Provider/gateway-side caching may still occur and is not guaranteed by selecting a runner.
-
-Supported OpenAI models enable prompt caching by default; matching prefixes, model
-rules and provider settings determine reuse. That does not prove an Anthropic-compatible
-gateway forwards the same options/accounting. See the
-[official prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching).
-Zero SDK cache fields can mean no cache use or missing gateway reporting; do not infer
-upstream billing from them alone. Each cached request still generates a new answer.
+See the [complete CLI guide](docs/cli.md) for every command, option, configuration
+setting, environment variable, output artifact and exit behavior.
 
 ## Development and explicit live checks
 
@@ -800,7 +578,7 @@ private folder unless `--out-dir` is provided. It never adds custom headers.
 ```sh
 python -m benchmarks.gateway_check --help
 python -m benchmarks.gateway_check --execute \
-  --base-url https://gateway.example/aigw --model codex/gpt-5.6-terra --max-calls 1
+  --base-url https://gateway.example/api --model YOUR_MODEL --max-calls 1
 python -m benchmarks.gateway_check --execute \
   --base-url https://gateway.example/aigw --model YOUR_MODEL \
   --source ./etl --schema catalog.json --ai-lineage fallback --max-calls 4

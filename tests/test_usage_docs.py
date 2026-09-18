@@ -43,18 +43,50 @@ def test_every_command_has_help_without_credentials(command, monkeypatch):
     assert "Usage:" in result.output
 
 
-def test_readme_covers_every_registered_option():
-    text = (ROOT / "README.md").read_text()
+def test_cli_guide_covers_every_registered_option():
+    text = (ROOT / "docs" / "cli.md").read_text()
 
     def check(command):
         for parameter in command.params:
             for option in getattr(parameter, "opts", []) + getattr(parameter, "secondary_opts", []):
                 if option.startswith("--"):
-                    assert option in text, f"Missing README documentation for {option}"
+                    assert option in text, f"Missing CLI documentation for {option}"
         for child in getattr(command, "commands", {}).values():
             check(child)
 
     check(get_command(app))
+
+
+def test_sdk_guide_covers_configuration_scan_options_and_public_api():
+    import inspect
+
+    import etl_parser
+    from etl_parser.ai_analysis import AnalysisConfig
+
+    text = (ROOT / "docs" / "sdk.md").read_text()
+    for name in AnalysisConfig.model_fields:
+        assert f"`{name}`" in text, f"Missing SDK configuration field {name}"
+    for name in inspect.signature(scan).parameters:
+        if name != "path":  # Named source in the client API.
+            assert f"`{name}`" in text, f"Missing SDK scan argument {name}"
+    for name in etl_parser.__all__:
+        assert name in text, f"Missing public SDK API {name}"
+
+
+def test_usage_guides_are_linked_and_python_examples_parse():
+    import ast
+    import re
+
+    readme = (ROOT / "README.md").read_text()
+    for filename in ("cli.md", "sdk.md"):
+        assert f"docs/{filename}" in readme
+        document = ROOT / "docs" / filename
+        text = document.read_text()
+        for snippet in re.findall(r"```python\n(.*?)```", text, re.S):
+            ast.parse(snippet)
+        for target in re.findall(r"\]\(([^)]+)\)", text):
+            if not target.startswith(("https://", "http://", "#")):
+                assert (document.parent / target.split("#", 1)[0]).exists(), target
 
 
 def test_catalog_template_is_valid_schema_and_prior(tmp_path):

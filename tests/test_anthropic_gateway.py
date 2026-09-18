@@ -39,7 +39,7 @@ def response(text):
             "role": "assistant",
             "content": [{"type": "text", "text": text}],
             "stop_reason": "end_turn",
-            "model": "codex/gpt-5.6-terra",
+            "model": "example-model",
             "usage": {"input_tokens": 100, "output_tokens": 20},
         },
     )
@@ -64,7 +64,7 @@ def test_real_anthropic_sdk_headers_model_and_analysis(monkeypatch, tmp_path, mo
         assert request.headers["x-duke-mode"] == "invoke"
         assert request.headers["x-duke-stream"] == "true"
         body = json.loads(request.content)
-        assert body["model"] == "codex/gpt-5.6-terra"
+        assert body["model"] == "example-model"
         content = body["messages"][0]["content"]
         data = json.loads(content if isinstance(content, str) else content[0]["text"])
         edge = data["deterministic_edges"][0]
@@ -100,7 +100,7 @@ def test_real_anthropic_sdk_headers_model_and_analysis(monkeypatch, tmp_path, mo
             runner="anthropic",
             api_key="PRIVATE_KEY",
             base_url="https://gateway.invalid/aigw",
-            model="codex/gpt-5.6-terra",
+            model="example-model",
             extra_headers={"x-duke-mode": "invoke", "x-duke-stream": "true"},
             ai_lineage=mode,
             descriptions=descriptions,
@@ -149,7 +149,7 @@ def test_legacy_describe_uses_anthropic_without_lambda_and_closes(monkeypatch, t
             "--base-url",
             "https://gateway.invalid/aigw",
             "--model",
-            "codex/gpt-5.6-terra",
+            "example-model",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -176,7 +176,7 @@ def test_anthropic_errors_do_not_retry_follow_redirect_or_leak(monkeypatch, tmp_
             runner="anthropic",
             api_key="PRIVATE_KEY",
             base_url="https://gateway.invalid",
-            model="codex/gpt-5.6-terra",
+            model="example-model",
             ai_lineage="improve",
         ),
         log_dir=tmp_path / "logs",
@@ -271,14 +271,26 @@ def test_invalid_schema_reports_safe_details_and_preserves_graph(monkeypatch, tm
     assert result.document == result.baseline
 
 
-def test_public_sdk_preserves_credentials_and_token_override(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "base_url,model",
+    [
+        ("https://gateway.invalid", "test"),
+        ("https://gateway.example/api/anthropic", "EXAMPLE-MODEL"),
+    ],
+)
+def test_public_sdk_preserves_credentials_and_token_override(
+    monkeypatch, tmp_path, base_url, model
+):
     from etl_parser import ParserClient
 
     source = tmp_path / "job.sql"
     source.write_text("CREATE TABLE db.t AS SELECT x FROM db.s")
 
     def handler(request):
+        assert str(request.url) == base_url + "/v1/messages"
         assert request.headers["x-api-key"] == "PRIVATE_KEY"
+        assert "x-duke-mode" not in request.headers
+        assert json.loads(request.content)["model"] == model
         assert json.loads(request.content)["max_tokens"] == 2222
         return response('{"complete":true}')
 
@@ -287,8 +299,8 @@ def test_public_sdk_preserves_credentials_and_token_override(monkeypatch, tmp_pa
         config=AnalysisConfig(
             runner="anthropic",
             api_key="PRIVATE_KEY",
-            base_url="https://gateway.invalid",
-            model="test",
+            base_url=base_url,
+            model=model,
             ai_lineage="improve",
             max_output_tokens=2222,
         ),
@@ -297,3 +309,38 @@ def test_public_sdk_preserves_credentials_and_token_override(monkeypatch, tmp_pa
     assert not result.warnings and result.metrics["counters"]["ai.calls.completed"] == 1
     assert all(client.is_closed for client in clients)
     assert "PRIVATE_KEY" not in json.dumps(result.to_dict())
+
+
+@pytest.mark.parametrize(
+    "error,reason",
+    [
+        (httpx.ReadTimeout, "timeout"),
+        (httpx.RemoteProtocolError, "provider_transport_failure"),
+    ],
+)
+def test_sdk_wrapped_transport_errors_are_classified_without_payload(
+    monkeypatch, tmp_path, error, reason
+):
+    from etl_parser import ParserClient
+
+    source = tmp_path / "job.sql"
+    source.write_text("CREATE TABLE db.t AS SELECT x FROM db.s")
+
+    def handler(request):
+        raise error("PRIVATE_TRANSPORT_DETAILS", request=request)
+
+    install_transport(monkeypatch, handler)
+    result = ParserClient(
+        config=AnalysisConfig(
+            runner="anthropic",
+            api_key="PRIVATE_KEY",
+            base_url="https://gateway.invalid",
+            model="test",
+            ai_lineage="improve",
+        ),
+        log_level="ERROR",
+    ).run(source)
+    assert result.decisions[0]["reason"] == reason
+    assert result.decisions[0]["transport_error_type"] == error.__name__
+    assert result.document == result.baseline
+    assert "PRIVATE_TRANSPORT_DETAILS" not in json.dumps(result.to_dict())

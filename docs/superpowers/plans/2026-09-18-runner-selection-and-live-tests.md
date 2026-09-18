@@ -9,7 +9,7 @@ live checks documented. See [validation report](../../reports/2026-09-18-gateway
 - [x] Support `AnthropicRunner` and Lambda Bedrock Invoke through the existing private SDK.
 - [x] Name the Lambda option `lambda-bedrock-invoke`, with `lbi` as an alias, not `bedrock`.
 - [x] Expose base URL, API key and optional JSON custom headers for Anthropic.
-- [x] Use the user's gateway/model `codex/gpt-5.6-terra` with **no extra headers** for live tests.
+- [x] Use the user's selected gateway/model with **no extra headers** for live tests.
 - [x] Keep secrets out of files/logs/commits; use hidden terminal input for live checks.
 - [x] Test the real ETL folder and all AI policy combinations in automated tests.
 - [x] Detailed README covering every command and available option, plus `--help` everywhere.
@@ -30,10 +30,13 @@ live checks documented. See [validation report](../../reports/2026-09-18-gateway
 - [x] Fix the live-discovered dataset/column-schema variable collision with regression test.
 - [x] Add sanitized schema-error locations/types and response digests for diagnosis.
 - [x] Full local tests, SDK-blocked tests, lint and whitespace checks passed.
-- [ ] Live-retest corrected code and failed/skipped files after approval availability returns.
-- [ ] Live fallback-only/background-only checks (additional call was blocked by workspace credits).
+- [x] Live-retest corrected code and failed/skipped files with the subsequently selected
+  replacement provider; all seven files returned valid responses across one run and one retry.
+- [x] Live fallback-only/background-only calls completed; retained partial
+  analysis and rejected proposals are detailed in the
+  [follow-up report](../../reports/2026-09-19-live-validation.md).
 - [x] Final release checks: 206 tests, lint, whitespace, credential-pattern scan,
   and offline source/wheel builds passed.
 
-Release instruction: commit and push this follow-up, then verify the remote branch;
-the two open live-validation items above remain separate follow-up work.
+Release instruction: commit and push this follow-up, then verify the remote branch.
+The follow-up checks exercise request modes, not exhaustive parser/model accuracy.

@@ -35,8 +35,8 @@ The framework currently uses **the non-streaming/buffered ARN**, `complete()`, b
 ## Actual live gateway used
 
 - SDK runner: `AnthropicRunner`, not a fake runner or direct custom HTTP client.
-- Base URL: `https://aigateway-beta-api.godigitaltc.com/aigw`.
-- Model: `codex/gpt-5.6-terra`, as explicitly requested by the user.
+- Base URL: user-supplied compatible gateway (identifier omitted at the user's request).
+- Model: explicitly selected by the user (identifier omitted at the user's request).
 - Authentication: the user-supplied API key, entered through a hidden terminal prompt.
 - Extra headers: **none**, following the user's correction.
 - Raw keys were not written to source/config/log files or committed.

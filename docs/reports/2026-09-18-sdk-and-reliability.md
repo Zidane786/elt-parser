@@ -1,5 +1,10 @@
 # Python SDK, larger response limits and failure handling
 
+Follow-up: the user switched providers and the outstanding live request scenarios
+were exercised successfully with the replacement provider, with partial-analysis limitations retained.
+See the [live validation report](2026-09-19-live-validation.md). The gateway
+blocker below describes the earlier run, not the current provider's state.
+
 ## What changed
 
 - The framework works as a CLI and an importable Python library. `ParserClient.run`
@@ -51,7 +56,7 @@
 
 The seven previously failed/skipped files were selected from the full repository,
 preserving import context. Live requests used `AnthropicRunner`, the supplied
-gateway/credentials, `codex/gpt-5.6-terra`, **no custom headers**, 16,000 output tokens,
+gateway/credentials and selected model, **no custom headers**, 16,000 output tokens,
 and the longer timeout/deadline. All seven returned provider errors before analysis.
 That run predated the HTTP-status/circuit-stopping changes in this patch.
 

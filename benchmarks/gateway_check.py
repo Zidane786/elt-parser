@@ -93,6 +93,7 @@ def main():
                     "reason": d.get("reason"),
                     "validation_errors": d.get("validation_errors", []),
                     "http_status": d.get("http_status"),
+                    "transport_error_type": d.get("transport_error_type"),
                     "response_complete": d.get("response_complete"),
                     "unfilled_descriptions": len(d.get("unfilled_descriptions", [])),
                 }
