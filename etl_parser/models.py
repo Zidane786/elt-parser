@@ -30,7 +30,10 @@ UnresolvedKind = Literal[
     "unresolved_import",
     "dynamic_schedule",
     "external_job",
+    "analysis_note",
+    "skipped_entry",
 ]
+Origin = Literal["parser", "ai", "runtime", "prior", "registry"]
 Orchestrator = Literal["airflow", "product_yaml", "cron_comment"]
 DependencySource = Literal["data", "dag"]
 
@@ -60,6 +63,10 @@ class DatasetRef(_Model):
             declared database.
         layer: Product-declared layer (e.g. raw/stage/mart) for the owning database.
         columns: Column names observed for this dataset across all jobs.
+        origin: Who introduced this dataset: ``parser`` (deterministic workers), ``ai``
+            (accepted AI proposal), ``runtime`` (OpenLineage events), ``prior`` (carried
+            from a prior catalog) or ``registry`` (product YAML).
+        provenance: Provenance of the introducing evidence when ``origin`` is not ``parser``.
     """
 
     id: str
@@ -71,6 +78,8 @@ class DatasetRef(_Model):
     product: str | None = None
     layer: str | None = None
     columns: list[str] = Field(default_factory=list)
+    origin: Origin = "parser"
+    provenance: Provenance | None = None
 
 
 class ColumnRef(_Model):
@@ -118,6 +127,9 @@ class Provenance(_Model):
         model_id: LLM model id, set only on AI-derived provenance.
         request_id: LLM request id, set only on AI-derived provenance.
         evidence_digest: Digest of the evidence an AI-derived edge was grounded in.
+        ai_confidence: The model's own 0-1 self-assessment for an AI-derived edge, so a
+            consumer can threshold AI output independently of ``confidence``.
+        ai_rationale: Short model-supplied reason behind ``ai_confidence``.
     """
 
     parser: str
@@ -127,6 +139,8 @@ class Provenance(_Model):
     model_id: str | None = None
     request_id: str | None = None
     evidence_digest: str | None = None
+    ai_confidence: float | None = Field(default=None, ge=0, le=1)
+    ai_rationale: str | None = Field(default=None, max_length=500)
 
 
 class ColumnEdge(_Model):
@@ -234,6 +248,11 @@ class Job(_Model):
         description: Human or AI-authored description; empty until filled downstream.
         inputs: Canonical ids of datasets this job reads.
         outputs: Canonical ids of datasets this job writes.
+        origin: ``parser`` for jobs found by deterministic workers, ``ai`` when an accepted
+            AI proposal introduced the job.
+        ai_inputs: Dataset ids added to ``inputs`` by accepted AI proposals, kept separate so
+            deterministic inputs stay distinguishable.
+        ai_outputs: Dataset ids added to ``outputs`` by accepted AI proposals.
     """
 
     id: str
@@ -248,6 +267,9 @@ class Job(_Model):
     description: str | None = None
     inputs: list[str] = Field(default_factory=list)
     outputs: list[str] = Field(default_factory=list)
+    origin: Origin = "parser"
+    ai_inputs: list[str] = Field(default_factory=list)
+    ai_outputs: list[str] = Field(default_factory=list)
 
 
 class JobDependency(_Model):
