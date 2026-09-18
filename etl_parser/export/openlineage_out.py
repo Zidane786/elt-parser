@@ -1,4 +1,10 @@
-"""OpenLineage events constructed with the official Python models."""
+"""OpenLineage events constructed with the official Python models (spec sections 3.3, 10).
+
+Implements the ``OpenLineageExporter`` role: one static ``RunEvent`` per job, with a
+``SchemaDatasetFacet`` on datasets with known columns and a ``ColumnLineageDatasetFacet``
+on outputs, so Collibra (via Edge), DataHub, and Marquez can all ingest the same files.
+Uses the ``openlineage-python`` generated classes for serialization and validation.
+"""
 
 from uuid import NAMESPACE_URL, uuid5
 
@@ -13,6 +19,21 @@ PRODUCER = "https://github.com/Zidane786/elt-parser"
 
 
 def export_openlineage(doc):
+    """Build one OpenLineage ``RunEvent`` dict per job in a lineage document.
+
+    Args:
+        doc: The scanned :class:`~etl_parser.models.LineageDocument`.
+
+    Returns:
+        list[dict]: One serialized ``RunEvent`` per job, sorted by job id, each with
+        ``eventType: COMPLETE``, a run id derived deterministically from the job id and
+        scan commit, input/output datasets (with a schema facet when columns are known),
+        and a column lineage facet on each output whose columns have edges. Transformation
+        kinds map to ``DIRECT`` (subtype ``IDENTITY``/``TRANSFORMATION``/``AGGREGATION``)
+        for direct sources and ``INDIRECT`` for indirect sources (filter/join/group-by/
+        window). ``eventTime`` uses ``doc.generated_at`` when set, else a static sentinel
+        timestamp, since these are static snapshots rather than real execution runs.
+    """
     datasets = {d.id: d for d in doc.datasets}
     events = []
     for job in sorted(doc.jobs, key=lambda j: j.id):

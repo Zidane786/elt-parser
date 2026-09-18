@@ -1,4 +1,14 @@
-"""Unique run output directories with atomic, owner-private artifact files."""
+"""Write analysis results to unique, owner-private, per-run output directories.
+
+Persists the deterministic and (optionally) AI-assisted lineage produced by
+:mod:`etl_parser.ai_analysis` to disk as the output-folder contract described in
+``docs/superpowers/specs/2026-09-17-ai-lineage-observability-github-design.md``:
+``decisions.json``, ``changes.json``, a work plan, lineage graphs and the catalog,
+plus a ``manifest.json`` written last as a completion marker. Every file is written
+to a temporary path first and atomically renamed into place so a crash mid-run never
+leaves a partially written artifact visible under its final name. The single entry
+point is :func:`write_analysis`.
+"""
 
 import json
 import os
@@ -10,6 +20,31 @@ from etl_parser.observability import current_observer, digest
 
 
 def write_analysis(result, directory):
+    """Write an :class:`~etl_parser.ai_analysis.AnalysisRun` result to disk atomically.
+
+    Creates a ``run_<run_id>`` subdirectory of ``directory`` (mode ``0o700``) and writes
+    the deterministic lineage, the merged lineage, the agent catalog, decisions, changes
+    and work plan as JSON files. When AI lineage proposals or a comparison exist, the
+    separate ``lineage.ai.json`` and ``lineage.comparison.json`` artifacts are added too,
+    keeping AI-proposed lineage out of the main ``lineage.json`` unless it was applied.
+    Each file is written to a temporary path in the same directory and moved into place
+    with ``os.replace`` so partial writes are never visible under the final filename. A
+    ``manifest.json`` listing per-file content digests is written last; its absence
+    indicates an interrupted export.
+
+    Args:
+        result: The analysis run whose ``document``, ``baseline``, ``catalog``,
+            ``decisions``, ``changes``, ``work``, ``ai_document``, ``comparison``,
+            ``index``, ``configuration``, ``status`` and ``warnings`` are serialized.
+        directory: Parent directory under which the per-run output folder is created.
+
+    Returns:
+        pathlib.Path: The created ``run_<run_id>`` directory containing the artifacts.
+
+    Raises:
+        FileExistsError: If the run output directory already exists.
+        OSError: If creating the directory or writing/renaming a file fails.
+    """
     observer = current_observer()
     run_id = observer.run_id if observer else uuid4().hex
     folder = Path(directory) / f"run_{run_id}"

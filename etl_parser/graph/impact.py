@@ -1,4 +1,9 @@
-"""Bounded graph traversal, cycle safe, with explicit hop distance."""
+"""Bounded graph traversal, cycle safe, with explicit hop distance (spec section 9).
+
+Implements the impact API: :func:`downstream` and :func:`upstream` return the closure of
+datasets, columns, jobs, and products reachable from a node, grouped by hop distance, with
+cross-product edges flagged.
+"""
 
 import networkx as nx
 
@@ -6,6 +11,24 @@ from etl_parser.graph.builder import LineageGraph
 
 
 def _walk(graph: LineageGraph, node_id: str, max_depth: int | None, reverse: bool):
+    """Compute the impact closure of a node in one traversal direction.
+
+    Args:
+        graph: The lineage graph to traverse.
+        node_id: A dataset id or ``"{dataset_id}#{column}"`` column id to start from.
+        max_depth: Maximum hop distance to include, or ``None`` for unbounded.
+        reverse: ``False`` walks downstream (consumers); ``True`` walks upstream
+            (provenance), by traversing the reversed graph.
+
+    Returns:
+        dict: ``{"node", "direction", "by_hop", "cross_product_edges"}`` where ``by_hop``
+        is a list of ``{"hop", "datasets", "columns", "jobs", "products"}`` entries ordered
+        by increasing distance, and ``cross_product_edges`` lists table edges within the
+        reached node set whose source and target belong to different products.
+
+    Raises:
+        ValueError: If ``max_depth`` is negative, or ``node_id`` is not a node in the graph.
+    """
     if max_depth is not None and max_depth < 0:
         raise ValueError("max_depth must be nonnegative")
     net = graph.graph.reverse(copy=False) if reverse else graph.graph
@@ -49,8 +72,34 @@ def _walk(graph: LineageGraph, node_id: str, max_depth: int | None, reverse: boo
 
 
 def downstream(graph, node_id, max_depth=None):
+    """Return everything downstream of a dataset or column.
+
+    Args:
+        graph: The lineage graph to traverse.
+        node_id: A dataset id or ``"{dataset_id}#{column}"`` column id.
+        max_depth: Maximum hop distance to include, or ``None`` for unbounded.
+
+    Returns:
+        dict: The downstream impact report; see :func:`_walk`.
+
+    Raises:
+        ValueError: If ``max_depth`` is negative, or ``node_id`` is unknown.
+    """
     return _walk(graph, node_id, max_depth, False)
 
 
 def upstream(graph, node_id, max_depth=None):
+    """Return everything upstream of (providing provenance for) a dataset or column.
+
+    Args:
+        graph: The lineage graph to traverse.
+        node_id: A dataset id or ``"{dataset_id}#{column}"`` column id.
+        max_depth: Maximum hop distance to include, or ``None`` for unbounded.
+
+    Returns:
+        dict: The upstream impact report; see :func:`_walk`.
+
+    Raises:
+        ValueError: If ``max_depth`` is negative, or ``node_id`` is unknown.
+    """
     return _walk(graph, node_id, max_depth, True)

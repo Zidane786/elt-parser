@@ -29,7 +29,15 @@ _QUOTED = re.compile(r'^\s*(["`\[])(.*)(["`\]])\s*$')
 
 
 def _split_identifier(name: str) -> list[tuple[str, bool]]:
-    """Split ``a.b.c`` into parts, honouring quotes. Returns (text, was_quoted)."""
+    """Split a dotted identifier into its parts, honoring quoted segments.
+
+    Args:
+        name: A possibly dotted, possibly quoted identifier, e.g. ``a.b."c.d"``.
+
+    Returns:
+        list[tuple[str, bool]]: One ``(text, was_quoted)`` pair per non-empty part, in
+        order.
+    """
     parts: list[tuple[str, bool]] = []
     buf = ""
     quote: str | None = None
@@ -55,7 +63,23 @@ def _split_identifier(name: str) -> list[tuple[str, bool]]:
 def normalize_dataset_id(
     name: str, *, engine: str = "unknown", default_db: str | None = None
 ) -> str:
-    """Return the canonical id for a table name or storage URI as seen at a call site."""
+    """Return the canonical id for a table name or storage URI as seen at a call site.
+
+    Applies the identity rules in spec section 7: URIs and absolute paths pass through
+    with their scheme normalized; two- and three-part SQL names resolve to ``glue`` for
+    Athena/Spark/Hive-family engines (lower-cased) or to the engine's own scheme
+    otherwise (case preserved only when quoted); one-part names resolve against
+    ``default_db``.
+
+    Args:
+        name: The identifier or URI text as it appeared at the call site.
+        engine: Executing engine (e.g. ``athena``, ``spark``, ``postgres``); determines the
+            resulting scheme and case-folding behavior.
+        default_db: Database to use when ``name`` has no database part.
+
+    Returns:
+        str: The canonical ``scheme://namespace/name`` id.
+    """
     name = name.strip()
     if "://" in name:
         parsed = urlparse(name)
@@ -88,7 +112,16 @@ def normalize_dataset_id(
 
 
 def split_dataset_id(dataset_id: str) -> tuple[str, str, str]:
-    """Return (scheme, namespace, name) for a canonical id."""
+    """Split a canonical id into its scheme, namespace, and name.
+
+    Args:
+        dataset_id: A canonical ``scheme://namespace/name`` id.
+
+    Returns:
+        tuple[str, str, str]: ``(scheme, namespace, name)``. For URI-style schemes (e.g.
+        ``s3``, ``file``) the namespace is the bucket/host and the name is the remaining
+        path.
+    """
     scheme, rest = dataset_id.split("://", 1)
     if scheme in URI_SCHEMES or scheme in {"s3", "file"}:
         bucket, _, path = rest.partition("/")
@@ -98,6 +131,18 @@ def split_dataset_id(dataset_id: str) -> tuple[str, str, str]:
 
 
 def dataset_ref_from_id(dataset_id: str) -> DatasetRef:
+    """Build a minimal :class:`DatasetRef` from a canonical id alone.
+
+    Used when a dataset is referenced (e.g. by an edge) but no richer :class:`DatasetRef`
+    for it has been registered yet.
+
+    Args:
+        dataset_id: Canonical ``scheme://namespace/name`` id.
+
+    Returns:
+        DatasetRef: A ref with ``namespace``, ``name``, and ``kind`` inferred from the
+        scheme, and no aliases or columns.
+    """
     scheme, ns, name = split_dataset_id(dataset_id)
     kind = "s3_path" if scheme == "s3" else "table"
     if scheme in {"api", "http", "https"}:
@@ -110,7 +155,15 @@ def dataset_ref_from_id(dataset_id: str) -> DatasetRef:
 
 
 def agent_table_name(dataset_id: str) -> str:
-    """``glue://db/table`` -> ``db.table`` (the shape the agent catalog uses)."""
+    """Render a canonical id in the ``db.table`` shape the agent catalog format uses.
+
+    Args:
+        dataset_id: A canonical ``scheme://namespace/name`` id.
+
+    Returns:
+        str: ``dataset_id`` unchanged for URI-style schemes (e.g. ``s3``), otherwise
+        ``"namespace.name"``.
+    """
     scheme, ns, name = split_dataset_id(dataset_id)
     if scheme in URI_SCHEMES or scheme == "s3":
         return dataset_id
@@ -118,13 +171,28 @@ def agent_table_name(dataset_id: str) -> str:
 
 
 class DatasetRegistry:
-    """Collects DatasetRefs and merges aliases so one physical dataset has one node."""
+    """Collects DatasetRefs and merges aliases so one physical dataset has one node.
+
+    Used by the graph builder to deduplicate datasets discovered under different names
+    (e.g. a Glue table and the S3 path it is backed by) into a single canonical node.
+    """
 
     def __init__(self) -> None:
+        """Create an empty registry with no datasets or aliases."""
         self._refs: dict[str, DatasetRef] = {}
         self._alias_to_canonical: dict[str, str] = {}
 
     def add(self, ref: DatasetRef) -> DatasetRef:
+        """Register a dataset, merging it into any existing entry with the same canonical id.
+
+        Args:
+            ref: The dataset to register. Its own ``id`` is treated as an alias if it
+                differs from its resolved canonical id.
+
+        Returns:
+            DatasetRef: The stored (possibly merged) dataset, with columns, aliases, and
+            optional fields unioned with any prior entry.
+        """
         canonical_id = self.resolve_id(ref.id)
         existing = self._refs.get(canonical_id)
         if existing is None:
@@ -148,13 +216,31 @@ class DatasetRegistry:
         return updated
 
     def get_or_create(self, dataset_id: str) -> DatasetRef:
+        """Return the registered dataset for an id, creating a minimal one if needed.
+
+        Args:
+            dataset_id: A canonical or alias id.
+
+        Returns:
+            DatasetRef: The existing entry for this id's canonical form, or a new minimal
+            ref (via :func:`dataset_ref_from_id`) registered and returned if none existed.
+        """
         canonical = self.resolve_id(dataset_id)
         if canonical not in self._refs:
             self._refs[canonical] = dataset_ref_from_id(canonical)
         return self._refs[canonical]
 
     def merge_alias(self, alias_id: str, canonical_id: str) -> None:
-        """Declare that ``alias_id`` (e.g. an s3 path) is the same dataset as ``canonical_id``."""
+        """Declare that ``alias_id`` (e.g. an s3 path) is the same dataset as ``canonical_id``.
+
+        Any existing entry under ``alias_id`` is folded into the canonical entry: its
+        columns and aliases are unioned in, and it may fill in a missing
+        ``physical_location`` on the canonical entry.
+
+        Args:
+            alias_id: The id to merge away.
+            canonical_id: The id ``alias_id`` should resolve to from now on.
+        """
         canonical_id = self.resolve_id(canonical_id)
         alias_id = self.resolve_id(alias_id)
         if alias_id == canonical_id:
@@ -175,6 +261,14 @@ class DatasetRegistry:
         self._refs[canonical_id] = target.model_copy(update=update)
 
     def resolve_id(self, dataset_id: str) -> str:
+        """Follow alias chains to the canonical id for a dataset.
+
+        Args:
+            dataset_id: A canonical or alias id.
+
+        Returns:
+            str: The canonical id, or ``dataset_id`` unchanged if it has no alias mapping.
+        """
         seen = set()
         while dataset_id in self._alias_to_canonical and dataset_id not in seen:
             seen.add(dataset_id)
@@ -182,4 +276,9 @@ class DatasetRegistry:
         return dataset_id
 
     def all(self) -> list[DatasetRef]:
+        """Return every registered dataset, sorted by canonical id.
+
+        Returns:
+            list[DatasetRef]: All registered datasets, sorted by ``id``.
+        """
         return sorted(self._refs.values(), key=lambda r: r.id)

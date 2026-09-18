@@ -1,4 +1,14 @@
-"""Read-only local/GitHub source providers. GitHub reads never create a checkout."""
+"""Read-only local and GitHub source providers for the ETL parser.
+
+Both providers implement :class:`SourceProvider` and return a
+:class:`~etl_parser.scanner.repo.ScanIndex` of the files the parser should analyze.
+:class:`GitHubSource` is the clone-free GitHub source described in
+``docs/superpowers/specs/2026-09-17-ai-lineage-observability-github-design.md``: it
+reads a repository at a pinned commit through the GitHub REST API (bounded, serial
+requests with retry/backoff) rather than by creating a local git checkout, so no
+working tree or ``.git`` directory is ever written to disk. :class:`LocalSource`
+scans an existing local directory with :class:`~etl_parser.scanner.repo.RepoScanner`.
+"""
 
 from __future__ import annotations
 
@@ -20,23 +30,91 @@ from etl_parser.scanner.repo import RepoScanner, ScanIndex, SourceFile
 
 
 class SourceProvider(Protocol):
-    def scan(self, *, extensions: set[str]) -> ScanIndex: ...
+    """Structural interface implemented by every scannable source (local or remote)."""
+
+    def scan(self, *, extensions: set[str]) -> ScanIndex:
+        """Scan the source and return its indexed files.
+
+        Args:
+            extensions: File extensions (including the leading dot) to include.
+
+        Returns:
+            ScanIndex: The scanned files, unresolved entries and source metadata.
+        """
+        ...
 
 
 class LocalSource:
+    """Source provider that scans an existing directory on the local filesystem."""
+
     def __init__(self, path):
+        """Store the directory to scan.
+
+        Args:
+            path: Filesystem path to the local repository or directory to scan.
+        """
         self.path = path
 
     def scan(self, *, extensions):
+        """Scan ``self.path`` for files with the given extensions.
+
+        Args:
+            extensions: File extensions (including the leading dot) to include.
+
+        Returns:
+            ScanIndex: The result of :class:`~etl_parser.scanner.repo.RepoScanner`.
+        """
         return RepoScanner(self.path, extensions=extensions).scan()
 
 
 class _NoRedirect(HTTPRedirectHandler):
+    """urllib redirect handler that refuses every redirect.
+
+    Prevents the GitHub API token from being replayed against an arbitrary
+    redirect target.
+    """
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """Refuse to follow any HTTP redirect.
+
+        Args:
+            req: The original request.
+            fp: The response file object.
+            code: The HTTP status code that triggered the redirect.
+            msg: The HTTP status message.
+            headers: The response headers.
+            newurl: The redirect target URL.
+
+        Returns:
+            None: Always, so urllib treats the redirect as unfollowed.
+        """
         return None  # Never send a repository token to an arbitrary redirect.
 
 
 class GitHubSource:
+    """Clone-free source provider that reads a GitHub repository via the REST API.
+
+    Lists and reads files at a single pinned commit (the resolved ``ref``, or the
+    default branch's ``HEAD``) using bounded, serial, retried HTTP requests, without
+    ever creating a local git checkout. Optionally scopes the scan to a repository
+    subdirectory or a single file, and can transparently expand a selected ``.zip``
+    entry. Byte, file-count and total-size limits bound both memory and network use;
+    symlinks, submodules and Git LFS pointers are rejected rather than followed.
+
+    Attributes:
+        repo: The ``OWNER/REPO`` path, percent-encoded per segment.
+        origin: The canonical ``https://github.com/OWNER/REPO`` URL.
+        ref: The requested branch, tag or commit SHA, or ``None`` for the default branch.
+        path: Repository-relative path scoping the scan, or ``""`` for the whole repo.
+        token: The GitHub API token used for authenticated requests, if any.
+        timeout: Per-request timeout in seconds.
+        retries: Number of retries after the first attempt for retryable failures.
+        max_files: Maximum number of file/tree entries the scan will enumerate.
+        max_file_bytes: Maximum size in bytes of any single file (or zip member).
+        max_total_bytes: Maximum cumulative decoded bytes read across the scan.
+        transport: Optional callable overriding HTTP requests, for testing.
+    """
+
     def __init__(
         self,
         url,
@@ -51,6 +129,31 @@ class GitHubSource:
         max_total_bytes=100_000_000,
         transport=None,
     ):
+        """Validate and store the repository URL, scope and read limits.
+
+        Args:
+            url: Repository URL in the form ``https://github.com/OWNER/REPO``
+                (no query, fragment, ref or subpath embedded in it).
+            ref: Branch, tag or commit SHA to read; the default branch's ``HEAD``
+                when ``None``.
+            path: Repository-relative path scoping the scan to a subdirectory or
+                single file; the whole repository when ``None``.
+            token: GitHub API token. Falls back to the ``GITHUB_TOKEN`` then
+                ``GH_TOKEN`` environment variable, then unauthenticated.
+            timeout: Per-request timeout in seconds; must be positive.
+            retries: Retries after the first attempt for retryable failures;
+                must be nonnegative.
+            max_files: Maximum number of file/tree entries to enumerate.
+            max_file_bytes: Maximum size in bytes of any single file or zip member.
+            max_total_bytes: Maximum cumulative decoded bytes read across the scan.
+            transport: Optional callable ``endpoint -> dict`` replacing the real
+                HTTP transport, for testing.
+
+        Raises:
+            ValueError: If ``url`` is not a bare ``https://github.com/OWNER/REPO``
+                URL, if ``timeout``/``retries``/the byte or file limits are out of
+                range, or if ``path`` is absolute, contains ``..`` or a backslash.
+        """
         parsed = urlsplit(url)
         parts = parsed.path.strip("/").split("/")
         if (
@@ -82,6 +185,29 @@ class GitHubSource:
         self._total_bytes = 0
 
     def _request(self, endpoint):
+        """Call one GitHub API endpoint, retrying retryable failures with backoff.
+
+        Uses ``self.transport`` when set (test injection point); otherwise issues a
+        real HTTPS request to ``https://api.github.com/repos/{self.repo}/{endpoint}``
+        with the configured token and a non-redirecting opener. Rate-limited (429, or
+        403 with rate-limit headers), 5xx, and transport-level failures are retried up
+        to ``self.retries`` times with capped exponential backoff, honoring
+        ``Retry-After``/``X-RateLimit-Reset`` when present.
+
+        Args:
+            endpoint: Path appended to the repository API base URL, e.g.
+                ``"commits/HEAD"``.
+
+        Returns:
+            dict: The parsed JSON response body.
+
+        Raises:
+            ValueError: If the response body exceeds the configured transport byte
+                limit, is not valid JSON, or the rate-limit response cannot be parsed.
+            RuntimeError: If a non-retryable HTTP error occurs, retries are exhausted,
+                the transport fails repeatedly, or the required backoff exceeds the
+                30-second bound.
+        """
         observer = current_observer()
         if self.transport is not None:
             if observer:
@@ -157,6 +283,24 @@ class GitHubSource:
         raise RuntimeError("GitHub retry budget exhausted")
 
     def list_files(self):
+        """Resolve ``self.ref`` to a commit and list every entry in its tree.
+
+        Resolves the commit first, pinning the scan to that single SHA, then reads the
+        recursive tree. Falls back to a manual breadth-first walk of individual
+        subtrees when GitHub reports the recursive listing as truncated.
+
+        Returns:
+            tuple[str, list[dict]]: The resolved commit SHA, and the tree entries
+            (each with at least ``path``, ``type``, ``sha`` and, for blobs, ``size``)
+            sorted by path.
+
+        Raises:
+            ValueError: If the number of entries exceeds ``self.max_files``, subtree
+                traversal exceeds that same limit, or a non-recursive subtree listing
+                is itself truncated.
+            KeyError: If a GitHub API response is missing an expected field.
+            RuntimeError: Propagated from :meth:`_request` on API/transport failure.
+        """
         commit = self._request("commits/" + quote(self.ref or "HEAD", safe=""))
         revision = commit["sha"]
         tree_sha = commit["commit"]["tree"]["sha"]
@@ -188,6 +332,22 @@ class GitHubSource:
         return revision, sorted(entries, key=lambda item: item["path"])
 
     def read_file(self, entry):
+        """Fetch and decode one blob entry, enforcing per-file and total byte limits.
+
+        Args:
+            entry: A tree entry from :meth:`list_files`, with ``sha`` and optionally
+                ``size``.
+
+        Returns:
+            bytes: The decoded file content.
+
+        Raises:
+            ValueError: If the reported or decoded size exceeds ``self.max_file_bytes``
+                or the running total exceeds ``self.max_total_bytes``, if the blob
+                encoding is not base64, if the content is not valid base64, or if the
+                content is a Git LFS pointer.
+            RuntimeError: Propagated from :meth:`_request` on API/transport failure.
+        """
         if entry.get("size", 0) > self.max_file_bytes:
             raise ValueError("GitHub file exceeds configured size limit")
         data = self._request(f"git/blobs/{entry['sha']}")
@@ -202,6 +362,30 @@ class GitHubSource:
         return content
 
     def scan(self, *, extensions):
+        """Scan the configured repository scope and build a :class:`ScanIndex`.
+
+        Lists the repository tree once via :meth:`list_files`, narrows it to
+        ``self.path`` (a single file, a ``.zip`` archive to expand, a subdirectory, or
+        the whole repository), skips VCS/build/dependency directories, symlinks and
+        submodules, and reads each remaining file matching ``extensions`` (or member
+        of a matched ``.zip``) through :meth:`read_file`. Per-entry read/decode
+        failures are recorded as :class:`~etl_parser.models.Unresolved` entries rather
+        than aborting the scan; the scan stops early only once the total byte budget
+        is exceeded.
+
+        Args:
+            extensions: File extensions (including the leading dot) to include.
+
+        Returns:
+            ScanIndex: The scanned files, unresolved entries and source metadata, via
+            :meth:`~etl_parser.scanner.repo.ScanIndex.build_modules`.
+
+        Raises:
+            ValueError: If ``self.path`` does not match any entry at the resolved
+                revision.
+            RuntimeError: Propagated from :meth:`list_files`/:meth:`_request` on
+                API/transport failure.
+        """
         self._total_bytes = 0
         revision, entries = self.list_files()
         observer = current_observer()

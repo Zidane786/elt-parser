@@ -9,13 +9,36 @@ from etl_parser.workers.base import normalize_cron
 
 
 class ProductRegistry:
+    """Loads ``product.yaml`` files and answers ownership and schedule queries.
+
+    Populated once per scan (see ``etl_parser.pipeline.scan``) and consulted by the graph
+    builder to attach ``product``/``layer`` to datasets and jobs, and to fold
+    ``product.yaml``-declared schedules into the lineage document (spec section 6).
+    """
+
     def __init__(self):
+        """Create an empty registry with no products, databases, or schedules."""
         self.products: list[Product] = []
         self._databases = {}
         self._schedules = {}
 
     @classmethod
     def load(cls, path: Path | str):
+        """Build a registry from one ``product.yaml`` file or a directory tree of them.
+
+        Args:
+            path: A single ``product.yaml`` file, or a directory searched recursively for
+                files named ``product.yaml``.
+
+        Returns:
+            ProductRegistry: A registry populated from every file found, processed in
+            sorted path order.
+
+        Raises:
+            ValueError: Propagated from :meth:`add_text` if a file is not a valid product
+                document, declares a duplicate product code, or claims a database another
+                product already owns.
+        """
         path = Path(path)
         registry = cls()
         files = sorted(path.rglob("product.yaml")) if path.is_dir() else [path]
@@ -24,6 +47,21 @@ class ProductRegistry:
         return registry
 
     def add_text(self, text: str, source_file: str):
+        """Parse one ``product.yaml`` document's text and register it.
+
+        Args:
+            text: Raw YAML content of a ``product.yaml`` file.
+            source_file: Path the text was read from, used for error messages and
+                recorded as ``Product.source_file`` / ``Schedule.source_file``.
+
+        Returns:
+            Product: The parsed and registered product.
+
+        Raises:
+            ValueError: If ``text`` does not parse to a YAML mapping, if its ``code``
+                duplicates an already-registered product, or if one of its databases is
+                already owned by another registered product.
+        """
         data = yaml.safe_load(text)
         if not isinstance(data, dict):
             raise ValueError(f"Invalid product document: {source_file}")
@@ -73,17 +111,46 @@ class ProductRegistry:
         return product
 
     def product_for_database(self, db):
+        """Return the product that owns a database, if any.
+
+        Args:
+            db: Database name (matches ``ProductDatabase.name``).
+
+        Returns:
+            Product | None: The owning product, or ``None`` if no registered product
+            declares this database.
+        """
         value = self._databases.get(db)
         return value[0] if value else None
 
     def layer_for_database(self, db):
+        """Return the declared layer for a database, if any.
+
+        Args:
+            db: Database name (matches ``ProductDatabase.name``).
+
+        Returns:
+            str | None: The declared layer (e.g. ``"raw"``), or ``None`` if the database
+            is not owned by a registered product or declares no layer.
+        """
         value = self._databases.get(db)
         return value[1] if value else None
 
     def schedules(self):
+        """Return all schedules declared across every registered product's ``product.yaml``.
+
+        Returns:
+            dict[str, Schedule]: A copy of the internal id-to-``Schedule`` mapping.
+        """
         return dict(self._schedules)
 
     def resolve_dependencies(self):
+        """Resolve each declared cross-product dependency's product name to its code.
+
+        Mutates ``declared_dependencies`` on every registered product in place, replacing
+        ``DeclaredDependency.code`` (which may hold a product *name* as written in YAML)
+        with the matching product's ``code`` when one is found by name.
+        """
         by_name = {p.name: p.code for p in self.products}
         for product in self.products:
             for dependency in product.declared_dependencies:

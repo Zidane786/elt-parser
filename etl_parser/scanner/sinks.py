@@ -1,8 +1,12 @@
-"""Declarative table of I/O call patterns.
+"""Declarative table of I/O call patterns and the dialects they imply.
 
-Each entry says whether a call reads, writes, or executes SQL, which argument carries the
-dataset name, path, or SQL text, and which engine and dialect the call site implies.
-The table is data so teams can extend it without touching the workers.
+This is the sink table from design section 8.2 step 2 (and section 7's dialect rule: the
+sink table maps each call site to a dialect, since dialect belongs to the job, not the
+dataset). Each ``SinkSpec`` entry says whether a call reads, writes, or executes SQL, which
+argument carries the dataset name, path, or SQL text, and which engine and dialect the call
+site implies. ``match_sink`` is PythonWorker's and SparkStaticWorker's entry point for
+resolving a fully qualified callee to its spec. The table is plain data so teams can extend
+coverage without touching the workers.
 """
 
 from __future__ import annotations
@@ -15,6 +19,25 @@ Direction = Literal["read", "write", "sql"]
 
 @dataclass(frozen=True)
 class SinkSpec:
+    """One I/O call pattern: how to recognise it and what dataset/dialect it implies.
+
+    A row in ``SINKS``, matched against a call site's fully qualified callee by
+    ``match_sink``.
+
+    Attributes:
+        callee: Dotted suffix matched against the fully qualified callee, e.g.
+            ``read.parquet``.
+        direction: Whether the call reads a dataset, writes one, or executes SQL text.
+        arg: Positional index or keyword name of the dataset / path / SQL argument.
+        scheme: ``table`` (engine decides), ``s3``, ``file``, or ``sql``.
+        engine: Engine implied by the call site, e.g. ``spark``, ``pandas``, ``athena``.
+        dialect: SQL dialect implied by the call site, or ``None`` when the call is not
+            SQL-flavored or the dialect must come from elsewhere (e.g. a connection URL).
+        language: Source language the call appears in; always ``"python"`` today.
+        alt_arg: Keyword fallback when ``arg`` is positional but the call used a keyword.
+        schema_kw: Keyword that carries the schema/database (pandas ``to_sql(schema=...)``).
+    """
+
     callee: str
     """Dotted suffix matched against the fully qualified callee, e.g. ``read.parquet``."""
     direction: Direction
@@ -162,9 +185,21 @@ ENGINE_DIALECT = {
 
 
 def match_sink(qualified_callee: str) -> SinkSpec | None:
-    """Longest-suffix match of a dotted callee such as ``spark.read.parquet``.
+    """Find the ``SinkSpec`` matching a fully qualified callee, by longest-suffix match.
 
-    Earlier entries win ties, so ``write.saveAsTable`` is preferred over bare ``saveAsTable``.
+    Args:
+        qualified_callee: Dotted call path such as ``spark.read.parquet`` or
+            ``df.to_sql``.
+
+    Returns:
+        The ``SinkSpec`` whose ``callee`` is the longest dotted suffix of
+        ``qualified_callee`` (exact match or preceded by a ``.``), or ``None`` when no
+        entry in ``SINKS`` matches. Ties on suffix length are broken by earlier entries in
+        ``SINKS``, so ``write.saveAsTable`` is preferred over bare ``saveAsTable``.
+
+    Example:
+        >>> match_sink("spark.read.parquet").callee
+        'read.parquet'
     """
     best: SinkSpec | None = None
     for spec in SINKS:

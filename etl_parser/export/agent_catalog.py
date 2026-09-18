@@ -1,4 +1,11 @@
-"""Catalog export preserving prior human metadata and flags."""
+"""Catalog export preserving prior human metadata and flags (spec sections 3.1, 10).
+
+Implements the ``AgentCatalogExporter`` role: writes ``catalog.json`` in the exact shape
+``de_agent`` expects (top-level ``databases``, ``relations``, ``scripts``), merging in a
+prior catalog when supplied so human/AI descriptions and catalog flags (``to_tokenize``,
+``verify``, etc., which are not derivable from code) survive re-scans. Also writes the
+``schedules`` and ``lineage`` extension fields the current agent ignores.
+"""
 
 import copy
 
@@ -6,12 +13,36 @@ from etl_parser.identity import ENGINE_SCHEME, GLUE_ENGINES, agent_table_name, s
 
 
 def export_agent_catalog(doc, prior=None):
+    """Build (or update) an agent ``catalog.json`` dict from a lineage document.
+
+    Args:
+        doc: The scanned :class:`~etl_parser.models.LineageDocument`.
+        prior: A previously exported catalog dict to merge into. Databases, tables, and
+            scripts it contains are updated in place (by db/table name, or by job id/source
+            path for scripts); anything the current scan did not touch is kept unchanged.
+            If omitted, a fresh catalog with empty ``databases``/``relations`` is built.
+
+    Returns:
+        dict: The catalog, with ``databases`` (schema per table, preserving unrelated
+        prior flags), ``scripts`` (one entry per job, with ``depends_on`` and the
+        extension field ``depends_on_detail``), ``schedules``, and ``lineage``
+        (``column_edges`` and ``unresolved``) all populated. ``relations`` is passed
+        through unchanged from ``prior``, since it is not inferred from code.
+    """
     catalog = copy.deepcopy(prior) if prior is not None else {"databases": [], "relations": []}
     databases = catalog.setdefault("databases", [])
     prior_scripts = {s["script_path"]: s for s in catalog.get("scripts", [])}
     prior_jobs = {s["job_id"]: s for s in catalog.get("scripts", []) if s.get("job_id")}
 
     def database_scheme(database):
+        """Return the identity scheme (e.g. ``glue``) implied by a catalog database's type.
+
+        Args:
+            database: A catalog ``databases[]`` entry; its ``db_type`` is inspected.
+
+        Returns:
+            str: ``glue`` for Athena/Spark/Glue engines, else the engine scheme or the raw type.
+        """
         kind = database.get("db_type", "").lower()
         return "glue" if kind in GLUE_ENGINES else ENGINE_SCHEME.get(kind, kind)
 
@@ -48,6 +79,14 @@ def export_agent_catalog(doc, prior=None):
             table["schema"].append({"field_name": column, "description": ""})
 
     def reference(ident):
+        """Build a ``reads_from``/``writes_to`` entry for a dataset id.
+
+        Args:
+            ident: Canonical dataset id such as ``glue://db/table`` or ``s3://bucket/path/``.
+
+        Returns:
+            dict: ``{"type": "table" | "s3" | "file", "target": <agent-style name>}``.
+        """
         return {
             "type": "s3"
             if ident.startswith("s3://")

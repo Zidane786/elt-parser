@@ -1,7 +1,19 @@
 """Static frame and I/O analysis shared by PySpark, Pandas and Polars.
 
+This module implements PythonWorker (design spec section 8.2) and, by extension,
+SparkStaticWorker (section 8.3), which re-exports it directly. Given a ``.py`` file and the
+scanned module graph, :class:`PythonWorker` builds the file's import map, matches calls
+against the sink table (``etl_parser.scanner.sinks``) to find reads/writes, reconstructs
+SQL-carrying string arguments, and hands SQL text to :class:`~etl_parser.workers.sql.SqlWorker`.
+It tracks DataFrame-shaped variables (pandas, polars, and PySpark alike) through an AST-driven
+interpreter so column-level projections, joins, aggregations, and filters become
+:class:`~etl_parser.models.ColumnEdge`/:class:`~etl_parser.models.TableEdge` records, and it
+follows one level of calls into helper modules resolved through the module graph.
+
 The interpreter handles a deliberately finite set of AST/frame operations. It never
 imports ETL code. Unknown frame operations preserve known sources with partial confidence.
+Everything the interpreter cannot resolve is reported as an
+:class:`~etl_parser.models.Unresolved` item with a reason, never guessed.
 """
 
 from __future__ import annotations
@@ -31,6 +43,28 @@ from etl_parser.workers.sql import SqlWorker
 
 @dataclass
 class Column:
+    """A single tracked DataFrame column's provenance, as understood so far.
+
+    Instances accumulate as the interpreter walks projections, joins, and aggregations;
+    :func:`PythonWorker.analyze_source`'s ``write_frame`` turns each into a ``ColumnEdge``.
+
+    Attributes:
+        sources (set[tuple[str, str]]): Direct ``(dataset_id, column_name)`` origins that
+            feed this column's value.
+        text (str): Source text of the expression that produced this column.
+        kind (str): Transformation kind, matching ``Transformation.kind`` (for example
+            ``"identity"``, ``"expression"``, ``"aggregation"``, ``"window"``).
+        partial (bool): Whether this column's provenance is incompletely known, downgrading
+            any edge built from it to ``partial`` confidence.
+        name (str | None): Output column name, when known (set by ``alias``/``name`` calls
+            or by the caller assigning it into a frame).
+        indirect (set[tuple[str, str]]): ``(dataset_id, column_name)`` origins referenced
+            only indirectly (filter/join/aggregation keys), not in the value itself.
+        source_file (str | None): Path of the file the defining expression came from.
+        line_start (int | None): First line of the defining expression.
+        line_end (int | None): Last line of the defining expression.
+    """
+
     sources: set[tuple[str, str]] = field(default_factory=set)
     text: str = ""
     kind: str = "identity"
@@ -44,11 +78,44 @@ class Column:
 
 @dataclass
 class Expression:
+    """A deferred, unevaluated AST expression node.
+
+    Wraps ``pyspark.sql.functions``-style values (``F.col``, ``Window.partitionBy``, and
+    similar) that are only resolved to a :class:`Column` once applied to a frame.
+
+    Attributes:
+        node (ast.AST): The wrapped expression node.
+    """
+
     node: ast.AST
 
 
 @dataclass
 class Frame:
+    """A tracked DataFrame variable: its known columns, source datasets, and open questions.
+
+    This is the interpreter's model of a pandas/polars/PySpark DataFrame as it is threaded
+    through assignments and chained method calls in :func:`PythonWorker.analyze_source`.
+
+    Attributes:
+        columns (dict[str, Column]): Known output columns by name.
+        sources (set[str]): Dataset ids this frame was ultimately read from.
+        aliases (dict[str, Frame]): Sub-frame aliases introduced by ``.alias(...)``, used to
+            resolve dotted column references like ``"left.id"``.
+        indirect (set[tuple[str, str]]): ``(dataset_id, column_name)`` origins referenced
+            only through filters, join keys, or group-by keys on this frame.
+        partial (bool): Whether this frame's shape is only partially known (an unhandled
+            operation was applied, or a source could not be resolved).
+        open_columns (bool): Whether columns outside ``self.columns`` may still exist (no
+            input schema was available to enumerate them), as opposed to ``self.columns``
+            being the complete, closed set of columns.
+        group (list[str]): Group-by key column names, set by a ``groupBy``/``groupby`` call
+            and consumed by the following ``agg``/``sum``/``mean``/etc. call.
+        parallel_sources (bool): Whether this frame was read from multiple dataset arguments
+            at once (for example ``pd.read_csv([a, b])``), so an unknown column's origin
+            fans out across all of ``sources`` rather than just one.
+    """
+
     columns: dict[str, Column] = field(default_factory=dict)
     sources: set[str] = field(default_factory=set)
     aliases: dict[str, Frame] = field(default_factory=dict)
@@ -59,6 +126,19 @@ class Frame:
     parallel_sources: bool = False
 
     def column(self, name: str) -> Column:
+        """Resolve a column reference against this frame, including dotted alias access.
+
+        Args:
+            name (str): Column name to resolve. A dotted prefix matching a key in
+                ``self.aliases`` (for example ``"left.id"``) resolves against that aliased
+                sub-frame instead.
+
+        Returns:
+            Column: A copy of the known column when tracked. When the column is not tracked
+            but this frame has exactly one source dataset (or ``parallel_sources`` is set)
+            and columns are still open, a best-effort :class:`Column` sourced from every
+            source dataset under that name. Otherwise a :class:`Column` marked ``partial``.
+        """
         alias, dot, tail = name.partition(".")
         if dot and alias in self.aliases:
             return self.aliases[alias].column(tail)
@@ -71,15 +151,53 @@ class Frame:
 
 @dataclass
 class Connection:
+    """A resolved database connection/engine, tracked so later SQL calls know their dialect.
+
+    Attributes:
+        engine (str): Engine name (for example ``"postgres"``, ``"athena"``), derived from a
+            connection URL via ``URL_ENGINE_HINTS``.
+    """
+
     engine: str
 
 
 @dataclass
 class Reader:
+    """A partially-built PySpark ``spark.read``/``sqlContext.read`` builder chain.
+
+    Accumulates ``.format(...)``/``.option(...)``/``.options(...)`` calls before the chain
+    terminates in a load call (``.load()``, ``.parquet()``, ``.table()``, and similar).
+
+    Attributes:
+        options (dict[str, ast.AST]): Builder options captured so far, keyed by option name
+            (for example ``"path"``, ``"format"``), with values as their literal AST nodes
+            (folded to constants once known).
+    """
+
     options: dict[str, ast.AST] = field(default_factory=dict)
 
 
 class PythonWorker:
+    """Static ast-driven lineage worker for Python, pandas, polars, and PySpark files.
+
+    Implements design spec section 8.2 (and, via the ``SparkStaticWorker`` alias, section
+    8.3): builds each file's import map, matches calls against the sink table, folds
+    SQL/dataset string arguments, tracks DataFrame variables through supported chained
+    operations, and follows helper-module calls up to ``max_import_depth`` levels deep.
+    Unhandled frame operations degrade the affected columns to ``partial`` confidence and
+    continue rather than aborting the analysis.
+
+    Attributes:
+        sql (SqlWorker): Worker used to analyze SQL text found in string arguments.
+        index (ScanIndex | None): Scanned repository used to resolve local imports and
+            helper modules; when ``None``, import following is disabled.
+        bindings (dict[str, str]): Explicit values for otherwise-unresolvable symbols or
+            environment keys, seeded into every analysis's folding environment.
+        default_db (str | None): Default database used to qualify one-part dataset/table
+            names.
+        max_import_depth (int): Maximum depth of helper-module calls to follow.
+    """
+
     def __init__(
         self,
         sql_worker: SqlWorker | None = None,
@@ -89,6 +207,19 @@ class PythonWorker:
         default_db: str | None = None,
         max_import_depth: int = 3,
     ):
+        """Configure a worker for analyzing Python/PySpark files.
+
+        Args:
+            sql_worker (SqlWorker | None): Worker to delegate SQL text to; a default
+                :class:`~etl_parser.workers.sql.SqlWorker` is created when not given.
+            index (ScanIndex | None): Scanned repository, used to resolve imports to helper
+                module files. Import following is skipped when ``None``.
+            bindings (dict[str, str] | None): Explicit values for otherwise-unresolvable
+                symbols or environment keys.
+            default_db (str | None): Default database for qualifying one-part table names.
+            max_import_depth (int): Maximum depth of helper-module calls to follow before
+                recording a ``partial``/``unresolved_import`` result. Defaults to 3.
+        """
         self.sql = sql_worker or SqlWorker()
         self.index = index
         self.bindings = bindings or {}
@@ -96,6 +227,15 @@ class PythonWorker:
         self.max_import_depth = max_import_depth
 
     def analyze_file(self, path: Path) -> WorkerResult:
+        """Read a ``.py`` file from disk and analyze it.
+
+        Args:
+            path (Path): Path to the Python file to analyze.
+
+        Returns:
+            WorkerResult: The analysis result from :meth:`analyze_source`, or a result
+            containing a single ``unsupported_syntax`` item when the file cannot be read.
+        """
         root = self.index.root if self.index else path.parent
         try:
             source = SourceFile(path.relative_to(root).as_posix(), path.read_text(), ".py")
@@ -114,6 +254,30 @@ class PythonWorker:
         entry_function: str | None = None,
         job_id_override: str | None = None,
     ) -> WorkerResult:
+        """Analyze one Python/PySpark source file and return its lineage contributions.
+
+        This is the core of PythonWorker (design spec section 8.2): it walks the module's
+        top-level statements (and, when ``entry_function`` is given, that function's body),
+        matching sink calls, tracking DataFrame variables, and following one level of helper
+        calls resolved through ``self.index``. When no ``entry_function`` is given, a
+        function named ``main``, ``handler``, or ``lambda_handler`` is invoked automatically
+        if present and not already reached by another call, so Lambda-style entry points are
+        still analyzed as their own job. A :class:`~etl_parser.models.Job` record is emitted
+        for the file (or entry function) with its resolved inputs/outputs, owner and
+        description from header comments/docstring, and schedule, if any.
+
+        Args:
+            source (SourceFile): The file to analyze.
+            entry_function (str | None): Name of a specific function to treat as the job's
+                entry point, analyzed instead of (in addition to) top-level statements. When
+                given, only import/function/assignment statements are executed at module
+                level before the function itself is invoked.
+            job_id_override (str | None): Job id to use instead of ``source.job_id``.
+
+        Returns:
+            WorkerResult: Datasets, the job, column edges, table edges, schedules, and
+            unresolved items found while analyzing this file.
+        """
         result = WorkerResult()
         inputs: set[str] = set()
         outputs: set[str] = set()
@@ -126,6 +290,17 @@ class PythonWorker:
         loading_modules: set[str] = set()
 
         def issue(node, reason, kind="unsupported_syntax", folded=None):
+            """Append an :class:`Unresolved` item for the current file at ``node``'s line.
+
+            Args:
+                node: AST node the issue is attached to; its source text and line number
+                    are recorded.
+                reason (str): Human-readable explanation of the issue.
+                kind (str): ``Unresolved.kind`` value. Defaults to ``"unsupported_syntax"``.
+                folded (Folded | None): The folded value, when the issue came from folding a
+                    string expression; supplies ``partial_text``, ``symbols``, and
+                    ``assumptions``, and changes the default remediation text.
+            """
             result.unresolved.append(
                 Unresolved(
                     kind=kind,
@@ -147,6 +322,22 @@ class PythonWorker:
 
         @dataclass
         class State:
+            """Per-module interpreter state: one file's symbol table and import map.
+
+            A new ``State`` is created for the entry module and for each helper module
+            loaded via ``imported_state``/``invoke``, so each file's names stay isolated.
+
+            Attributes:
+                source (SourceFile): The module this state belongs to.
+                env (dict): Symbol table mapping names to their tracked values (``Frame``,
+                    ``Column``, ``Folded``, ``Connection``, ``Reader``, nested ``State`` for
+                    imported modules, or a plain string/AST value).
+                imports (dict): Maps a local import name to ``(dotted_module, level)``.
+                functions (dict): Maps a local function name to its ``ast.FunctionDef``.
+                depth (int): Helper-module recursion depth, compared against
+                    ``self.max_import_depth``.
+            """
+
             source: SourceFile
             env: dict = field(default_factory=lambda: dict(self.bindings))
             imports: dict = field(default_factory=dict)
@@ -156,6 +347,13 @@ class PythonWorker:
         state = State(source)
 
         def strings():
+            """Collect string-like environment values for folding, including one import level.
+
+            Returns:
+                dict: Every ``str``/``Folded`` value in the current scope's ``env``, plus,
+                for each imported module bound to a name, its own string values exposed
+                under ``"module.attr"`` keys.
+            """
             values = {k: v for k, v in state.env.items() if isinstance(v, (str, Folded))}
             for key, module in state.env.items():
                 if isinstance(module, State):
@@ -169,9 +367,28 @@ class PythonWorker:
             return values
 
         def folded(node):
+            """Fold an AST expression to a :class:`Folded` string using the current scope.
+
+            Args:
+                node: Expression node to fold.
+
+            Returns:
+                Folded: The folded value, using the current scope's string-like bindings
+                (see ``strings``) to resolve names.
+            """
             return fold_string(node, strings())
 
         def concrete(node, kind):
+            """Fold ``node`` and require a fully concrete result, else record an issue.
+
+            Args:
+                node: Expression node to fold.
+                kind (str): ``Unresolved.kind`` to use if the value cannot be resolved.
+
+            Returns:
+                str | None: The folded text, or ``None`` (with an issue recorded) when the
+                value is incomplete or relies on an environment-default assumption.
+            """
             value = folded(node)
             if not value.complete or value.assumptions:
                 issue(
@@ -181,6 +398,16 @@ class PythonWorker:
             return value.text
 
         def callee(node):
+            """Render a call target's fully qualified name, resolving local import aliases.
+
+            Args:
+                node: The ``Call.func`` expression to render.
+
+            Returns:
+                str: The dotted callee text with the leading name resolved through
+                ``state.imports`` and, for ``pandas``/``polars``/``awswrangler`` targets,
+                rewritten to the ``pd.``/``pl.``/``wr.`` shorthand used by the sink table.
+            """
             text = ast.unparse(node)
             first, dot, rest = text.partition(".")
             imported = state.imports.get(first)
@@ -192,6 +419,19 @@ class PythonWorker:
             return text
 
         def col_expr(node, frame):
+            """Evaluate a column expression and stamp it with its source location.
+
+            Thin wrapper around ``_col_expr`` that fills in ``source_file``/``line_start``/
+            ``line_end`` on the returned :class:`Column` when not already set, so every
+            column edge carries the location of the expression that produced it.
+
+            Args:
+                node: Expression node to evaluate as a column.
+                frame (Frame): Frame the expression is evaluated against.
+
+            Returns:
+                Column: The evaluated column, with location fields populated.
+            """
             column = _col_expr(node, frame)
             if column.source_file is None:
                 column.source_file = state.source.path
@@ -200,6 +440,26 @@ class PythonWorker:
             return column
 
         def _col_expr(node, frame):
+            """Evaluate an expression node to a :class:`Column`, tracking provenance.
+
+            Handles names bound to a tracked :class:`Column`/:class:`Expression`, literal
+            constants, subscript column access, attribute access on a tracked
+            :class:`Frame`, and a broad set of PySpark/pandas/polars column-function calls
+            (``col``, ``lit``, ``cast``/``astype``, ``over``, ``alias``/``name``, ``expr``,
+            aggregate functions, and a fixed list of scalar column functions). Any other
+            node falls back to combining the sources/partial state of its child expression
+            nodes. This is the recursive worker behind ``col_expr``, which is called instead
+            of it everywhere else in this function.
+
+            Args:
+                node: Expression node to evaluate.
+                frame (Frame): Frame the expression is evaluated against, used to resolve
+                    column references and aggregate group-by keys.
+
+            Returns:
+                Column: The evaluated column, without source-location fields set (those are
+                filled in by ``col_expr``).
+            """
             if isinstance(node, ast.Name) and isinstance(state.env.get(node.id), Column):
                 return copy.deepcopy(state.env[node.id])
             if isinstance(node, ast.Name) and isinstance(state.env.get(node.id), Expression):
@@ -437,6 +697,20 @@ class PythonWorker:
             )
 
         def sql_expression(node, frame):
+            """Evaluate a raw SQL expression string (``F.expr``/``selectExpr``) via sqlglot.
+
+            Qualifies the text against a synthetic single-column-list relation built from
+            ``frame``'s known columns, then rewrites the resulting column edge's sources
+            back onto ``frame``'s actual column origins.
+
+            Args:
+                node: Expression node holding the SQL text (folded via ``concrete``).
+                frame (Frame): Frame whose columns the SQL expression is evaluated against.
+
+            Returns:
+                Column: The evaluated column. Marked ``partial`` when the text cannot be
+                folded to a concrete string or sqlglot produces no column edge for it.
+            """
             text = concrete(node, "dynamic_sql")
             if text is None:
                 return Column(partial=True)
@@ -462,6 +736,22 @@ class PythonWorker:
             )
 
         def select_frame(frame, args):
+            """Build a new frame containing only the selected columns/expressions.
+
+            Backs ``select``/``selectExpr``-style calls. Flattens list/tuple arguments,
+            expands a bare ``"*"`` string to all currently-known columns, and evaluates
+            non-string arguments as column expressions via ``col_expr``.
+
+            Args:
+                frame (Frame): Source frame the selection is applied to.
+                args: Sequence of AST argument nodes naming or computing output columns.
+
+            Returns:
+                Frame: A copy of ``frame`` with ``columns`` replaced by the selection and
+                ``open_columns`` set to ``False`` (except where ``"*"`` preserves it),
+                marked ``partial`` for any argument whose output column name could not be
+                determined.
+            """
             out = copy.deepcopy(frame)
             out.columns = {}
             out.open_columns = False
@@ -488,6 +778,16 @@ class PythonWorker:
             return out
 
         def frame_from_dataset(ds):
+            """Create a :class:`Frame` for a dataset read, recording it as a job input.
+
+            Args:
+                ds (str): Normalized dataset id being read.
+
+            Returns:
+                Frame: A frame sourced from ``ds``, with columns seeded from the schema
+                provider when available; ``open_columns`` is ``True`` when no schema was
+                found, since unlisted columns may still exist.
+            """
             inputs.add(ds)
             columns = self.sql.schema.columns(ds) if self.sql.schema else None
             return Frame(
@@ -497,6 +797,21 @@ class PythonWorker:
             )
 
         def write_frame(frame, ds, node):
+            """Record a dataset write: table edges from every known source, column edges.
+
+            Emits one ``TableEdge`` per source dataset ``frame`` was built from (or, when
+            ``frame`` is not a tracked :class:`Frame`, per input seen so far in this file,
+            conservatively) and, when ``frame`` is a tracked :class:`Frame`, one
+            ``ColumnEdge`` per known column. Records issues for an untracked write receiver,
+            an output with open (possibly incomplete) columns, and any column whose
+            provenance is only partially known.
+
+            Args:
+                frame (Frame): The frame being written, or any other tracked value when the
+                    write target could not be resolved to a frame.
+                ds (str): Normalized dataset id being written.
+                node: The write call node, used for its source text and line range.
+            """
             outputs.add(ds)
             refs = sorted(frame.sources) if isinstance(frame, Frame) else sorted(inputs)
             partial = not isinstance(frame, Frame) or frame.partial
@@ -562,6 +877,24 @@ class PythonWorker:
                 )
 
         def invoke(function, args, keywords, module_state):
+            """Bind arguments and run a function body under its own interpreter state.
+
+            Guards against unbounded recursion/import depth via ``active`` and
+            ``max_import_depth``, binds positional and keyword arguments (falling back to
+            evaluated defaults, or an unknown placeholder when neither is supplied) into a
+            copy of ``module_state``'s environment, then interprets the function body.
+
+            Args:
+                function (ast.FunctionDef): The function to invoke.
+                args (list): Already-evaluated positional argument values.
+                keywords (dict): Already-evaluated keyword argument values by name.
+                module_state (State): The state of the module ``function`` is defined in,
+                    used as the base environment for the call.
+
+            Returns:
+                The function's ``return`` value, as produced by ``statements``, or ``None``
+                when the recursion/depth limit is reached or the function has no return.
+            """
             nonlocal state
             key = (module_state.source.path, function.name)
             if key in active or module_state.depth > self.max_import_depth:
@@ -589,6 +922,22 @@ class PythonWorker:
                 state = old
 
         def imported_state(module, level=0):
+            """Resolve and load a helper module's definitions (functions and constants).
+
+            Loads only import/function/assignment statements (``definitions_only=True``),
+            so importing a helper module never executes its top-level side effects, and
+            guards against re-entering a module already being loaded or exceeding
+            ``max_import_depth``.
+
+            Args:
+                module (str): Dotted module name to resolve.
+                level (int): Relative import level; ``0`` for an absolute import.
+
+            Returns:
+                State | None: The loaded module's state, or ``None`` when ``self.index`` is
+                unset, the module cannot be resolved, it is already being loaded (import
+                cycle), or the depth limit is reached.
+            """
             if not self.index:
                 return None
             helper = self.index.resolve_module(module, state.source, level)
@@ -605,6 +954,37 @@ class PythonWorker:
             return module_state
 
         def evaluate(node):
+            """Evaluate an arbitrary AST expression to its tracked runtime-shaped value.
+
+            This is the interpreter's dispatch core. Depending on ``node`` it returns: the
+            bound value or a folded string for a ``Name``; a :class:`Folded` constant; a
+            folded string, or a column-tracking :class:`Column` for arithmetic/f-strings
+            that touch frame columns; a :class:`Frame`/:class:`Column`/folded value for
+            subscript access (list/tuple selection, string column access, group-by-aware
+            single-key access, or an indexed slice); a :class:`Reader` builder, a resolved
+            attribute, or a folded value for attribute access; and, for calls, one of many
+            outcomes depending on the callee: an invoked helper function's return value; a
+            :class:`Connection` for ``create_engine``/``connect``; an updated
+            :class:`Reader` for builder calls (``format``/``option``/``options``); a
+            :class:`Column` for calls on a tracked column; an updated :class:`Frame` for
+            supported chained DataFrame operations (``select``, ``withColumn``, ``rename``,
+            ``drop``, ``filter``/``where``, ``join``/``merge``, ``groupBy``/``agg``,
+            ``union``, and several no-op passthroughs), with unsupported operations
+            downgrading the frame to ``partial`` and recording an issue; for a call matching
+            the sink table, a new input :class:`Frame`, the write receiver echoed back after
+            recording a write, or ``None`` after a SQL write; an :class:`Expression` for
+            unresolved ``pyspark.sql.functions``/``Window``-style calls; or a folded value
+            as the fallback.
+
+            Args:
+                node: Expression node to evaluate, or ``None``.
+
+            Returns:
+                The tracked value described above, or ``None`` when ``node`` is ``None`` or
+                the call could not be resolved to a usable value (dataset argument missing,
+                SQL write with no output frame requested, and similar cases handled by
+                returning ``None``).
+            """
             if node is None:
                 return None
             if isinstance(node, ast.Name):
@@ -1058,6 +1438,16 @@ class PythonWorker:
                     )
 
                 def dataset_id(text):
+                    """Normalize a resolved path/table string to a canonical dataset id.
+
+                    Args:
+                        text (str): The resolved path or table name.
+
+                    Returns:
+                        str: ``"file://" + text`` for a bare path-scheme value with no
+                        scheme prefix, otherwise the result of
+                        :func:`~etl_parser.identity.normalize_dataset_id`.
+                    """
                     if sink.scheme == "path" and "://" not in text:
                         return "file://" + text
                     return normalize_dataset_id(text, engine=engine, default_db=self.default_db)
@@ -1092,6 +1482,27 @@ class PythonWorker:
             return folded(node)
 
         def statements(body):
+            """Interpret a sequence of statements against the current interpreter state.
+
+            Handles function/class-level definitions (registered for later calls, not
+            executed), imports (resolved via ``imported_state``), assignments (including
+            subscript assignment onto a tracked :class:`Frame`'s columns), bare expression
+            statements, ``return``, ``if``/``else`` (both branches are interpreted from a
+            shared starting environment and merged afterward, with divergent values
+            downgraded to a :class:`Frame` union or an unknown placeholder), ``with``, a
+            bounded ``for`` loop over a literal list/tuple with no ``break``/``continue``/
+            ``return`` in its body (interpreted once per item), and other loops/``try``
+            blocks (interpreted once conservatively, with every tracked frame marked
+            partial afterward). Any exception raised while interpreting one statement is
+            caught and recorded as an issue rather than aborting the rest of the body.
+
+            Args:
+                body (list): Sequence of statement nodes to interpret.
+
+            Returns:
+                The value of a ``return`` statement encountered directly in ``body``, or
+                ``None`` when none is reached.
+            """
             for node in body:
                 try:
                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1174,6 +1585,17 @@ class PythonWorker:
             return None
 
         def load_module(source, module_state, definitions_only=False):
+            """Parse a module and interpret its body under ``module_state``.
+
+            Args:
+                source (SourceFile): The module to parse and interpret.
+                module_state (State): The state to interpret the module's body under; made
+                    the active ``state`` for the duration of this call.
+                definitions_only (bool): When ``True``, only ``Import``, ``ImportFrom``,
+                    ``FunctionDef``, ``AsyncFunctionDef``, ``Assign``, and ``AnnAssign``
+                    top-level statements are interpreted, so loading a helper module never
+                    runs its other top-level side effects.
+            """
             nonlocal state
             old, state = state, module_state
             try:

@@ -1,9 +1,18 @@
 """SqlWorker: column-level lineage from SQL text using sqlglot.
 
-Statements are normalised to (target, SELECT) pairs. CREATE TABLE AS, INSERT ... SELECT and
-MERGE all become a target dataset plus a select-like body. Each output column is resolved with
-``sqlglot.lineage`` to leaf table columns, and columns used only in WHERE, JOIN, GROUP BY or
-HAVING are attached as indirect sources.
+Implements design section 8.1. Statements are normalised to ``(target, SELECT)`` pairs:
+``CREATE TABLE AS``, ``INSERT ... SELECT``, ``INSERT OVERWRITE``, ``MERGE``, and ``UPDATE``
+all become a target dataset plus a select-like body; a plain ``SELECT`` has no target and
+yields inputs only. Each output column is resolved with ``sqlglot.lineage`` to leaf table
+columns, and columns used only in ``WHERE``, ``JOIN ... ON``, ``GROUP BY``, or ``HAVING``
+are attached as indirect sources with kind ``filter``, ``join``, or ``aggregation``. A
+session-scoped temp table map lets a temp table created in one statement be expanded when
+read by a later statement in the same ``analyze``/``analyze_file`` call.
+
+Entry points: ``SqlWorker.analyze`` (SQL text, for embedded/dynamic SQL) and
+``SqlWorker.analyze_file`` (a ``.sql`` file, builds the ``Job`` around it). Schema lookup is
+pluggable through the ``SchemaProvider`` protocol, with ``DictSchemaProvider`` (a
+``catalog.json`` or plain mapping) and ``GlueSchemaProvider`` (boto3) implementations.
 """
 
 from __future__ import annotations
@@ -44,13 +53,38 @@ from etl_parser.workers.base import (
 
 
 class SchemaProvider(Protocol):
-    def columns(self, dataset_id: str) -> list[str] | None: ...
+    """Pluggable schema lookup used by ``SqlWorker`` to qualify columns and star-expand."""
+
+    def columns(self, dataset_id: str) -> list[str] | None:
+        """Return the known column names of a dataset, or ``None`` when the schema is unknown.
+
+        Args:
+            dataset_id: Canonical dataset id (see ``identity.py``).
+
+        Returns:
+            Ordered column names, or ``None`` if the dataset is not present in this
+            provider's schema.
+        """
+        ...
 
 
 class DictSchemaProvider:
     """Schema lookup backed by a ``{db: {table: [cols]}}`` mapping or an agent ``catalog.json``."""
 
     def __init__(self, source: Mapping | str | Path):
+        """Load a schema from an in-memory mapping, a JSON file path, or a ``catalog.json``.
+
+        Args:
+            source: Either a ``Mapping`` (a ``catalog.json``-shaped dict with a
+                ``"databases"`` key, or a plain ``{db: {table: [cols]}}``/``{db: {table:
+                {col: type}}}`` mapping), or a ``str``/``Path`` to a JSON file containing
+                one of those shapes.
+
+        Raises:
+            ValueError: If ``source`` (or the parsed JSON file) is not a mapping, if a
+                database entry does not map table names to column lists, or if a table's
+                columns are not a list of non-empty strings.
+        """
         if isinstance(source, (str, Path)):
             source = json.loads(Path(source).read_text())
         if not isinstance(source, Mapping):
@@ -75,6 +109,14 @@ class DictSchemaProvider:
                     )
 
     def columns(self, dataset_id: str) -> list[str] | None:
+        """Return the columns for a dataset id, matched by lower-cased ``namespace.name``.
+
+        Args:
+            dataset_id: Canonical dataset id.
+
+        Returns:
+            The dataset's column names, or ``None`` when it is not in the loaded schema.
+        """
         _, ns, name = split_dataset_id(dataset_id)
         return self._cols.get(f"{ns}.{name}".lower())
 
@@ -83,6 +125,13 @@ class GlueSchemaProvider:
     """Optional cached Glue lookup, enabled only by an explicit caller choice."""
 
     def __init__(self, client=None, *, region: str | None = None):
+        """Create a Glue-backed schema provider.
+
+        Args:
+            client: A boto3 Glue client, or ``None`` to create one with ``boto3.client
+                ("glue", region_name=region)``.
+            region: AWS region for the default client. Ignored when ``client`` is given.
+        """
         if client is None:
             import boto3
 
@@ -91,6 +140,15 @@ class GlueSchemaProvider:
         self._cache: dict[str, list[str] | None] = {}
 
     def columns(self, dataset_id: str) -> list[str] | None:
+        """Return a Glue table's columns (storage columns plus partition keys), cached.
+
+        Args:
+            dataset_id: Canonical dataset id; only ``glue://`` ids are looked up.
+
+        Returns:
+            Deduplicated column names in Glue's reported order, or ``None`` when
+            ``dataset_id`` is not a ``glue`` scheme dataset or Glue has no such table.
+        """
         scheme, database, table = split_dataset_id(dataset_id)
         if scheme != "glue":
             return None
@@ -108,22 +166,62 @@ class GlueSchemaProvider:
 
 @dataclass
 class SqlAnalysis:
+    """Result of analysing one SQL text: the ``WorkerResult`` plus dataset-level summary.
+
+    Returned by ``SqlWorker.analyze``/``analyze_file`` so callers such as PythonWorker's
+    DataFrame tracker can see which datasets were touched and what columns a target ended
+    up with, without re-deriving them from ``result``.
+
+    Attributes:
+        result: Datasets, jobs, column/table edges, and unresolved items produced.
+        inputs: Dataset ids read by any statement in the analysed text.
+        outputs: Dataset ids written by any statement in the analysed text.
+        output_columns: Target dataset id -> ordered output column names, keyed
+            ``"__select__"`` for a plain ``SELECT`` with no target (for callers tracking
+            frames).
+    """
+
     result: WorkerResult
     inputs: set[str] = field(default_factory=set)
     outputs: set[str] = field(default_factory=set)
     output_columns: dict[str, list[str]] = field(default_factory=dict)
-    """target dataset id -> ordered output column names (for callers tracking frames)."""
 
 
 @dataclass
 class _Statement:
+    """One parsed SQL statement together with its line span in the original source text.
+
+    Attributes:
+        expression: The parsed sqlglot expression for the statement.
+        line_start: 1-based line number where the statement starts.
+        line_end: 1-based line number where the statement ends.
+    """
+
     expression: exp.Expression
     line_start: int
     line_end: int
 
 
 class SqlWorker:
+    """Parses SQL text with sqlglot and produces column- and table-level lineage.
+
+    Implements design section 8.1. One instance carries a session-scoped temp table map
+    (``_temp_tables``) that is reset at the start of every ``analyze`` call, so a temp
+    table created in one statement can be expanded when read by a later statement in the
+    same call, but never leaks across unrelated files or calls.
+
+    Attributes:
+        schema: Optional ``SchemaProvider`` used to qualify columns, expand ``SELECT *``,
+            and validate that resolved columns actually exist.
+    """
+
     def __init__(self, schema: SchemaProvider | None = None):
+        """Create a worker, optionally backed by a schema provider.
+
+        Args:
+            schema: Schema lookup used for qualification and star-expansion, or ``None``
+                to analyze without one (stars and unqualified columns stay unresolved).
+        """
         self.schema = schema
         self._temp_tables: dict[str, dict[str, ColumnEdge]] = {}
 
@@ -131,6 +229,25 @@ class SqlWorker:
     def analyze_file(
         self, path: Path, *, root: Path | None = None, engine: str = "athena"
     ) -> SqlAnalysis:
+        """Analyze a ``.sql`` file and build the ``Job`` that represents it.
+
+        Reads the file, extracts its header (``owner``, ``schedule``, ...) via
+        ``parse_header``, analyzes the SQL body, and appends a ``Job`` (and, when the
+        header declares a schedule, a ``Schedule``) to the returned result.
+
+        Args:
+            path: Path to the ``.sql`` file.
+            root: Repo root used to compute the job id and repo-relative source file path.
+            engine: Executing engine (``athena``, ``spark``, ``postgres``, ``mysql``, ...),
+                used to pick the SQL dialect via ``ENGINE_DIALECT`` and to set
+                ``Job.engine``/``Job.dialect``.
+
+        Returns:
+            The ``SqlAnalysis`` for the file's SQL, with its ``result.jobs`` containing the
+            file's ``Job``. When the file cannot be read, ``result.unresolved`` holds a
+            single ``unsupported_syntax`` item describing the read error and no job is
+            added.
+        """
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
@@ -187,6 +304,36 @@ class SqlWorker:
         line_offset: int = 0,
         target_override: str | None = None,
     ) -> SqlAnalysis:
+        """Analyze one SQL session's text and return its lineage.
+
+        Splits ``sql`` into statements, tracks a ``USE`` default database, and dispatches
+        each statement to the merge, update, or generic (create/insert/select/delete)
+        analysis path. Resets the temp table map first, since a call to ``analyze``
+        represents one self-contained SQL session.
+
+        Args:
+            sql: The SQL text to analyze. May contain multiple ``;``-separated statements.
+            dialect: sqlglot dialect to parse and qualify with.
+            engine: Executing engine, used only to normalise dataset ids (see
+                ``identity.normalize_dataset_id``).
+            job_id: Job id attached to every edge and unresolved item produced.
+            default_db: Default database for one-part table names, overridden by any
+                ``USE`` statement encountered.
+            source_file: Repo-relative source file path recorded on edges and unresolved
+                items.
+            line_offset: Line number to add to every reported line, for SQL embedded in a
+                Python file at a known offset.
+            target_override: When given, used as every statement's target dataset instead
+                of the one derived from the statement (for SQL embedded in a call whose
+                target is known some other way).
+
+        Returns:
+            The ``SqlAnalysis`` for ``sql``. If ``sql`` contains an unrendered
+            ``{{...}}``/``${...}`` template placeholder, analysis stops immediately and
+            ``result.unresolved`` holds a single ``dynamic_sql`` item; otherwise a failure
+            analyzing one statement is isolated to that statement's ``unresolved`` item and
+            the rest of the statements are still analyzed.
+        """
         result = WorkerResult()
         analysis = SqlAnalysis(result=result)
         holes = re.findall(r"\{\{\s*(.*?)\s*\}\}|\$\{([^}]+)\}", sql)
@@ -248,6 +395,26 @@ class SqlWorker:
         result: WorkerResult,
         job_id: str,
     ) -> list[_Statement]:
+        """Tokenize and split ``sql`` into individually-parsed statements.
+
+        Splitting on tokenized semicolons (rather than a naive string split) preserves
+        quoted semicolons, keeps accurate character offsets for line numbers, and skips
+        empty statements.
+
+        Args:
+            sql: The full SQL text.
+            dialect: sqlglot dialect to tokenize and parse with.
+            source_file: Recorded on any ``unsupported_syntax`` item raised.
+            line_offset: Added to every reported line number.
+            result: Worker result that tokenize/parse failures are appended to.
+            job_id: Recorded on any ``unsupported_syntax`` item raised.
+
+        Returns:
+            One ``_Statement`` per successfully parsed chunk. A chunk that fails to parse
+            contributes an ``unsupported_syntax`` item to ``result`` and is skipped, so the
+            fatal ``tokenize`` failure aside, a parse error in one statement does not stop
+            the others from being returned.
+        """
         try:
             tokens = sqlglot.tokenize(sql, read=dialect)
         except (SqlglotError, ValueError) as e:
@@ -312,6 +479,29 @@ class SqlWorker:
         source_file: str | None,
         target_override: str | None,
     ) -> None:
+        """Route one parsed statement to its analysis path and update ``analysis``.
+
+        ``USE`` statements are intercepted by the caller (``analyze``) before reaching
+        here; the check in this method is defensive. Handles ``DROP`` (clears a temp table
+        mapping), ``ALTER``/``SET``/``PRAGMA`` (ignored), ``MERGE`` and ``UPDATE``
+        (delegated to their dedicated analyzers), and otherwise normalises
+        ``CREATE TABLE/VIEW AS``, ``INSERT ... SELECT``/``INSERT OVERWRITE``, plain
+        ``SELECT``/set operations, and ``DELETE`` to a target plus a ``SELECT``-like body
+        before calling ``_analyze_select``. Plain DDL (a ``CREATE TABLE`` with no
+        ``SELECT`` body) registers the target's declared columns directly with no lineage.
+        A statement type with no modelled path becomes an ``unsupported_syntax`` item.
+
+        Args:
+            stmt: The statement to analyze.
+            analysis: Accumulator updated in place with datasets, edges, and inputs/outputs.
+            dialect: sqlglot dialect used to render unresolved SQL snippets.
+            engine: Executing engine, forwarded to ``_analyze_select``.
+            job_id: Recorded on every edge and unresolved item produced.
+            default_db: Default database for one-part table names.
+            source_file: Recorded on every edge and unresolved item produced.
+            target_override: Forced target dataset id, taking precedence over one derived
+                from the statement.
+        """
         e = stmt.expression
         result = analysis.result
         norm = lambda name: normalize_dataset_id(name, engine=engine, default_db=default_db)  # noqa: E731
@@ -429,6 +619,35 @@ class SqlWorker:
         is_temp: bool,
         target_columns: list[str] | None = None,
     ) -> None:
+        """Resolve a ``SELECT``-like body's column and table lineage into a target dataset.
+
+        Collects the real (non-CTE) source tables, qualifies the body against the schema
+        provider (or an inferred schema), checks for unexpandable ``SELECT *`` (kind
+        ``missing_schema``, confidence downgraded to ``partial``), and resolves each output
+        projection via ``_column_edge``. When the target column count from an explicit
+        column list does not match the number of projections, output columns are dropped
+        entirely and an ``unknown_column`` item is recorded. Registers the target dataset
+        with its resolved columns, one ``TableEdge`` per source table, and, for a temp
+        table, stores its column edges in ``self._temp_tables`` for later expansion.
+
+        Args:
+            body: The ``SELECT``/set-operation/subquery body to analyze.
+            target: Target dataset id, or ``None`` for a plain ``SELECT`` with no target
+                (in which case output columns are recorded under ``"__select__"`` and no
+                edges are produced).
+            stmt: The enclosing statement, for line numbers.
+            analysis: Accumulator updated in place.
+            dialect: sqlglot dialect used to qualify and render SQL.
+            engine: Executing engine; unused directly here but threaded through for
+                consistency with callers that also invoke ``_analyze_merge``.
+            job_id: Recorded on every edge and unresolved item produced.
+            norm: Callable normalising a raw table name to a canonical dataset id.
+            source_file: Recorded on every edge and unresolved item produced.
+            is_temp: Whether ``target`` is a session-scoped temp table, so its column
+                edges are cached in ``self._temp_tables`` instead of only being reported.
+            target_columns: Explicit target column names from ``INSERT``/``CREATE ...
+                (cols)``, used to rename and validate output projections.
+        """
         result = analysis.result
         prov = Provenance(parser="sqlglot", dialect=dialect)
 
@@ -587,6 +806,38 @@ class SqlWorker:
         source_file,
         result,
     ) -> ColumnEdge | None:
+        """Resolve one output column's ``sqlglot.lineage`` leaves into a ``ColumnEdge``.
+
+        Walks the lineage graph's leaf nodes for ``name``. A leaf backed by a real table
+        becomes a source column, checked against the schema provider when available (an
+        unknown column downgrades confidence to ``partial`` and is dropped, with an
+        ``unknown_column`` item recorded). A leaf with no column references (a constant,
+        ``COUNT(*)``, a zero-argument function) contributes no source. Anything else that
+        cannot be traced to a table downgrades confidence to ``partial``, except for a
+        top-level constant/null/boolean/anonymous-function/current-timestamp/current-date
+        projection, which is expected to have no sources.
+
+        Args:
+            name: Output column name (alias or bare name) being resolved.
+            proj: The projection expression for ``name`` in the qualified query.
+            qualified: The fully qualified query passed to ``sqlglot.lineage``.
+            schema_map: Nested ``{db: {table: {col: type}}}`` schema used by ``lineage``.
+            dialect: sqlglot dialect used to render the transformation expression.
+            norm: Callable normalising a raw table name to a canonical dataset id.
+            target: Target dataset id the resulting edge's ``ColumnRef`` belongs to.
+            job_id: Recorded on the edge and any unresolved item produced.
+            indirect: Filter/join/aggregation indirect sources from ``_indirect_sources``,
+                attached to the edge regardless of how ``name`` itself was resolved.
+            prov: Base provenance to copy onto the edge, with confidence adjusted.
+            stmt: The enclosing statement, for line numbers.
+            source_file: Recorded on the edge and any unresolved item produced.
+            result: Worker result that unresolved items are appended to.
+
+        Returns:
+            A ``ColumnEdge`` for ``name``. Despite the ``| None`` annotation, this method
+            does not return ``None`` in current code: a ``sqlglot.lineage`` failure still
+            yields a ``partial``-confidence edge with no sources.
+        """
         try:
             node = sqlglot_lineage(
                 exp.column(name, quoted=True),
@@ -691,7 +942,21 @@ class SqlWorker:
         )
 
     def _expand_temp(self, edge: ColumnEdge) -> ColumnEdge:
-        """Replace sources that point at a session temp table with that table's own sources."""
+        """Replace sources that point at a session temp table with that table's own sources.
+
+        Applied to every column edge as it is produced, so a temp table created earlier in
+        the same ``analyze`` call is transparently expanded to its ultimate table sources
+        rather than left pointing at a dataset id that never gets registered as a real
+        table.
+
+        Args:
+            edge: A freshly resolved column edge whose sources may include temp tables.
+
+        Returns:
+            ``edge`` unchanged when there are no known temp tables; otherwise a copy with
+            temp-table sources (direct and indirect) replaced by their own upstream
+            sources, and confidence downgraded to match the least exact of them.
+        """
         if not self._temp_tables:
             return edge
         new_sources: list[ColumnRef] = []
@@ -720,6 +985,31 @@ class SqlWorker:
         )
 
     def _analyze_merge(self, e: exp.Merge, stmt, analysis, dialect, job_id, norm, source_file):
+        """Resolve a ``MERGE`` statement's ``WHEN`` branches into column lineage.
+
+        Each ``WHEN MATCHED UPDATE`` or ``WHEN NOT MATCHED INSERT`` branch is rewritten as
+        a synthetic ``SELECT`` (assignment expressions aliased to their target column, from
+        the merge target joined to the using source on the merge condition, further
+        filtered by the branch's own condition) and analyzed with ``_analyze_select``.
+        Branches touching the same target column are merged: sources and indirect sources
+        are unioned, the reported transformation expression is the original ``MERGE`` text
+        (not the synthetic ``SELECT``) so lineage points back at real source SQL, the kind
+        becomes ``expression`` when branches disagree, and confidence is downgraded to the
+        least exact branch. The merge target is both an input and an output.
+
+        Args:
+            e: The parsed ``MERGE`` expression.
+            stmt: The enclosing statement, for line numbers.
+            analysis: Accumulator updated in place with the merged edges and inputs.
+            dialect: sqlglot dialect used to analyze branches and render the merge text.
+            job_id: Recorded on every edge and unresolved item produced.
+            norm: Callable normalising a raw table name to a canonical dataset id.
+            source_file: Recorded on every edge and unresolved item produced.
+
+        Raises:
+            KeyError: If a branch is missing the ``"whens"``, ``"using"``, or ``"on"``
+                argument sqlglot's ``Merge`` grammar is expected to always provide.
+        """
         target = norm(_table_name(e.this))
         analysis.inputs.add(target)
         analysis.outputs.add(target)
@@ -789,6 +1079,22 @@ class SqlWorker:
         analysis.output_columns[target] = list(merged)
 
     def _analyze_update(self, e: exp.Update, stmt, analysis, dialect, job_id, norm, source_file):
+        """Resolve an ``UPDATE`` statement's ``SET`` assignments into column lineage.
+
+        Rewrites the statement as a synthetic ``SELECT`` (each ``col = expr`` assignment
+        aliased to ``col``, from the updated table, cross-joined to an ``UPDATE ... FROM``
+        source when present, with the original ``WHERE``/``WITH`` reattached) and analyzes
+        it with ``_analyze_select`` against the same table as both source and target.
+
+        Args:
+            e: The parsed ``UPDATE`` expression.
+            stmt: The enclosing statement, for line numbers.
+            analysis: Accumulator updated in place by ``_analyze_select``.
+            dialect: sqlglot dialect used to analyze the synthetic select.
+            job_id: Recorded on every edge and unresolved item produced.
+            norm: Callable normalising a raw table name to a canonical dataset id.
+            source_file: Recorded on every edge and unresolved item produced.
+        """
         target = norm(_table_name(e.this))
         projections = [
             exp.alias_(eq.expression.copy(), eq.this.name, quoted=True)
@@ -807,6 +1113,24 @@ class SqlWorker:
 
     # --------------------------------------------------------------- helpers
     def _schema_map(self, source_tables: Mapping[str, str], norm) -> dict:
+        """Build the nested ``{db: {table: {col: type}}}`` schema sqlglot expects.
+
+        Columns come from an open temp table first (``self._temp_tables``, whose keys are
+        already the temp table's own resolved columns), falling back to ``self.schema``.
+        A source table with no known columns is omitted so ``qualify``/``lineage`` treat
+        it as schema-less rather than empty.
+
+        Args:
+            source_tables: Mapping of the table's SQL text (as it appeared in the query) to
+                its normalised dataset id.
+            norm: Unused directly here; accepted for a consistent helper signature with
+                callers that also normalise table names.
+
+        Returns:
+            Nested mapping keyed by each part of the table's SQL name, with a fabricated
+            ``"unknown"`` type for every column (sqlglot needs a type per column but this
+            worker does not track real types).
+        """
         out: dict = {}
         for table_sql, ds in source_tables.items():
             cols = (
@@ -824,6 +1148,24 @@ class SqlWorker:
         return out
 
     def _indirect_sources(self, qualified, norm, dialect) -> dict[str, list[ColumnRef]]:
+        """Collect columns referenced only in ``WHERE``, ``JOIN ON``, ``GROUP BY``, or
+        ``HAVING``/``QUALIFY`` across every scope of a qualified query.
+
+        For each such clause, walks its columns within the enclosing scope. A column from a
+        real table is recorded directly; a column from a subquery/CTE scope is traced with
+        a further ``sqlglot.lineage`` call to its leaf table columns. These become the
+        indirect sources attached to every output column edge of the query (design section
+        8.1 step 5), matching OpenLineage's indirect transformation categories.
+
+        Args:
+            qualified: The fully qualified query to scan.
+            norm: Callable normalising a raw table name to a canonical dataset id.
+            dialect: sqlglot dialect used for the nested ``lineage`` calls.
+
+        Returns:
+            Mapping with keys ``"filter"``, ``"join"``, and ``"aggregation"``, each a
+            deduplicated list of the ``ColumnRef``s referenced in that clause kind.
+        """
         result: dict[str, list[ColumnRef]] = {"filter": [], "join": [], "aggregation": []}
         for scope in traverse_scope(qualified):
             query = scope.expression
@@ -869,6 +1211,14 @@ class SqlWorker:
 
 
 def _dedup(refs: Iterable[ColumnRef]) -> list[ColumnRef]:
+    """Remove duplicate ``ColumnRef``s, keeping first occurrence order.
+
+    Args:
+        refs: Column references to deduplicate, compared by ``(dataset_id, name)``.
+
+    Returns:
+        The unique references in the order first seen.
+    """
     seen = set()
     out = []
     for r in refs:
@@ -879,10 +1229,31 @@ def _dedup(refs: Iterable[ColumnRef]) -> list[ColumnRef]:
 
 
 def _table_name(t: exp.Table) -> str:
+    """Render a sqlglot ``Table`` node's parts as a dotted name, e.g. ``db.schema.table``.
+
+    Args:
+        t: The table node.
+
+    Returns:
+        The dot-joined SQL text of each part, preserving quoting as sqlglot renders it.
+    """
     return ".".join(p.sql() for p in t.parts)
 
 
 def _all_selects(body: exp.Expression) -> list[exp.Expression]:
+    """Collect every output projection of a select/set-operation/subquery body.
+
+    Unlike the single ``outer.selects`` used inline in ``_analyze_select`` (which only
+    looks at the outermost branch), this recurses into both sides of a set operation
+    (``UNION``, etc.) and through a wrapping subquery.
+
+    Args:
+        body: The query body to collect projections from.
+
+    Returns:
+        A flat list of projection expressions across every branch, or an empty list when
+        ``body`` is not a ``Select``, ``SetOperation``, or ``Subquery``.
+    """
     if isinstance(body, exp.SetOperation):
         return _all_selects(body.left) + _all_selects(body.right)
     if isinstance(body, exp.Subquery):
@@ -893,6 +1264,16 @@ def _all_selects(body: exp.Expression) -> list[exp.Expression]:
 
 
 def _kind(proj: exp.Expression) -> str:
+    """Classify a projection's ``Transformation.kind`` for design section 8.1 step 4.
+
+    Args:
+        proj: The (possibly aliased) output projection expression.
+
+    Returns:
+        ``"window"`` if the projection contains a window function, ``"aggregation"`` if it
+        contains an aggregate function, ``"identity"`` if it is a bare column reference,
+        otherwise ``"expression"``.
+    """
     inner = proj.unalias() if isinstance(proj, exp.Alias) else proj
     if inner.find(exp.Window):
         return "window"
@@ -906,6 +1287,18 @@ def _kind(proj: exp.Expression) -> str:
 
 
 def _sql_description(text: str) -> str | None:
+    """Return the first leading ``--`` comment line of a SQL file, used as ``Job.description``.
+
+    Skips header-style comment lines (``Key: value``, matched by whether the first word
+    contains a colon) and stops at the first non-comment, non-blank line.
+
+    Args:
+        text: Full SQL file text.
+
+    Returns:
+        The stripped text of the first plain leading comment line, or ``None`` when there
+        is none before the SQL body starts.
+    """
     for line in text.splitlines():
         s = line.strip()
         if s.startswith("--"):

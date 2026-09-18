@@ -1,4 +1,13 @@
-"""Command-line interface. Scanning never imports the scanned repository."""
+"""Command-line interface. Scanning never imports the scanned repository (spec section 12).
+
+Typer app with commands ``run`` (deterministic lineage plus optional, explicitly enabled AI
+work), ``scan`` (deterministic lineage only), ``export catalog``/``export openlineage``,
+``impact``, ``products``, and ``describe`` (AI column descriptions). Each command's
+docstring is also its ``--help`` text. Exit code is non-zero when a scan finds an
+``unsupported_syntax`` unresolved item, or when ``--strict`` is set on ``run`` and any
+unresolved items, warnings, or a non-success run status remain, so CI can gate on parser
+coverage.
+"""
 
 from __future__ import annotations
 
@@ -97,7 +106,60 @@ def analysis_run(
     log_max_bytes: int = typer.Option(10_000_000, min=1024),
     log_max_files: int = typer.Option(20, min=1),
 ):
-    """Run deterministic lineage plus explicitly enabled AI work; defaults make no AI calls."""
+    """Run deterministic lineage plus explicitly enabled AI work; defaults make no AI calls.
+
+    Args:
+        source: Local path or ``https://github.com/OWNER/REPO`` to analyze.
+        out_dir: Directory to write result artifacts to.
+        config: JSON file of base :class:`~etl_parser.ai_analysis.AnalysisConfig` settings;
+            any other option given on the command line overrides its value.
+        ai_lineage: ``off`` (default), ``fallback``, or ``improve``.
+        descriptions: Whether to also generate column descriptions.
+        background_comparison: Whether to run a background AI-vs-static comparison.
+        dry_run: Whether to validate configuration without making AI calls.
+        schema: JSON schema file for qualifying SQL and expanding stars.
+        glue: Fetch input schemas from AWS Glue instead of ``--schema``.
+        plugin: Explicitly trusted ``module:factory`` parser plugins to register.
+        bindings: JSON file of string substitutions for SQL placeholders.
+        products: Path to a ``product.yaml`` file or directory of them.
+        prior: Prior catalog JSON to preserve descriptions and flags from.
+        engine: Default execution engine for standalone ``.sql`` files.
+        dialect: Default sqlglot dialect for standalone ``.sql`` files.
+        default_db: Database to assume for one-part table names.
+        ref: GitHub branch, tag, or commit to pin (GitHub sources only).
+        source_path: Subpath within a GitHub repository to scan.
+        lambda_arn: Lambda function name or ARN for the Bedrock invoke runner.
+        runner: ``lambda-bedrock-invoke`` (default), ``lbi`` (alias), or ``anthropic``.
+        base_url: Anthropic-compatible HTTPS root; SDK appends ``/v1/messages``.
+        api_key: Prefer the environment variable over a command-line secret.
+        extra_headers: JSON object of custom HTTP headers for the Anthropic runner.
+        extra_headers_file: JSON header object file; mutually exclusive with
+            ``extra_headers``.
+        model: SDK model id or registered model slug for AI work.
+        region: AWS region for the Bedrock invoke runner.
+        aws_profile: Named AWS profile to use.
+        web_adapter: Whether to use the SDK Lambda Web Adapter envelope.
+        max_calls: Maximum number of AI calls to make.
+        max_output_tokens: Maximum output tokens per AI file request (default: 16000).
+        max_total_tokens: Maximum total tokens across all AI calls.
+        max_context_chars: Maximum characters of context sent per AI call.
+        timeout_seconds: Per-request timeout.
+        deadline_seconds: Overall deadline for AI work.
+        include: Glob patterns limiting which files AI work considers.
+        exclude: Glob patterns excluding files from AI work.
+        strict: Fail if any unresolved item, warning, or non-success status remains.
+        log_dir: Directory to persist run events and metrics in.
+        log_level: Console log level; file logs always retain DEBUG events.
+        log_max_bytes: Maximum size of a single log file before rotation.
+        log_max_files: Maximum number of rotated log files to keep.
+
+    Raises:
+        typer.BadParameter: If ``config`` is not a JSON object, the merged configuration
+            fails validation, both ``schema`` and ``glue`` are given, or ``bindings`` is
+            not a JSON object of string keys and values.
+        typer.Exit: With code 1 if ``strict`` is set and unresolved items, warnings, or a
+            non-success run status remain.
+    """
     from etl_parser.ai_analysis import AnalysisConfig, analyze
     from etl_parser.artifacts import write_analysis
 
@@ -189,10 +251,33 @@ def analysis_run(
 
 
 def _json(path):
+    """Read and parse a JSON file.
+
+    Args:
+        path: Path to the JSON file.
+
+    Returns:
+        The parsed JSON value.
+    """
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _headers(raw, path):
+    """Resolve and validate extra HTTP headers from an inline JSON string or a file.
+
+    Args:
+        raw: Inline JSON object string of headers, or ``None``.
+        path: Path to a JSON header object file, or ``None``.
+
+    Returns:
+        dict[str, str] | None: The validated headers, or ``None`` if neither ``raw`` nor
+        ``path`` was given.
+
+    Raises:
+        typer.BadParameter: If both ``raw`` and ``path`` are given, or the resolved value
+            is not valid JSON, is not readable, or fails
+            :class:`~etl_parser.describe.client.RunnerConfig` header validation.
+    """
     if raw is not None and path is not None:
         raise typer.BadParameter("Choose --extra-headers or --extra-headers-file, not both")
     if raw is None and path is None:
@@ -207,6 +292,12 @@ def _headers(raw, path):
 
 
 def _write(value, path):
+    """Serialize a value to deterministic, sorted JSON and write it to disk.
+
+    Args:
+        value: The JSON-serializable value to write.
+        path: Destination file path.
+    """
     text = json.dumps(value, sort_keys=True, indent=2) + "\n"
     path.write_text(text, encoding="utf-8")
     observer = current_observer()
@@ -222,6 +313,20 @@ def _write(value, path):
 
 
 def _factory(spec):
+    """Import and call a ``module:factory`` spec to build a trusted parser plugin.
+
+    Args:
+        spec: A ``"module:factory"`` string naming a zero-argument callable that returns a
+            :class:`~etl_parser.pipeline.ParserPlugin`.
+
+    Returns:
+        ParserPlugin: The result of calling the resolved factory.
+
+    Raises:
+        typer.BadParameter: If ``spec`` has no ``:`` separator.
+        ModuleNotFoundError: If ``module`` cannot be imported.
+        AttributeError: If ``module`` has no attribute ``attribute``.
+    """
     module, separator, attribute = spec.partition(":")
     if not separator:
         raise typer.BadParameter("Expected module:factory")
@@ -249,7 +354,32 @@ def scan(
     ref: str | None = typer.Option(None, help="GitHub branch, tag or commit to pin"),
     source_path: str | None = typer.Option(None, "--path", help="GitHub repository subpath"),
 ):
-    """Scan a repo, directory, Python/SQL file, or ZIP library into native JSON."""
+    """Scan a repo, directory, Python/SQL file, or ZIP library into native JSON.
+
+    Args:
+        repo: Local path or ``https://github.com/OWNER/REPO``.
+        out: Destination for the native ``lineage.json`` output.
+        schema: JSON schema file for qualifying SQL and expanding stars.
+        glue: Fetch input schemas from AWS Glue instead of ``--schema``.
+        region: AWS region for the Glue schema provider.
+        products: Path to a ``product.yaml`` file or directory of them.
+        bindings: JSON file of string substitutions for SQL placeholders.
+        default_db: Database to assume for one-part table names.
+        engine: Default execution engine for standalone ``.sql`` files.
+        dialect: Default sqlglot dialect for standalone ``.sql`` files.
+        plugin: Explicitly trusted ``module:factory`` parser plugins to register.
+        log_dir: Directory to persist run events and metrics in.
+        log_level: Console log level; file logs always retain DEBUG events.
+        log_max_bytes: Maximum size of a single log file before rotation.
+        log_max_files: Maximum number of rotated log files to keep.
+        ref: GitHub branch, tag, or commit to pin.
+        source_path: Subpath within the GitHub repository to scan.
+
+    Raises:
+        typer.BadParameter: If both ``schema`` and ``glue`` are given, or ``bindings`` is
+            not a JSON object of string keys and values.
+        typer.Exit: With code 1 if any unresolved item has kind ``unsupported_syntax``.
+    """
     registry = ParserRegistry()
     if schema and glue:
         raise typer.BadParameter("Choose either --schema or --glue")
@@ -303,7 +433,15 @@ def catalog_export(
     log_dir: Path | None = None,
     log_level: str = "INFO",
 ):
-    """Create the agent catalog, retaining prior descriptions and flags."""
+    """Create the agent catalog, retaining prior descriptions and flags.
+
+    Args:
+        lineage: Path to a native ``lineage.json`` file.
+        out: Destination for the generated ``catalog.json``.
+        prior: Prior ``catalog.json`` to merge into, preserving human-only fields.
+        log_dir: Directory to persist run events and metrics in.
+        log_level: Console log level; file logs always retain DEBUG events.
+    """
     _write(export_agent_catalog(read_native(lineage), _json(prior) if prior else None), out)
 
 
@@ -315,7 +453,14 @@ def openlineage_export(
     log_dir: Path | None = None,
     log_level: str = "INFO",
 ):
-    """Write one synthetic static OpenLineage event per job."""
+    """Write one synthetic static OpenLineage event per job.
+
+    Args:
+        lineage: Path to a native ``lineage.json`` file.
+        out: Directory to write one ``<runId>.json`` event file per job into.
+        log_dir: Directory to persist run events and metrics in.
+        log_level: Console log level; file logs always retain DEBUG events.
+    """
     out.mkdir(parents=True, exist_ok=True)
     for event in export_openlineage(read_native(lineage)):
         _write(event, out / f"{event['run']['runId']}.json")
@@ -331,7 +476,20 @@ def impact(
     log_dir: Path | None = None,
     log_level: str = "INFO",
 ):
-    """Query a dataset ID or dataset#column ID."""
+    """Query a dataset ID or dataset#column ID.
+
+    Args:
+        lineage: Path to a native ``lineage.json`` file.
+        node: Dataset id or ``dataset_id#column`` id to query.
+        upstream_direction: Walk upstream (provenance) instead of downstream (consumers).
+        depth: Maximum hop distance to include; unbounded if omitted.
+        log_dir: Directory to persist run events and metrics in.
+        log_level: Console log level; file logs always retain DEBUG events.
+
+    Raises:
+        typer.BadParameter: If ``depth`` is negative or ``node`` is not a known dataset or
+            column id.
+    """
     graph = LineageGraph(read_native(lineage))
     try:
         report = (upstream if upstream_direction else downstream)(graph, node, depth)
@@ -343,7 +501,13 @@ def impact(
 @app.command()
 @observed("command.products")
 def products(lineage: Path, log_dir: Path | None = None, log_level: str = "INFO"):
-    """Report product dependency and orchestrator drift."""
+    """Report product dependency and orchestrator drift.
+
+    Args:
+        lineage: Path to a native ``lineage.json`` file.
+        log_dir: Directory to persist run events and metrics in.
+        log_level: Console log level; file logs always retain DEBUG events.
+    """
     graph = LineageGraph(read_native(lineage))
     typer.echo(
         json.dumps(
@@ -385,7 +549,34 @@ def describe(
     log_max_bytes: int = typer.Option(10_000_000, min=1024),
     log_max_files: int = typer.Option(20, min=1),
 ):
-    """Generate descriptions through the selected Agent SDK runner (paid calls)."""
+    """Generate descriptions through the selected Agent SDK runner (paid calls).
+
+    Args:
+        lineage: Path to a native ``lineage.json`` file.
+        catalog: Existing ``catalog.json`` to enrich with descriptions.
+        out: Destination for the enriched catalog.
+        lambda_arn: Lambda function name or ARN for the Bedrock invoke runner.
+        runner: ``lambda-bedrock-invoke``, ``lbi`` (alias), or ``anthropic``.
+        base_url: Anthropic-compatible HTTPS root; SDK appends ``/v1/messages``.
+        api_key: Prefer the environment variable over a command-line secret.
+        extra_headers: JSON object of custom HTTP headers for the Anthropic runner.
+        extra_headers_file: JSON header object file; mutually exclusive with
+            ``extra_headers``.
+        model: SDK model id or registered model slug.
+        region: AWS region for the Bedrock invoke runner.
+        aws_profile: Named AWS profile to use.
+        web_adapter: Use the SDK Lambda Web Adapter envelope.
+        max_tokens: Maximum output tokens per description request.
+        log_dir: Directory to persist run events and metrics in.
+        log_level: Console log level; file logs always retain DEBUG events.
+        log_max_bytes: Maximum size of a single log file before rotation.
+        log_max_files: Maximum number of rotated log files to keep.
+
+    Raises:
+        typer.BadParameter: If the runner configuration is invalid (bad runner/URL/headers
+            combination), or runner initialization fails (missing SDK, missing
+            credentials, or invalid engine construction).
+    """
     doc, existing = read_native(lineage), _json(catalog)
     try:
         options = RunnerConfig(
@@ -425,6 +616,7 @@ def describe(
     )
 
     async def generate():
+        """Construct the configured runner, run the description engine, and close it."""
         selected = configured_runner(options)
         try:
             engine = DescriptionEngine(selected, model=model, max_tokens=max_tokens)

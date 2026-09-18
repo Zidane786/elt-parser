@@ -1,4 +1,22 @@
-"""Opt-in bounded AI proposals. Policy code, never the model, controls acceptance."""
+"""Optional, bounded AI-assisted lineage and description proposals.
+
+Implements the AI lineage modes described in
+``docs/superpowers/specs/2026-09-17-ai-lineage-observability-github-design.md``:
+deterministic lineage remains the default, and AI assistance is off unless a caller
+explicitly sets :attr:`AnalysisConfig.ai_lineage` to ``"fallback"`` or ``"improve"``
+or requests :attr:`AnalysisConfig.descriptions`. The main entry points are
+:func:`analyze`/:func:`analyze_async`, which run the deterministic parser first via
+:func:`etl_parser.pipeline.scan`, then optionally call a configured SDK runner per
+selected source file to propose column/table edges and column descriptions. Every
+AI-proposed edge carries a :class:`~etl_parser.models.Provenance` with
+``parser="agent_sdk_ai"``, the model id, a request id and an evidence digest, so it is
+never confused with a deterministic, exact-confidence edge; proposals are validated
+against the source text and either merged additively into
+:attr:`AnalysisRun.document` or kept separate on :attr:`AnalysisRun.ai_document` for
+comparison, never used to replace or delete existing deterministic lineage. Policy
+code — eligibility, budgets, evidence validation and merge rules — controls what is
+accepted; model output alone never does.
+"""
 
 from __future__ import annotations
 
@@ -34,6 +52,40 @@ from etl_parser.pipeline import scan
 
 
 class AnalysisConfig(RunnerConfig):
+    """Configuration for one :func:`analyze`/:func:`analyze_async` run.
+
+    Extends :class:`~etl_parser.describe.client.RunnerConfig` (provider/runner,
+    endpoint and credential settings) with the policy knobs that decide whether,
+    where and how much AI work a run may do. All AI work is off by default: both
+    ``ai_lineage="off"`` and ``descriptions=False`` skip provider calls entirely.
+
+    Attributes:
+        ai_lineage: AI lineage mode. ``"off"`` never proposes lineage edges.
+            ``"fallback"`` proposes lineage only for files with eligibility reasons
+            (parse failures, non-exact edges, sparse extraction). ``"improve"``
+            requests lineage review for every selected file.
+        descriptions: Whether to request AI-generated column descriptions for
+            catalog columns that are missing one.
+        background_comparison: Whether a description-only call may also request a
+            lineage comparison (never applied to the main graph) as a by-product of
+            a call that descriptions already require. Never schedules an extra call
+            solely to audit lineage.
+        dry_run: When true, record which files would be selected for AI work
+            without making any provider calls.
+        model: Model identifier to request from the configured runner; required for
+            any actual AI call.
+        max_calls: Maximum number of provider calls for this run.
+        max_output_tokens: Maximum output tokens requested per call.
+        max_context_chars: Maximum serialized prompt size in characters; larger
+            prompts are trimmed (dropping lineage context) or the file is skipped.
+        max_total_tokens: Optional cap on cumulative accounted tokens across the run.
+        timeout_seconds: Per-call timeout in seconds.
+        deadline_seconds: Wall-clock budget in seconds for the whole run's AI work.
+        include: Glob patterns selecting source files eligible for AI work.
+        exclude: Glob patterns excluding source files from AI work, applied after
+            ``include``.
+    """
+
     ai_lineage: Literal["off", "fallback", "improve"] = "off"
     descriptions: bool = False
     background_comparison: bool = True  # Only piggybacks on a needed description request.
@@ -50,10 +102,27 @@ class AnalysisConfig(RunnerConfig):
 
 
 class StrictModel(BaseModel):
+    """Base for AI response models that rejects any field not explicitly declared.
+
+    A structurally malformed response (extra fields, wrong types) fails validation as
+    a unit, before any individual proposal is evidence-checked.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
 
 class Evidence(StrictModel):
+    """A source-grounded citation backing one AI-proposed edge or description.
+
+    Attributes:
+        source_file: Path of the source file the evidence was quoted from.
+        source_digest: SHA-256 digest of the source file text at scan time, checked
+            against the current text to catch stale evidence.
+        line_start: First 1-based line of the quoted evidence.
+        line_end: Last 1-based line of the quoted evidence.
+        quote: Exact text quoted from the cited line range.
+    """
+
     source_file: str
     source_digest: str
     line_start: int = Field(ge=1)
@@ -62,6 +131,19 @@ class Evidence(StrictModel):
 
 
 class ColumnProposal(StrictModel):
+    """One AI-proposed column-level lineage edge, prior to evidence validation.
+
+    Attributes:
+        job_id: Identifier of the job the edge belongs to.
+        target: The column the edge produces.
+        sources: Columns the target is directly derived from.
+        indirect_sources: Columns that influence the target without a direct
+            data-flow (e.g. filter/join conditions).
+        expression: The transformation expression, as evidenced in source.
+        kind: The transformation kind; ``"unknown"`` unless the model classifies it.
+        evidence: Source citation supporting this proposal.
+    """
+
     job_id: str
     target: ColumnRef
     sources: list[ColumnRef] = Field(default_factory=list, max_length=100)
@@ -72,6 +154,15 @@ class ColumnProposal(StrictModel):
 
 
 class TableProposal(StrictModel):
+    """One AI-proposed table-level lineage edge, prior to evidence validation.
+
+    Attributes:
+        job_id: Identifier of the job the edge belongs to.
+        source: Source dataset identifier.
+        target: Target dataset identifier.
+        evidence: Source citation supporting this proposal.
+    """
+
     job_id: str
     source: str
     target: str
@@ -79,11 +170,30 @@ class TableProposal(StrictModel):
 
 
 class DescriptionProposal(StrictModel):
+    """One AI-proposed description for a catalog column.
+
+    Attributes:
+        target: The column being described.
+        description: The proposed description text.
+    """
+
     target: ColumnRef
     description: str = Field(min_length=1, max_length=10000)
 
 
 class AnalysisResponse(StrictModel):
+    """The complete, schema-validated structure expected from one SDK call.
+
+    Attributes:
+        version: Response schema version; only ``"1"`` is accepted.
+        columns: Proposed column-level lineage edges.
+        tables: Proposed table-level lineage edges.
+        descriptions: Proposed column descriptions.
+        complete: Whether the model reports it fully analyzed the requested scope;
+            not independently verified, so absence of a proposal is never treated as
+            a proven negative.
+    """
+
     version: Literal["1"] = "1"
     columns: list[ColumnProposal] = Field(default_factory=list, max_length=1000)
     tables: list[TableProposal] = Field(default_factory=list, max_length=1000)
@@ -92,11 +202,59 @@ class AnalysisResponse(StrictModel):
 
 
 class AnalysisPolicyError(RuntimeError):
-    """Only fixed application-owned reason codes, never provider response text."""
+    """Raised by application policy code to reject an AI call or response.
+
+    The message is always a fixed, application-owned reason code (e.g.
+    ``"provider_configuration_missing"``); provider response text is never used as
+    the message, so logged/reported reasons cannot leak provider output.
+    """
 
 
 class AnalysisRun:
+    """Mutable state and result accumulator for one :func:`analyze_async` run.
+
+    Starts as a copy of the deterministic baseline and is updated in place as
+    eligible files are processed: accepted AI proposals are merged into
+    ``document``, all proposals (applied or not) are kept separately on
+    ``ai_document`` for comparison, and every decision/change is recorded for audit.
+
+    Attributes:
+        baseline: Deep copy of the deterministic lineage document, unmodified.
+        document: The lineage document that AI-accepted changes are merged into;
+            starts equal to ``baseline``.
+        index: The scanned source index (:class:`~etl_parser.scanner.repo.ScanIndex`)
+            the run was built from.
+        catalog: The agent catalog derived from ``document``, updated as descriptions
+            and lineage are added.
+        ai_document: Lineage document built only from AI proposals (applied or not),
+            kept separate from ``document`` so AI-only lineage is never confused with
+            merged/deterministic lineage.
+        decisions: Per-file eligibility/skip/completion decisions made during the run.
+        changes: Per-proposal outcomes (accepted/deferred/unchanged/rejected/etc.)
+            with before/after edges.
+        comparison: Deterministic-vs-AI comparison, keyed by file, populated only
+            when a lineage review ran.
+        warnings: Human-readable warning strings for failures encountered.
+        work: The planned eligible-file work items considered for AI processing.
+        status: Overall run status, seeded from whether the baseline has unresolved
+            items and updated as the run proceeds.
+        configuration: Sanitized configuration used for this run.
+        run_id: Identifier of the associated :class:`~etl_parser.observability.RunObserver`
+            run, once known.
+        metrics: Metrics snapshot for this run, once known.
+        artifact_path: Path where run artifacts were written, if any.
+        log_path: Path where run logs were written, if any.
+    """
+
     def __init__(self, baseline, index, catalog):
+        """Initialize run state from a deterministic baseline, index and catalog.
+
+        Args:
+            baseline: Deterministic :class:`~etl_parser.models.LineageDocument`
+                produced by the parser before any AI work.
+            index: The scanned source index the baseline was built from.
+            catalog: The agent catalog derived from ``baseline``.
+        """
         self.baseline = baseline.model_copy(deep=True)
         self.document = baseline.model_copy(deep=True)
         self.index = index
@@ -120,9 +278,15 @@ class AnalysisRun:
         self.log_path = None
 
     def to_dict(self):
-        """JSON-compatible service response; excludes raw source snapshots and secrets.
+        """Build a JSON-compatible service response for this run.
 
-        Lineage expressions and descriptions are still source-sensitive data.
+        Excludes raw source snapshots and secrets, though lineage expressions and
+        descriptions are still source-sensitive data and are included.
+
+        Returns:
+            dict: The run's status, lineage documents, catalog, decisions, changes,
+            comparison, warnings, work plan, configuration, metrics and artifact/log
+            paths.
         """
         return {
             "status": self.status,
@@ -144,6 +308,18 @@ class AnalysisRun:
 
 
 def _edge_key(edge):
+    """Build a hashable identity key for a column edge, ignoring transformation text.
+
+    Used to compare deterministic and AI-proposed edges for agreement regardless of
+    differences in expression wording.
+
+    Args:
+        edge: A :class:`~etl_parser.models.ColumnEdge`.
+
+    Returns:
+        tuple: ``(job_id, target dataset/name, sorted sources, sorted indirect
+        sources)``, suitable for set membership and deduplication.
+    """
     return (
         edge.job_id,
         edge.target.dataset_id,
@@ -154,6 +330,16 @@ def _edge_key(edge):
 
 
 def _catalog_columns(catalog):
+    """Index an agent catalog's columns by ``(dataset_id, field_name)``.
+
+    Args:
+        catalog: An agent catalog dict as produced by
+            :func:`~etl_parser.export.agent_catalog.export_agent_catalog`.
+
+    Returns:
+        dict: Mapping from ``(dataset_id, field_name)`` to that column's schema dict,
+        for tables that have a ``dataset_id``.
+    """
     return {
         (t.get("dataset_id"), c["field_name"]): c
         for d in catalog.get("databases", [])
@@ -164,6 +350,19 @@ def _catalog_columns(catalog):
 
 
 def _inherit(doc, catalog, observer):
+    """Propagate descriptions across exact identity edges to undescribed columns.
+
+    For each undescribed catalog column whose only deterministic lineage is a single
+    exact-confidence identity transformation from one source column, copies that
+    source column's description (marked ``description_source="inherited"``) if it has
+    one. Runs to a bounded fixed point so multi-hop identity chains are resolved, and
+    intentionally never invents text for a cycle with no described seed column.
+
+    Args:
+        doc: Lineage document whose column edges define the identity chains.
+        catalog: Agent catalog dict to update in place with inherited descriptions.
+        observer: Run observer used to count ``descriptions.inherited``.
+    """
     columns = _catalog_columns(catalog)
     grouped = {}
     for edge in doc.column_edges:
@@ -190,6 +389,19 @@ def _inherit(doc, catalog, observer):
 
 
 def _eligible(source, jobs, doc):
+    """Compute the reasons, if any, a source file is eligible for AI fallback review.
+
+    Args:
+        source: The source file being considered.
+        jobs: Deterministic jobs parsed from ``source``.
+        doc: The deterministic lineage document ``jobs`` and its edges belong to.
+
+    Returns:
+        list[str]: Sorted, deduplicated eligibility reason codes (e.g. diagnostic
+        kinds from :class:`~etl_parser.models.Unresolved`, ``"partial_lineage"`` for
+        any non-exact edge, ``"sparse_extraction"`` when jobs have inputs and outputs
+        but no column edges); empty when there is no known problem.
+    """
     ids = {j.id for j in jobs}
     issues = [u for u in doc.unresolved if u.source_file == source.path or u.job_id in ids]
     edges = [e for e in doc.column_edges if e.job_id in ids]
@@ -202,6 +414,20 @@ def _eligible(source, jobs, doc):
 
 
 def _validate_evidence(evidence, source):
+    """Check that an evidence citation matches the current source text.
+
+    Requires the evidence to cite the exact source file at its current digest (so
+    stale evidence from an earlier snapshot is rejected), a valid line range, and a
+    quote that is a verbatim substring of those lines.
+
+    Args:
+        evidence: The :class:`Evidence` citation to check.
+        source: The source file the citation is expected to come from.
+
+    Raises:
+        ValueError: If the file or digest does not match, the line range is invalid,
+            or the quote is not found in the cited lines.
+    """
     if evidence.source_file != source.path or evidence.source_digest != digest(source.text):
         raise ValueError("evidence_snapshot_or_scope_mismatch")
     lines = source.text.splitlines()
@@ -212,6 +438,23 @@ def _validate_evidence(evidence, source):
 
 
 def _validate_dataset(ident, known, source):
+    """Check that a proposed dataset identifier is well-formed and source-grounded.
+
+    Accepts identifiers already known to the file's jobs without further checks.
+    Otherwise requires a syntactically valid dataset URI whose literal table
+    reference (or the identifier itself) appears verbatim in the source text, so the
+    model cannot invent a dataset that has no textual basis in the file.
+
+    Args:
+        ident: The proposed dataset identifier.
+        known: Dataset identifiers already used as inputs/outputs of the file's jobs.
+        source: The source file the identifier must be grounded in when not already
+            known.
+
+    Raises:
+        ValueError: If ``ident`` is not a valid dataset URI, or if it is new and its
+            literal form does not appear in the source text.
+    """
     if not re.fullmatch(r"[a-z][a-z0-9+.-]*://[^\s?#{}]*/[^\s?#{}]+", ident):
         raise ValueError("invalid_or_dynamic_dataset_id")
     if ident in known:
@@ -223,6 +466,29 @@ def _validate_dataset(ident, known, source):
 
 
 def _proposal_edges(response, source, jobs, doc, request_id, model, schema=None):
+    """Validate and convert one AI response's proposals into typed lineage edges.
+
+    Each proposal is validated independently, so one bad proposal is rejected without
+    discarding the rest of a structurally valid response. Accepted proposals get a
+    :class:`~etl_parser.models.Provenance` marking them ``parser="agent_sdk_ai"`` with
+    ``confidence="inferred"``, the model id, request id and an evidence digest.
+
+    Args:
+        response: The validated :class:`AnalysisResponse` from the SDK call.
+        source: The source file the proposals are scoped to.
+        jobs: Deterministic jobs parsed from ``source``.
+        doc: The deterministic lineage document, used for ``scan_commit`` provenance.
+        request_id: Identifier of the SDK request these proposals came from.
+        model: Model identifier used for the request, recorded in provenance.
+        schema: Optional schema provider whose ``columns(dataset_id)`` restricts
+            accepted column names when it returns a known column set.
+
+    Returns:
+        tuple[list[ColumnEdge], list[TableEdge], list[dict]]: Accepted column edges,
+        accepted table edges, and rejection records (with ``status="rejected"``,
+        ``kind``, ``job_id``, ``reason`` and ``request_id``) for proposals that failed
+        validation.
+    """
     ids = {j.id for j in jobs} or {source.job_id}
     known = {ident for j in jobs for ident in j.inputs + j.outputs}
     columns, tables, rejected = [], [], []
@@ -301,7 +567,22 @@ def _proposal_edges(response, source, jobs, doc, request_id, model, schema=None)
 
 
 def _implied_tables(columns, existing):
-    """Table dependencies entailed by column sources, with stable deduplication."""
+    """Derive table-level edges entailed by proposed column sources.
+
+    Each column edge's sources and indirect sources imply a table-level dependency
+    from that source dataset to the column's target dataset. Skips any
+    ``(job_id, source, target)`` already present in ``existing`` and deduplicates
+    stably within this call, reusing each implying column edge's provenance and
+    transformation.
+
+    Args:
+        columns: Column edges (deterministic or AI-proposed) to derive table edges
+            from.
+        existing: Table edges already known, used to avoid duplicate keys.
+
+    Returns:
+        list[TableEdge]: Newly implied table edges not already present in ``existing``.
+    """
     keys = {(edge.job_id, edge.source, edge.target) for edge in existing}
     result = []
     for edge in columns:
@@ -324,6 +605,26 @@ def _implied_tables(columns, existing):
 
 
 def _rebuild(baseline, columns, tables):
+    """Rebuild a full lineage document from a baseline plus additional edges.
+
+    Adds table edges implied by ``columns`` (via :func:`_implied_tables`), merges the
+    new column/table edges into copies of the baseline's jobs (creating jobs for
+    edges that reference a new job id), and reruns
+    :func:`~etl_parser.graph.builder.build_graph` on the combined
+    :class:`~etl_parser.models.WorkerResult` so datasets/graph structure stay
+    consistent. Products are carried over unchanged from ``baseline``. Used both to
+    merge accepted AI proposals into the main document and to build the
+    AI-proposals-only comparison document.
+
+    Args:
+        baseline: The lineage document to extend; its jobs, datasets, schedules,
+            task jobs, unresolved items and products are preserved.
+        columns: Additional column edges to merge in.
+        tables: Additional table edges to merge in.
+
+    Returns:
+        LineageDocument: The rebuilt, sorted lineage document.
+    """
     tables = list(tables) + _implied_tables(columns, baseline.table_edges + tables)
     jobs = {j.id: j.model_copy(deep=True) for j in baseline.jobs}
     for edge in columns:
@@ -363,7 +664,32 @@ def _rebuild(baseline, columns, tables):
 def analyze(
     path, *, config=None, runner=None, prior=None, log_dir=None, log_level="INFO", **scan_options
 ):
-    """Synchronous run; use ``analyze_async`` inside an event loop."""
+    """Run deterministic parsing plus optional AI analysis, synchronously.
+
+    Convenience wrapper around :func:`analyze_async` for callers not already inside
+    an event loop. Use :func:`analyze_async` directly when already running inside
+    one, e.g. in a service handler.
+
+    Args:
+        path: Source to scan, e.g. a local directory path or a
+            :class:`~etl_parser.sources.GitHubSource`.
+        config: An :class:`AnalysisConfig`, a mapping of its fields, or ``None`` for
+            defaults (AI work off).
+        runner: An already-configured SDK runner to use instead of building one from
+            ``config``; the caller owns its lifecycle when supplied.
+        prior: Optional prior agent catalog used to seed descriptions/state.
+        log_dir: Directory to persist run logs under; console-only when ``None``.
+        log_level: Minimum console/log level for the run.
+        **scan_options: Additional keyword arguments forwarded to
+            :func:`etl_parser.pipeline.scan`.
+
+    Returns:
+        AnalysisRun: The completed analysis run.
+
+    Raises:
+        RuntimeError: If called while an asyncio event loop is already running; await
+            :func:`analyze_async` instead in that case.
+    """
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -393,6 +719,64 @@ async def analyze_async(
     observer=None,
     **scan_options,
 ):
+    """Run deterministic parsing, then optional bounded AI lineage/description work.
+
+    Scans ``path`` off the event loop, builds the deterministic baseline via
+    :func:`etl_parser.pipeline.scan`, and returns immediately if both
+    ``config.ai_lineage == "off"`` and ``config.descriptions`` are false. Otherwise
+    iterates source files in scan order and, for each file with eligible work,
+    applies a chain of policy checks (include/exclude scope, dry-run, provider
+    availability, call count, wall-clock deadline, prompt size, token budget) before
+    issuing at most one SDK completion request per file. Successful responses are
+    schema-validated as a unit (:class:`AnalysisResponse`), then each individual
+    proposal is evidence-checked against the current source text
+    (:func:`_validate_evidence`, :func:`_validate_dataset`) before being merged:
+    accepted column/table edges are folded into ``result.document`` (never
+    overwriting an existing exact-confidence edge), while every proposal, accepted or
+    not, also accumulates in ``result.ai_document`` for side-by-side comparison. Each
+    file's changes are applied transactionally — any exception during processing
+    rolls back that file's applied edges/descriptions and records a failure decision
+    rather than leaving partial state. A provider error that looks like an
+    authentication, not-found or rate-limit failure stops further calls for the rest
+    of the run (recorded, not retried). All decisions, changes, comparisons, metrics
+    and warnings are recorded on the returned :class:`AnalysisRun` and via the active
+    :class:`~etl_parser.observability.RunObserver`.
+
+    Args:
+        path: Source to scan, e.g. a local directory path or a
+            :class:`~etl_parser.sources.GitHubSource`.
+        config: An :class:`AnalysisConfig`, a mapping of its fields, or ``None`` for
+            defaults (AI work off).
+        runner: An already-configured SDK runner to use instead of building one from
+            ``config`` via :func:`~etl_parser.describe.client.configured_runner`; when
+            supplied, the caller owns closing it and this function will not.
+        prior: Optional prior agent catalog used to seed descriptions/state.
+        log_dir: Directory to persist run logs under; console-only when ``None``.
+            Only used when this call creates its own observer.
+        log_level: Minimum console/log level for the run. Only used when this call
+            creates its own observer.
+        observer: An existing :class:`~etl_parser.observability.RunObserver` to join
+            instead of creating one; typically supplied by the :func:`observed`
+            decorator from context rather than directly by callers.
+        **scan_options: Additional keyword arguments forwarded to
+            :func:`etl_parser.pipeline.scan`, e.g. a ``schema`` provider used to
+            restrict accepted AI-proposed column names.
+
+    Returns:
+        AnalysisRun: The completed run, with ``document`` holding deterministic
+        lineage plus any accepted AI changes, ``ai_document`` holding all AI
+        proposals for comparison, and ``status`` reflecting the observer's final
+        run status.
+
+    Raises:
+        pydantic.ValidationError: If ``config`` does not satisfy
+            :class:`AnalysisConfig`.
+        Exception: Propagates whatever :func:`etl_parser.pipeline.scan` raises for an
+            unreadable or invalid source.
+        BaseException: A cancellation (or other exception not caught by the
+            per-file ``except Exception`` handling) raised while a file is being
+            processed propagates after that file's partial changes are rolled back.
+    """
     config = AnalysisConfig.model_validate(config or {})
     observer = current_observer()
     if config.api_key:

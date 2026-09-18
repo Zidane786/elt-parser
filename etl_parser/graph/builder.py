@@ -1,4 +1,14 @@
-"""Merge parser results and derive data and orchestrator dependencies."""
+"""Merge parser results and derive data and orchestrator dependencies (spec section 9).
+
+Implements the graph builder: merges every worker's
+:class:`~etl_parser.models.WorkerResult`, applies dataset identity rules (unifying aliases
+via :class:`~etl_parser.identity.DatasetRegistry`), attaches product/layer ownership from
+the :class:`~etl_parser.registry.ProductRegistry`, derives job dependencies from both data
+flow and orchestrator-declared task order, and detects task-graph cycles. The result is a
+:class:`LineageGraph` wrapping a ``networkx.MultiDiGraph`` of datasets, columns, and jobs,
+consumed by the exporters, :mod:`etl_parser.graph.impact`, and
+:mod:`etl_parser.graph.products`.
+"""
 
 from collections import defaultdict
 
@@ -10,7 +20,28 @@ from etl_parser.registry import ProductRegistry
 
 
 class LineageGraph:
+    """A lineage document plus the ``networkx.MultiDiGraph`` built from it.
+
+    Nodes are dataset ids and ``"{dataset_id}#{column}"`` column ids; edges are ``table``
+    (dataset to dataset, tagged with the producing ``job``) and ``column`` (column to
+    column, also tagged with ``job``). Used by :mod:`etl_parser.graph.impact` and
+    :mod:`etl_parser.graph.products` for graph traversal, and by the CLI/exporters via
+    :meth:`to_document`.
+
+    Attributes:
+        document: The sorted :class:`~etl_parser.models.LineageDocument` this graph was
+            built from.
+        graph: The ``networkx.MultiDiGraph`` of datasets, columns, and their edges.
+    """
+
     def __init__(self, document: LineageDocument):
+        """Build the traversal graph from an already-assembled lineage document.
+
+        Args:
+            document: The lineage document to wrap. Stored sorted (see
+                :meth:`~etl_parser.models.LineageDocument.sorted`); the input is not
+                mutated.
+        """
         self.document = document.sorted()
         self.graph = nx.MultiDiGraph()
         for dataset in document.datasets:
@@ -26,9 +57,20 @@ class LineageGraph:
                 self.graph.add_edge(source, target, kind="column", job=edge.job_id)
 
     def to_document(self):
+        """Return a freshly sorted copy of the underlying lineage document.
+
+        Returns:
+            LineageDocument: A sorted copy, suitable for deterministic serialization.
+        """
         return self.document.sorted()
 
     def job_dependencies(self):
+        """Return each job's resolved upstream dependencies.
+
+        Returns:
+            dict[str, list[JobDependency]]: Job id to its list of upstream dependencies,
+            as stored on the underlying document.
+        """
         return self.document.job_dependencies
 
 
@@ -37,6 +79,27 @@ def build_graph(
     registry: ProductRegistry | None = None,
     scan_commit: str | None = None,
 ) -> LineageGraph:
+    """Merge worker results into one identity-resolved, dependency-derived lineage graph.
+
+    Steps (spec section 9): merge every result; resolve dataset aliases through a
+    :class:`~etl_parser.identity.DatasetRegistry`, flagging conflicting aliases as
+    unresolved; stamp ``scan_commit`` onto edges that lack one; merge duplicate jobs;
+    attach product/layer ownership and product-declared schedules from ``registry``; derive
+    ``data`` job dependencies (an output of job A read by job B, where A is not an in-place
+    writer of that dataset) and ``dag`` job dependencies (from declared task order,
+    including cross-DAG references); detect task-graph cycles; and deduplicate edges.
+
+    Args:
+        results: The :class:`~etl_parser.models.WorkerResult` from every parser invocation,
+            plus any pre-seeded unresolved items (e.g. from source indexing).
+        registry: Product registry to attach ownership and schedules from. If omitted, no
+            product/layer attachment is performed and the document's ``products`` is empty.
+        scan_commit: Commit to stamp onto edges and the resulting document.
+
+    Returns:
+        LineageGraph: The built graph, wrapping a fully assembled, deduplicated
+        :class:`~etl_parser.models.LineageDocument`.
+    """
     combined = WorkerResult()
     for result in results:
         combined.extend(result.model_copy(deep=True))
@@ -119,6 +182,14 @@ def build_graph(
     dependencies: dict[str, dict[str, JobDependency]] = {job: {} for job in jobs}
 
     def add(job, upstream, evidence, dataset=None):
+        """Record that ``job`` depends on ``upstream``, merging evidence if already known.
+
+        Args:
+            job: Id of the dependent job.
+            upstream: Id of the job it depends on.
+            evidence: ``"data"`` or ``"dag"``, the dependency source being added.
+            dataset: Dataset id that links the two jobs, for data evidence.
+        """
         if job == upstream or job not in jobs or upstream not in jobs:
             return
         dep = dependencies[job].setdefault(upstream, JobDependency(job_id=upstream))
@@ -137,6 +208,21 @@ def build_graph(
     task_graph = nx.DiGraph()
 
     def external_refs(reference, downstream, schedule):
+        """Resolve an ``external-dag://`` cross-DAG reference to matching schedule ids.
+
+        Plain (non-``external-dag://``) references pass through unchanged. Ambiguous or
+        unmatched external references are recorded as an ``external_job`` unresolved item
+        and resolve to no ids.
+
+        Args:
+            reference: A schedule id or an ``external-dag://<dag_id>/<task_id>`` reference.
+            downstream: True when resolving a declared downstream edge, which targets the
+                DAG root when no task id is given; False targets the DAG's tasks.
+            schedule: The schedule that declared the reference, used for diagnostics.
+
+        Returns:
+            list[str]: Matching schedule ids, possibly empty.
+        """
         if not reference.startswith("external-dag://"):
             return [reference]
         dag_id, _, task_id = reference.removeprefix("external-dag://").partition("/")
@@ -212,6 +298,14 @@ def build_graph(
 
     # Stable deduplication includes full edge metadata, preserving distinct transformations.
     def unique(items):
+        """Deduplicate model instances by their full JSON representation, preserving order.
+
+        Args:
+            items: Pydantic model instances (edges or unresolved items).
+
+        Returns:
+            list: The first occurrence of each distinct instance, in input order.
+        """
         return list({item.model_dump_json(): item for item in items}.values())
 
     document = LineageDocument(

@@ -1,4 +1,12 @@
-"""Optional topological description enrichment, preserving existing descriptions."""
+"""Optional topological description enrichment, preserving existing descriptions.
+
+Implements the ``DescriptionEngine`` from spec section 11: orders tables so upstream
+descriptions exist before downstream prompts are built, skips columns that already have a
+description or only inherit one through an identity edge, and writes AI-generated
+descriptions with ``description_source: ai``. No LLM is used to infer lineage; deterministic
+parts (ordering, skip policy, evidence assembly) live here, the LLM call is delegated to a
+caller/CLI-selected runner (see ``etl_parser.describe.client``).
+"""
 
 import asyncio
 import copy
@@ -16,7 +24,28 @@ if TYPE_CHECKING:
 
 
 class DescriptionEngine:
+    """Grounded column description generation over a lineage document and catalog.
+
+    Attributes:
+        runner: The caller-selected Agent SDK LLM runner; only its ``complete`` API is
+            used, so any conforming ``LLMRunnerProtocol`` implementation works.
+        model: Explicit SDK model id or registered model slug to request.
+        max_tokens: Maximum output tokens per description request.
+        warnings: Human-readable notes about columns skipped or rejected during the most
+            recent :meth:`run`/:meth:`arun` call.
+    """
+
     def __init__(self, runner: "LLMRunnerProtocol", *, model: str, max_tokens: int = 16000):
+        """Create an engine bound to a runner and model.
+
+        Args:
+            runner: The Agent SDK LLM runner to call for each description.
+            model: Explicit SDK model id or registered model slug; must be non-blank.
+            max_tokens: Maximum output tokens per description request; must be positive.
+
+        Raises:
+            ValueError: If ``model`` is blank or ``max_tokens`` is not positive.
+        """
         if not model.strip():
             raise ValueError("An explicit SDK model ID or registered model slug is required")
         if max_tokens < 1:
@@ -27,7 +56,22 @@ class DescriptionEngine:
         self.warnings = []
 
     def run(self, doc, catalog, *, log_dir=None, log_level="INFO", observer=None):
-        """Synchronous entry point. Async applications should await ``arun``."""
+        """Synchronous entry point. Async applications should await ``arun``.
+
+        Args:
+            doc: The :class:`~etl_parser.models.LineageDocument` to draw column edges from.
+            catalog: The agent catalog dict to enrich with descriptions.
+            log_dir: Directory to persist run events and metrics in, when ``observer`` is
+                not supplied.
+            log_level: Console log level, when ``observer`` is not supplied.
+            observer: Explicit observer to use instead of creating one.
+
+        Returns:
+            dict: The enriched catalog, as returned by :meth:`arun`.
+
+        Raises:
+            RuntimeError: If called from within a running event loop.
+        """
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -38,6 +82,35 @@ class DescriptionEngine:
 
     @observed("descriptions")
     async def arun(self, doc, catalog, *, log_dir=None, log_level="INFO", observer=None):
+        """Walk column edges in topological order and fill in missing descriptions.
+
+        For each target column with an existing description or no lineage edges, the
+        column is skipped. A single-source identity edge with exact confidence inherits
+        the upstream description instead of calling the LLM. Any edge set with
+        non-``exact`` confidence is skipped with a warning. Otherwise a grounded prompt is
+        built and sent to ``self.runner``; a response missing a non-empty ``description``
+        string, requesting tool use, or with a non-terminal stop reason is rejected (with a
+        warning) rather than written. Every failure and skip is recorded as an
+        observability event; nothing here ever raises to abort the walk.
+
+        Args:
+            doc: The :class:`~etl_parser.models.LineageDocument` to draw column edges from.
+            catalog: The agent catalog dict to enrich with descriptions. Not mutated; a
+                deep copy is enriched and returned.
+            log_dir: Unused directly; present for signature parity with :meth:`run`.
+            log_level: Unused directly; present for signature parity with :meth:`run`.
+            observer: Unused; the active observer is always looked up via
+                :func:`~etl_parser.observability.current_observer`.
+
+        Returns:
+            dict: A deep copy of ``catalog`` with ``description`` and
+            ``description_source`` (``"inherited"`` or ``"ai"``) filled in on the columns
+            this call resolved. ``self.warnings`` is reset and populated with one entry per
+            skipped or rejected column.
+
+        Raises:
+            ImportError: If ``agent_sdk`` is not installed.
+        """
         from agent_sdk.types import Message
 
         observer = current_observer()

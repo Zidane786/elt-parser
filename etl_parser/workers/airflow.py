@@ -1,4 +1,19 @@
-"""Airflow schedules and task order from AST; DAG modules are never imported."""
+"""Airflow schedules and task order from AST; DAG modules are never imported.
+
+Implements design section 8.4. A DAG file is parsed statically with ``ast``: ``DAG(...)``
+constructor calls and ``@dag``-decorated functions become ``Schedule`` entries (one per
+task plus one for the DAG itself), operator instantiations become tasks mapped to jobs
+(delegating SQL operators to ``SqlWorker`` and Python callables to ``PythonWorker``), and
+``>>``/``<<``/``chain``/``set_upstream``/``set_downstream``/``TriggerDagRunOperator``/
+``ExternalTaskSensor`` usage becomes each schedule's ``declared_upstream``/
+``declared_downstream``. String and constant values (``dag_id``, cron text, operator
+arguments, ...) are resolved through ``etl_parser.scanner.strings.fold_string`` rather than
+by executing the module, so anything data-dependent becomes an ``Unresolved`` item instead
+of a guess.
+
+Entry points: ``AirflowWorker.analyze_source`` (a parsed ``SourceFile``) and
+``AirflowWorker.analyze_file`` (a path, wraps it in a ``SourceFile``).
+"""
 
 from __future__ import annotations
 
@@ -14,12 +29,54 @@ from etl_parser.workers.sql import SqlWorker
 
 
 class AirflowWorker:
+    """Parses Airflow DAG modules statically into ``Schedule``, task, and job edges.
+
+    Attributes:
+        index: ``ScanIndex`` used to resolve script paths (``BashOperator``/
+            ``SparkSubmitOperator``) and imported callables (``PythonOperator``) to the
+            ``SourceFile`` that defines their job.
+        sql: ``SqlWorker`` used to analyze SQL operator queries (``AthenaOperator``,
+            ``PostgresOperator``, ``TrinoOperator``, ``SQLExecuteQueryOperator``).
+        bindings: Caller-supplied values folded into every string resolution, for example
+            ``connection:<conn_id>`` dialect hints used by ``SQLExecuteQueryOperator``.
+    """
+
     def __init__(self, index, sql_worker=None, *, bindings=None):
+        """Create a worker for one repo scan.
+
+        Args:
+            index: ``ScanIndex`` for resolving scripts and Python imports.
+            sql_worker: ``SqlWorker`` to reuse for SQL operators, or ``None`` to create a
+                fresh one with no schema provider.
+            bindings: Extra name/value bindings folded alongside module-level constants,
+                such as ``connection:<conn_id>`` dialect hints.
+        """
         self.index = index
         self.sql = sql_worker or SqlWorker()
         self.bindings = bindings or {}
 
     def analyze_source(self, source):
+        """Parse one DAG module's AST into schedules, tasks, jobs, and task dependencies.
+
+        The module is never imported or executed. Module-level assignments are folded into
+        an environment (``env``) up front so ``DAG(...)``/operator arguments referencing
+        them resolve; a nested ``visit`` walks the module body tracking the enclosing
+        ``with DAG(...):`` block or ``@dag``-decorated function to build each ``Schedule``
+        and task; a second pass over every node connects tasks via ``>>``/``<<``/
+        ``chain``/``cross_downstream``/``set_upstream``/``set_downstream`` and TaskFlow
+        (``@task``) call arguments.
+
+        Args:
+            source: The DAG file as a ``SourceFile`` (path, text, and derived job id).
+
+        Returns:
+            A ``WorkerResult`` whose ``schedules`` holds one entry per task plus one for
+            each DAG, ``task_jobs`` maps each schedule id to its resolved job id (or
+            ``None``), and ``jobs``/``column_edges``/``table_edges``/``unresolved`` include
+            everything produced by any SQL or Python job a task resolved to. When the file
+            fails to parse, the result holds a single ``unsupported_syntax`` item and
+            nothing else.
+        """
         result = WorkerResult()
         try:
             tree = ast.parse(source.text)
@@ -50,16 +107,42 @@ class AirflowWorker:
                     aliases[alias.asname or alias.name] = alias.name
 
         def name(node):
+            """Return an unqualified, alias-resolved name for a call target or reference.
+
+            Args:
+                node: The AST expression to name, typically a ``Call.func``.
+
+            Returns:
+                The last dotted segment of ``node`` (e.g. ``"DAG"`` for ``airflow.DAG``),
+                resolved through ``aliases`` when it was imported under another name.
+            """
             text = ast.unparse(node).split(".")[-1]
             return aliases.get(text, text)
 
         def value(node):
+            """Fold ``node`` to a plain string only when fully and unambiguously resolved.
+
+            Args:
+                node: The AST expression to fold, or ``None``.
+
+            Returns:
+                The folded text, or ``None`` when ``node`` is ``None`` or the fold is
+                incomplete or relies on an assumed (defaulted) value.
+            """
             if node is None:
                 return None
             folded = fold_string(node, env)
             return folded.text if folded.complete and not folded.assumptions else None
 
         def issue(node, reason, kind="dynamic_schedule"):
+            """Record an ``Unresolved`` item pointing at ``node``.
+
+            Args:
+                node: AST node the issue is about, used for its line number and unparsed
+                    expression text.
+                reason: Human-readable explanation of what could not be resolved.
+                kind: ``Unresolved.kind`` to record.
+            """
             result.unresolved.append(
                 Unresolved(
                     kind=kind,
@@ -71,6 +154,24 @@ class AirflowWorker:
             )
 
         def dag_schedule(call, fallback):
+            """Build and register the ``Schedule`` for a ``DAG(...)`` call or ``@dag`` decorator.
+
+            Reads ``dag_id``, ``schedule``/``schedule_interval`` (normalised to cron via
+            ``normalize_cron``, with an unresolvable non-``timedelta`` value raising a
+            ``dynamic_schedule`` issue), ``catchup``, ``tags``, ``start_date`` (and its
+            timezone keyword when given as a call), and ``default_args["owner"]``
+            (resolving a ``default_args`` variable back to its module-level assignment when
+            needed).
+
+            Args:
+                call: The ``DAG(...)`` call node (constructed synthetically for a bare
+                    ``@dag`` decorator with no call arguments).
+                fallback: ``dag_id`` to use when it cannot be resolved from ``call``.
+
+            Returns:
+                The new ``Schedule``, already stored in ``result.schedules`` under its id
+                ``f"airflow.{source.job_id}.{dag_id}"``.
+            """
             kw = {k.arg: k.value for k in call.keywords if k.arg}
             dag_id = value(kw.get("dag_id") or (call.args[0] if call.args else None)) or fallback
             interval = kw.get("schedule", kw.get("schedule_interval"))
@@ -129,6 +230,32 @@ class AirflowWorker:
             return schedule
 
         def task(call, dag, variable=None, function=None):
+            """Register one task's ``Schedule`` and resolve its operator to a job.
+
+            Copies ``dag``'s schedule to a task-scoped id ``f"{dag.id}.{task_id}"``, then
+            maps the operator per design section 8.4 step 2: ``BashOperator``/
+            ``SparkSubmitOperator`` resolve their script path through ``self.index.script``;
+            ``PythonOperator``/``PythonVirtualenvOperator``/a ``@task``-decorated callable
+            resolve their callable (following an import when needed) and delegate to
+            ``PythonWorker``; ``AthenaOperator``/``PostgresOperator``/``TrinoOperator``/
+            ``SQLExecuteQueryOperator`` delegate their SQL to ``self.sql``;
+            ``ExternalTaskSensor``/``TriggerDagRunOperator`` record cross-DAG
+            ``declared_upstream``/``declared_downstream``; ``GlueJobOperator``/
+            ``EmrAddStepsOperator`` and anything unresolvable become an ``Unresolved`` item
+            with no job. Registers the task id in ``symbols`` when assigned to a variable,
+            so later ``>>``/``chain()`` expressions can reference it.
+
+            Args:
+                call: The operator instantiation call node.
+                dag: The enclosing DAG's ``Schedule``, copied to build the task's schedule.
+                variable: Name the call's result was assigned to, if any.
+                function: Name of the ``@task``-decorated function being called, when this
+                    task comes from a TaskFlow call rather than an ``Operator(...)`` call.
+
+            Returns:
+                The task's schedule id, or ``None`` when ``task_id`` could not be resolved
+                (an ``Unresolved`` item is recorded and no schedule is created).
+            """
             kw = {k.arg: k.value for k in call.keywords if k.arg}
             task_id = value(kw.get("task_id")) or function or variable
             if not task_id:
@@ -274,6 +401,20 @@ class AirflowWorker:
             return ident
 
         def visit(body, dag=None):
+            """Walk a block of statements, tracking the enclosing DAG to find tasks.
+
+            Recurses into ``with DAG(...):`` blocks and ``@dag``-decorated function bodies
+            (registering their line range in ``dag_ranges`` so later dependency edges can
+            be attributed to the right DAG), records ``@task``-decorated functions in
+            ``decorated`` without visiting them as tasks directly, and calls ``task`` for
+            each recognised operator/sensor instantiation (as an assignment or a bare
+            expression statement) found inside a DAG. Also recurses into ``if`` blocks.
+
+            Args:
+                body: A list of AST statements to walk (a module, function, or ``with``/
+                    ``if`` body).
+                dag: The enclosing DAG's ``Schedule``, or ``None`` outside any DAG.
+            """
             for node in body:
                 if isinstance(node, ast.With):
                     nested = dag
@@ -328,6 +469,18 @@ class AirflowWorker:
         visit(tree.body)
 
         def refs(node):
+            """Resolve a dependency-operator operand to the task schedule ids it names.
+
+            Args:
+                node: The left- or right-hand operand of ``>>``/``<<``, or an element of a
+                    ``chain()``/``set_upstream``/``set_downstream`` argument.
+
+            Returns:
+                Schedule ids ``node`` refers to: a variable's tasks (looked up in
+                ``symbols`` under the current DAG), each element's refs for a list/tuple, or
+                the right operand's refs for a chained ``BinOp`` (e.g. ``a >> b >> c``).
+                Empty when ``node`` names nothing resolvable.
+            """
             if isinstance(node, ast.Name):
                 return symbols.get((current_dag, node.id), [])
             if isinstance(node, (ast.List, ast.Tuple)):
@@ -337,6 +490,12 @@ class AirflowWorker:
             return []
 
         def connect(left, right):
+            """Record every task in ``left`` as upstream of every task in ``right``.
+
+            Args:
+                left: Upstream task schedule ids.
+                right: Downstream task schedule ids.
+            """
             for a in left:
                 for b in right:
                     result.schedules[b].declared_upstream = sorted(
@@ -382,6 +541,18 @@ class AirflowWorker:
         return result
 
     def analyze_file(self, path):
+        """Analyze a DAG file given as a filesystem path.
+
+        Args:
+            path: Path to the ``.py`` DAG file, expected to lie under ``self.index.root``.
+
+        Returns:
+            The ``WorkerResult`` from ``analyze_source`` for this file's contents.
+
+        Raises:
+            ValueError: If ``path`` does not lie under ``self.index.root`` (from
+                ``Path.relative_to``).
+        """
         from etl_parser.scanner.repo import SourceFile
 
         return self.analyze_source(

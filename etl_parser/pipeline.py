@@ -1,4 +1,13 @@
-"""Public scan API and explicit parser/orchestrator extension registry."""
+"""Deterministic scan pipeline: source indexing, parser dispatch, and graph assembly.
+
+Implements the top half of the architecture in spec section 4: it indexes a repository or
+GitHub URL into a :class:`~etl_parser.scanner.repo.ScanIndex`, routes each file to the
+matching :class:`ParserPlugin` (SQL, Python/pandas/PySpark, or Airflow), collects the
+:class:`~etl_parser.models.WorkerResult` each parser returns, and hands the combined
+results to :func:`etl_parser.graph.builder.build_graph`. No LLM is used anywhere in this
+path (spec section 2, goal 1). The public entry point is :func:`scan`; see
+``docs/superpowers/specs/2026-09-15-etl-parser-design.md`` sections 4, 5, and 12.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +31,19 @@ from etl_parser.workers.sql import SchemaProvider, SqlWorker, _sql_description
 
 @dataclass
 class ScanContext:
+    """Per-scan configuration shared by every :class:`ParserPlugin` invocation.
+
+    Attributes:
+        index: The indexed source tree (files and module graph) being scanned.
+        schema: Optional schema provider used by :class:`~etl_parser.workers.sql.SqlWorker`
+            to qualify columns and expand stars.
+        bindings: String substitutions applied to ``{{name}}``/``${name}`` placeholders in
+            SQL text before parsing.
+        default_db: Database to assume for one-part table names.
+        sql_engine: Default execution engine for standalone ``.sql`` files.
+        sql_dialect: Default sqlglot dialect for standalone ``.sql`` files.
+    """
+
     index: ScanIndex
     schema: SchemaProvider | None = None
     bindings: dict[str, str] = field(default_factory=dict)
@@ -31,23 +53,70 @@ class ScanContext:
 
 
 class ParserPlugin(Protocol):
-    """Plugins return the same WorkerResult; graph/export code needs no parser branches."""
+    """Interface a language/orchestrator parser must implement to plug into the pipeline.
+
+    Plugins return the same :class:`~etl_parser.models.WorkerResult`; graph and export code
+    needs no parser-specific branches.
+
+    Attributes:
+        name: Unique parser name, used for registration and observability tags.
+        extensions: File suffixes this parser might handle; used to widen the set of files
+            the scan indexes.
+    """
 
     name: str
     extensions: set[str]
 
-    def accepts(self, source: SourceFile) -> bool: ...
-    def analyze(self, source: SourceFile, context: ScanContext) -> WorkerResult: ...
+    def accepts(self, source: SourceFile) -> bool:
+        """Return whether this parser should analyze ``source``.
+
+        Args:
+            source: The indexed file being routed.
+
+        Returns:
+            bool: True if this parser claims the file.
+        """
+        ...
+
+    def analyze(self, source: SourceFile, context: ScanContext) -> WorkerResult:
+        """Analyze ``source`` and return its lineage findings.
+
+        Args:
+            source: The indexed file to analyze.
+            context: Shared scan context (index, schema, bindings, SQL defaults).
+
+        Returns:
+            WorkerResult: Datasets, jobs, edges and unresolved items for the file.
+        """
+        ...
 
 
 class SqlParser:
+    """Parses standalone ``.sql`` files with :class:`~etl_parser.workers.sql.SqlWorker`."""
+
     name = "sql"
     extensions = {".sql"}
 
     def accepts(self, source):
+        """Return True for any file with a ``.sql`` suffix.
+
+        Args:
+            source: The indexed file being routed.
+        """
         return source.suffix == ".sql"
 
     def analyze(self, source, context):
+        """Substitute bindings, run :class:`~etl_parser.workers.sql.SqlWorker`, and build
+        the file's :class:`~etl_parser.models.Job` (including a comment-declared schedule,
+        if present).
+
+        Args:
+            source: The ``.sql`` file to analyze.
+            context: Shared scan configuration (schema provider, bindings, engine/dialect).
+
+        Returns:
+            WorkerResult: The SQL worker's findings plus this file's job appended.
+        """
         worker = SqlWorker(context.schema)
         sql = re.sub(
             r"\{\{\s*([A-Za-z_]\w*)\s*\}\}|\$\{([A-Za-z_]\w*)\}",
@@ -84,13 +153,29 @@ class SqlParser:
 
 
 class PythonParser:
+    """Parses non-Airflow ``.py`` files with :class:`~etl_parser.workers.python.PythonWorker`."""
+
     name = "python_frames"
     extensions = {".py"}
 
     def accepts(self, source):
+        """Return True for ``.py`` files that do not import ``airflow``.
+
+        Args:
+            source: The indexed file being routed.
+        """
         return source.suffix == ".py" and not imports_airflow(source)
 
     def analyze(self, source, context):
+        """Run :class:`~etl_parser.workers.python.PythonWorker` over the file.
+
+        Args:
+            source: The ``.py`` file to analyze.
+            context: Shared scan configuration (schema provider, bindings, module index).
+
+        Returns:
+            WorkerResult: The Python worker's findings for this file.
+        """
         return PythonWorker(
             SqlWorker(context.schema),
             context.index,
@@ -100,25 +185,65 @@ class PythonParser:
 
 
 class AirflowParser:
+    """Parses ``.py`` files that import ``airflow`` with
+    :class:`~etl_parser.workers.airflow.AirflowWorker`.
+    """
+
     name = "airflow"
     extensions = {".py"}
 
     def accepts(self, source):
+        """Return True for ``.py`` files that import ``airflow``.
+
+        Args:
+            source: The indexed file being routed.
+        """
         return source.suffix == ".py" and imports_airflow(source)
 
     def analyze(self, source, context):
+        """Run :class:`~etl_parser.workers.airflow.AirflowWorker` over the DAG file.
+
+        Args:
+            source: The ``.py`` DAG file to analyze.
+            context: Shared scan configuration (schema provider, bindings, module index).
+
+        Returns:
+            WorkerResult: The Airflow worker's findings (schedules, tasks, task jobs) for
+            this file.
+        """
         return AirflowWorker(
             context.index, SqlWorker(context.schema), bindings=context.bindings
         ).analyze_source(source)
 
 
 class ParserRegistry:
+    """The ordered set of :class:`ParserPlugin` instances a scan will try, in order.
+
+    Defaults to SQL, then non-Airflow Python, then Airflow. Callers extend it with
+    trusted, explicitly named plugins (CLI ``--plugin module:factory``) to add support for
+    other languages or orchestrators without modifying this package.
+    """
+
     def __init__(self, parsers=None):
+        """Create a registry.
+
+        Args:
+            parsers: Explicit list of parsers to use, replacing the default set. If
+                ``None``, defaults to ``[SqlParser(), PythonParser(), AirflowParser()]``.
+        """
         self.parsers = (
             list(parsers) if parsers is not None else [SqlParser(), PythonParser(), AirflowParser()]
         )
 
     def register(self, parser: ParserPlugin):
+        """Add a parser to the registry.
+
+        Args:
+            parser: The parser plugin to add.
+
+        Raises:
+            ValueError: If a parser with the same ``name`` is already registered.
+        """
         if any(p.name == parser.name for p in self.parsers):
             raise ValueError(f"Parser already registered: {parser.name}")
         self.parsers.append(parser)
@@ -145,6 +270,47 @@ def scan(
     ref: str | None = None,
     source_path: str | None = None,
 ):
+    """Scan a repository or GitHub URL and build its deterministic lineage graph.
+
+    Indexes the source (locally or, for an ``https://`` URL, via the GitHub API without
+    cloning), runs every matching :class:`ParserPlugin` over each file, merges the results,
+    and builds the :class:`~etl_parser.graph.builder.LineageGraph`. No LLM is used anywhere
+    in this path.
+
+    Args:
+        path: Local filesystem path, or an ``https://`` GitHub repository URL.
+        schema: Optional schema provider for qualifying SQL and expanding stars.
+        bindings: String substitutions for ``{{name}}``/``${name}`` SQL placeholders.
+        default_db: Database to assume for one-part table names.
+        products: Path to a ``product.yaml`` file or directory of them. If omitted,
+            ``product.yaml`` files found while scanning are loaded automatically.
+        parsers: Parser registry to use; defaults to a new :class:`ParserRegistry`.
+        sql_engine: Default execution engine for standalone ``.sql`` files.
+        sql_dialect: Default sqlglot dialect for standalone ``.sql`` files; derived from
+            ``sql_engine`` when omitted.
+        scan_commit: Commit identifier to stamp on the result; defaults to the source
+            provider's detected revision.
+        log_dir: Directory to persist run events and metrics in.
+        log_level: Console log level; the log file always retains DEBUG events.
+        log_max_bytes: Maximum size of a single log file before rotation.
+        log_max_files: Maximum number of rotated log files to keep.
+        observer: Unused; the active observer is always looked up via
+            :func:`~etl_parser.observability.current_observer`.
+        source_provider: Explicit source provider; defaults to
+            :class:`~etl_parser.sources.GitHubSource` for ``https://`` paths or
+            :class:`~etl_parser.sources.LocalSource` otherwise.
+        ref: GitHub branch, tag, or commit to pin. Only valid with a GitHub URL.
+        source_path: Subpath within the GitHub repository to scan. Only valid with a
+            GitHub URL.
+
+    Returns:
+        graph.builder.LineageGraph: The built lineage graph, with ``source_index`` set to
+        the indexed source tree.
+
+    Raises:
+        ValueError: If ``ref`` or ``source_path`` is given for a non-GitHub, non-explicit
+            ``path`` (they apply only to GitHub URLs).
+    """
     observer = current_observer()
     parsers = parsers or ParserRegistry()
     observer.configure(
