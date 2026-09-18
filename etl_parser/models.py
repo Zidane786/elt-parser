@@ -32,6 +32,7 @@ UnresolvedKind = Literal[
     "external_job",
     "analysis_note",
     "skipped_entry",
+    "missing_in_source",
 ]
 Origin = Literal["parser", "ai", "runtime", "prior", "registry"]
 Orchestrator = Literal["airflow", "product_yaml", "cron_comment"]
@@ -186,6 +187,22 @@ class TableEdge(_Model):
     source_file: str | None = None
     line: int | None = None
     transformation: Transformation = Field(default_factory=Transformation)
+
+
+class JoinCondition(_Model):
+    """An equality join between two physical columns observed in a job (for inferred relations).
+
+    Attributes:
+        left: One side of the ``ON`` equality, resolved to a physical column.
+        right: The other side, resolved to a physical column.
+        job_id: Job whose SQL or DataFrame join produced the condition.
+        provenance: Parser, confidence and dialect of the observation.
+    """
+
+    left: ColumnRef
+    right: ColumnRef
+    job_id: str
+    provenance: Provenance
 
 
 class Schedule(_Model):
@@ -400,6 +417,7 @@ class WorkerResult(_Model):
     column_edges: list[ColumnEdge] = Field(default_factory=list)
     table_edges: list[TableEdge] = Field(default_factory=list)
     unresolved: list[Unresolved] = Field(default_factory=list)
+    join_conditions: list[JoinCondition] = Field(default_factory=list)
 
     def extend(self, other: WorkerResult) -> WorkerResult:
         """Merge another result's contents into this one in place.
@@ -418,6 +436,7 @@ class WorkerResult(_Model):
         self.column_edges.extend(other.column_edges)
         self.table_edges.extend(other.table_edges)
         self.unresolved.extend(other.unresolved)
+        self.join_conditions.extend(other.join_conditions)
         return self
 
 
@@ -454,6 +473,7 @@ class LineageDocument(_Model):
     column_edges: list[ColumnEdge] = Field(default_factory=list)
     table_edges: list[TableEdge] = Field(default_factory=list)
     unresolved: list[Unresolved] = Field(default_factory=list)
+    join_conditions: list[JoinCondition] = Field(default_factory=list)
 
     def sorted(self) -> LineageDocument:
         """Return a copy with every list ordered so serialization is deterministic."""
