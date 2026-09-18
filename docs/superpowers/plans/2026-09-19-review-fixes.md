@@ -66,6 +66,14 @@ Files: `etl_parser/export/agent_catalog.py`, `tests/test_agent_catalog.py` (new)
   (emit them from the exporter into `doc`-independent `catalog["lineage"]["unresolved"]` and
   return them so the CLI can log them). Source-provided `relations` (from WP-G) are written to
   `relations` with `source: "database"`; prior human relations are kept.
+- [ ] `catalog["schema_drift"]` (new top-level dict, user request 2026-09-19):
+  `{"code_only": {"databases": [...]}, "unused_in_code": [{"db_name", "table_name"}]}`.
+  `code_only.databases` uses the exact `databases` shape (`db_name`, `db_type`, `tables[]
+  {table_name, description: "", schema[] {field_name, datatype: null, description: ""},
+  referenced_by: [job ids], source_files: [...]}`) so an entry can be copied into the real
+  catalog once verified against the source system. `unused_in_code` lists source tables no
+  scanned job reads or writes. Both lists are sorted. Also emitted to the log as one
+  `schema.drift` event with counts.
 
 ### WP-B Graph, impact, OpenLineage, registry, identity (3, 11, 12, 13, 27–31)
 
@@ -151,7 +159,8 @@ Files: `etl_parser/ai_analysis.py`, `etl_parser/describe/*.py`, `etl_parser/sour
   for them. Accepted edges set `Provenance.ai_confidence`/`ai_rationale`; catalog columns get
   `ai_confidence`, `ai_rationale`, `ai_model`, `description_source: ai`.
 - [ ] Optional `AnalysisConfig.min_ai_confidence` (default 0.0): proposals below it are
-  recorded as `deferred` with reason `below_confidence_threshold`.
+  recorded as `deferred` with reason `below_confidence_threshold`. Exposed on `ParserClient`
+  through `AnalysisConfig` and on the CLI as `--min-ai-confidence` (WP-F documents it).
 - [ ] AI-introduced datasets get `origin="ai"` and `provenance`; jobs get `ai_inputs`/
   `ai_outputs` instead of mutating `inputs`/`outputs`; a job created from AI only gets
   `origin="ai"`. `changes.json` records dataset/job additions.
@@ -205,6 +214,15 @@ Files: `etl_parser/schema/__init__.py`, `etl_parser/schema/base.py`, `etl_parser
   refuses a DSN containing a password if given via `--dsn` (env only).
 - [ ] `scan`/`run`: `--glue` uses `GlueSchemaSource` with `--aws-profile`; new
   `--schema-from-code` flag passed to the exporter.
+- [ ] SDK support (user request 2026-09-19, mandatory): `etl_parser.schema` exports
+  `GlueSchemaSource`, `PostgresSchemaSource`, `RedshiftSchemaSource`, `write_schema_catalog`;
+  `etl_parser/__init__.py` re-exports them lazily (no driver import at package import).
+  `ParserClient.fetch_schema(sources: list[SchemaSource]) -> dict` returns the catalog dict;
+  `ParserClient.run`/`arun` and `etl_parser.scan` accept `schema=` (a `SchemaSource`, a
+  catalog dict, or a path), `include_code_schema: bool = False`, and expose `schema_drift`
+  on the result object and in `to_dict()`. Add tests in `tests/test_schema_sources.py` for
+  the client surface with mocked sources. (Edit `etl_parser/sdk.py` and `etl_parser/pipeline.py`
+  only for these additions; WP-F owns their other changes and merges after WP-G.)
 - [ ] pyproject: extras `glue = ["boto3>=1.34"]`, `postgres = ["psycopg[binary]>=3.1"]`,
   `redshift = ["redshift_connector>=2.1"]`; nothing imported at module import time.
 - [ ] Tests: mocked boto3 client, fake psycopg/redshift connections returning fixed rows;
