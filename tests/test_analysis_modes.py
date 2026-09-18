@@ -82,3 +82,60 @@ def test_config_cli_override_and_invalid_options(tmp_path):
     assert not json.loads(result.stdout)["descriptions"]
     result = CliRunner().invoke(app, ["run", str(source), "--ai-lineage", "invalid"])
     assert result.exit_code != 0
+
+
+def test_multiple_proposals_keep_dataset_scope_when_one_schema_is_unknown():
+    from etl_parser.ai_analysis import AnalysisResponse, _proposal_edges
+    from etl_parser.models import Job, LineageDocument
+    from etl_parser.observability import digest
+    from etl_parser.scanner.repo import SourceFile
+    from etl_parser.workers.sql import DictSchemaProvider
+
+    source = SourceFile("job.py", 'df.write.saveAsTable("db.t")', ".py")
+    job = Job(
+        id="job",
+        name="job",
+        source_file=source.path,
+        inputs=["s3://bucket/orders"],
+        outputs=["glue://db/t"],
+    )
+    evidence = {
+        "source_file": source.path,
+        "source_digest": digest(source.text),
+        "line_start": 1,
+        "line_end": 1,
+        "quote": source.text,
+    }
+    response = AnalysisResponse.model_validate(
+        {
+            "columns": [
+                {
+                    "job_id": "job",
+                    "target": {"dataset_id": "glue://db/t", "name": name},
+                    "sources": [{"dataset_id": "s3://bucket/orders", "name": name}],
+                    "expression": name,
+                    "kind": "identity",
+                    "evidence": evidence,
+                }
+                for name in ("x", "y")
+            ],
+            "tables": [
+                {
+                    "job_id": "job",
+                    "source": "s3://bucket/orders",
+                    "target": "glue://db/t",
+                    "evidence": evidence,
+                }
+            ],
+        }
+    )
+    columns, tables, rejected = _proposal_edges(
+        response,
+        source,
+        [job],
+        LineageDocument(jobs=[job]),
+        "request",
+        "test",
+        DictSchemaProvider({"db": {"t": ["x", "y"]}}),
+    )
+    assert len(columns) == 2 and len(tables) == 1 and not rejected

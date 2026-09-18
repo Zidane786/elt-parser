@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 from pathlib import Path
 
 import typer
 
-from etl_parser.describe.client import bedrock_lambda_runner
+from etl_parser.describe.client import RunnerConfig, close_runner, configured_runner
 from etl_parser.describe.engine import DescriptionEngine
 from etl_parser.export.agent_catalog import export_agent_catalog
 from etl_parser.export.native import read_native, write_native
@@ -21,8 +22,15 @@ from etl_parser.pipeline import ParserRegistry
 from etl_parser.pipeline import scan as scan_repository
 from etl_parser.workers.sql import DictSchemaProvider, GlueSchemaProvider
 
-app = typer.Typer(no_args_is_help=True)
-export_app = typer.Typer(no_args_is_help=True)
+app = typer.Typer(
+    no_args_is_help=True,
+    help="Static ETL lineage with optional audited AI analysis. "
+    "Use COMMAND --help for all options; scanning does not run your ETL code.",
+    pretty_exceptions_show_locals=False,
+)
+export_app = typer.Typer(
+    no_args_is_help=True, help="Export saved native lineage to catalog or OpenLineage."
+)
 app.add_typer(export_app, name="export")
 
 
@@ -50,6 +58,25 @@ def analysis_run(
     ref: str | None = None,
     source_path: str | None = typer.Option(None, "--path"),
     lambda_arn: str | None = typer.Option(None, envvar="ETL_PARSER_LAMBDA_ARN"),
+    runner: str | None = typer.Option(
+        None,
+        envvar="ETL_PARSER_RUNNER",
+        help="lambda-bedrock-invoke (default), lbi (alias), or anthropic",
+    ),
+    base_url: str | None = typer.Option(
+        None,
+        envvar=["ANTHROPIC_API_BASE_URL", "ANTHROPIC_BASE_URL"],
+        help="Anthropic-compatible HTTPS root; SDK appends /v1/messages",
+    ),
+    api_key: str | None = typer.Option(
+        None,
+        envvar="ANTHROPIC_API_KEY",
+        help="Prefer the environment variable over a command-line secret",
+    ),
+    extra_headers: str | None = typer.Option(None, help="JSON object of custom HTTP headers"),
+    extra_headers_file: Path | None = typer.Option(
+        None, exists=True, help="JSON header object; mutually exclusive with --extra-headers"
+    ),
     model: str | None = typer.Option(None, envvar="ETL_PARSER_MODEL"),
     region: str | None = typer.Option(None, envvar="AWS_REGION"),
     aws_profile: str | None = typer.Option(None, envvar="AWS_PROFILE"),
@@ -84,6 +111,10 @@ def analysis_run(
                 "background_comparison": background_comparison,
                 "dry_run": dry_run,
                 "lambda_arn": lambda_arn,
+                "runner": runner,
+                "base_url": base_url,
+                "api_key": api_key,
+                "extra_headers": _headers(extra_headers, extra_headers_file),
                 "model": model,
                 "region": region,
                 "aws_profile": aws_profile,
@@ -157,6 +188,20 @@ def analysis_run(
 
 def _json(path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _headers(raw, path):
+    if raw is not None and path is not None:
+        raise typer.BadParameter("Choose --extra-headers or --extra-headers-file, not both")
+    if raw is None and path is None:
+        return None
+    try:
+        value = json.loads(raw) if raw is not None else _json(path)
+        return RunnerConfig(extra_headers=value).extra_headers
+    except (ValueError, OSError):
+        raise typer.BadParameter(
+            "Extra headers must be a valid JSON object of safe string headers"
+        ) from None
 
 
 def _write(value, path):
@@ -316,7 +361,18 @@ def describe(
     lineage: Path,
     catalog: Path = typer.Option(...),
     out: Path = typer.Option(...),
-    lambda_arn: str = typer.Option(..., envvar="ETL_PARSER_LAMBDA_ARN"),
+    lambda_arn: str | None = typer.Option(None, envvar="ETL_PARSER_LAMBDA_ARN"),
+    runner: str = typer.Option(
+        "lambda-bedrock-invoke",
+        envvar="ETL_PARSER_RUNNER",
+        help="lambda-bedrock-invoke, lbi (alias), or anthropic",
+    ),
+    base_url: str | None = typer.Option(
+        None, envvar=["ANTHROPIC_API_BASE_URL", "ANTHROPIC_BASE_URL"]
+    ),
+    api_key: str | None = typer.Option(None, envvar="ANTHROPIC_API_KEY"),
+    extra_headers: str | None = typer.Option(None, help="JSON object of custom HTTP headers"),
+    extra_headers_file: Path | None = typer.Option(None, exists=True),
     model: str = typer.Option(..., envvar="ETL_PARSER_MODEL"),
     region: str = typer.Option("us-east-1", envvar="AWS_REGION"),
     aws_profile: str | None = typer.Option(None, envvar="AWS_PROFILE"),
@@ -327,20 +383,36 @@ def describe(
     log_max_bytes: int = typer.Option(10_000_000, min=1024),
     log_max_files: int = typer.Option(20, min=1),
 ):
-    """Generate descriptions through Agent SDK's Lambda Bedrock invoke runner (paid calls)."""
+    """Generate descriptions through the selected Agent SDK runner (paid calls)."""
     doc, existing = read_native(lineage), _json(catalog)
+    try:
+        options = RunnerConfig(
+            runner=runner,
+            lambda_arn=lambda_arn,
+            region=region,
+            aws_profile=aws_profile,
+            web_adapter=web_adapter,
+            base_url=base_url,
+            api_key=api_key,
+            extra_headers=_headers(extra_headers, extra_headers_file) or {},
+        )
+    except ValueError:
+        raise typer.BadParameter(
+            "Invalid runner configuration; check runner, URL and headers"
+        ) from None
+    if options.api_key:
+        current_observer().protect(options.api_key.get_secret_value())
+    current_observer().protect(*options.extra_headers.values())
     current_observer().configure(
+        **options.model_dump(),
         model=model,
-        lambda_arn=lambda_arn,
-        region=region,
-        aws_profile=aws_profile,
-        web_adapter=web_adapter,
         ai_lineage="off",
         descriptions=True,
     )
     current_observer().event(
         "description.configured",
         actor="orchestrator",
+        runner=runner,
         model=model,
         lambda_arn=lambda_arn,
         region=region,
@@ -349,13 +421,20 @@ def describe(
         max_output_tokens=max_tokens,
         ai_lineage="off",
     )
+
+    async def generate():
+        selected = configured_runner(options)
+        try:
+            engine = DescriptionEngine(selected, model=model, max_tokens=max_tokens)
+            return await engine.arun(doc, existing), engine.warnings
+        finally:
+            await close_runner(selected)
+
     try:
-        runner = bedrock_lambda_runner(
-            lambda_arn, region=region, aws_profile=aws_profile, web_adapter=web_adapter
-        )
-        engine = DescriptionEngine(runner, model=model, max_tokens=max_tokens)
-        enriched = engine.run(doc, existing)
-    except (RuntimeError, ValueError, ImportError) as exc:
-        raise typer.BadParameter(str(exc)) from exc
+        enriched, warnings = asyncio.run(generate())
+    except (RuntimeError, ValueError, ImportError):
+        raise typer.BadParameter(
+            "Runner initialization failed; check SDK and selected provider settings"
+        ) from None
     _write(enriched, out)
-    current_observer().event("description.completed", warning_count=len(engine.warnings))
+    current_observer().event("description.completed", warning_count=len(warnings))

@@ -2,6 +2,11 @@
 
 Date: 18 September 2026. Baseline before this extension: `a218033`.
 
+Follow-up: [runner options and actual live gateway evaluation](2026-09-18-gateway-validation.md)
+records the subsequent Anthropic/LBI request, expanded README/catalog template,
+live partial results, local fixes and remaining approval blocker. Counts and the
+"no live model calls" statement below describe the earlier `81f569d` release only.
+
 ## In simple language
 
 Your framework reads ETL code and builds a map of which tables and columns feed

@@ -1,0 +1,57 @@
+{
+  "databases": [
+    {
+      "db_name": "raw",
+      "db_type": "glue",
+      "description": "Example source database. Replace these names with your physical database and tables.",
+      "tables": [
+        {
+          "table_name": "orders",
+          "dataset_id": "glue://raw/orders",
+          "description": "One record per order before transformation.",
+          "schema": [
+            {
+              "field_name": "order_id",
+              "datatype": "bigint",
+              "description": "Unique order identifier.",
+              "verify": true
+            },
+            {
+              "field_name": "amount",
+              "datatype": "decimal(18,2)",
+              "description": "Order amount before transformation.",
+              "verify": true
+            },
+            {
+              "field_name": "order_date",
+              "datatype": "date",
+              "description": "Date the order was placed.",
+              "is_partition": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "db_name": "analytics",
+      "db_type": "glue",
+      "description": "Example target database.",
+      "tables": [
+        {
+          "table_name": "order_totals",
+          "dataset_id": "glue://analytics/order_totals",
+          "description": "Example output of the ETL job.",
+          "schema": [
+            {"field_name": "order_id", "datatype": "bigint", "description": ""},
+            {"field_name": "double_amount", "datatype": "decimal(18,2)", "description": ""},
+            {"field_name": "order_date", "datatype": "date", "description": ""}
+          ]
+        }
+      ]
+    }
+  ],
+  "relations": [],
+  "scripts": [],
+  "schedules": {},
+  "lineage": {"column_edges": [], "unresolved": []}
+}

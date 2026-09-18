@@ -38,6 +38,8 @@ _SENSITIVE = {
     "access_token",
     "refresh_token",
     "api_key",
+    "anthropic_api_key",
+    "extra_headers",
     "aws_access_key_id",
     "aws_secret_access_key",
     "aws_session_token",
@@ -171,6 +173,11 @@ class RunObserver:
     def configure(self, **values):
         with self._lock:
             self.configuration.update(sanitize(values, secrets=self._secrets))
+
+    def protect(self, *secrets):
+        """Register explicitly supplied secrets before emitting provider metadata."""
+        with self._lock:
+            self._secrets += tuple(value for value in secrets if value)
 
     def partial(self):
         with self._lock:

@@ -11,9 +11,9 @@ import time
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from etl_parser.describe.client import bedrock_lambda_runner
+from etl_parser.describe.client import RunnerConfig, close_runner, configured_runner
 from etl_parser.export.agent_catalog import export_agent_catalog
 from etl_parser.graph.builder import build_graph
 from etl_parser.identity import dataset_ref_from_id
@@ -32,17 +32,12 @@ from etl_parser.observability import current_observer, digest, observed, sanitiz
 from etl_parser.pipeline import scan
 
 
-class AnalysisConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class AnalysisConfig(RunnerConfig):
     ai_lineage: Literal["off", "fallback", "improve"] = "off"
     descriptions: bool = False
     background_comparison: bool = True  # Only piggybacks on a needed description request.
     dry_run: bool = False
     model: str | None = None
-    lambda_arn: str | None = None
-    region: str = "us-east-1"
-    aws_profile: str | None = None
-    web_adapter: bool = True
     max_calls: int = Field(default=20, ge=0, le=10000)
     max_output_tokens: int = Field(default=4096, ge=1)
     max_context_chars: int = Field(default=60000, ge=1024, le=1_000_000)
@@ -239,8 +234,8 @@ def _proposal_edges(response, source, jobs, doc, request_id, model, schema=None)
                         raise ValueError("empty_column_name")
                     if schema:
                         for ref in [item.target, *item.sources, *item.indirect_sources]:
-                            known = schema.columns(ref.dataset_id)
-                            if known is not None and ref.name not in known:
+                            known_columns = schema.columns(ref.dataset_id)
+                            if known_columns is not None and ref.name not in known_columns:
                                 raise ValueError("column_absent_from_supplied_schema")
                     columns.append(
                         ColumnEdge(
@@ -372,6 +367,10 @@ async def analyze_async(
 ):
     config = AnalysisConfig.model_validate(config or {})
     observer = current_observer()
+    if config.api_key:
+        observer.protect(config.api_key.get_secret_value())
+    observer.protect(*config.extra_headers.values())
+    owns_runner = runner is None
     graph = scan(path, **scan_options)
     doc, index = graph.document, graph.source_index
     result = AnalysisRun(doc, index, export_agent_catalog(doc, prior))
@@ -532,14 +531,9 @@ async def analyze_async(
         new_descriptions_before = dict(new_descriptions)
         try:
             if runner is None:
-                if not config.lambda_arn or not config.model:
+                if not config.model:
                     raise AnalysisPolicyError("provider_configuration_missing")
-                runner = bedrock_lambda_runner(
-                    config.lambda_arn,
-                    region=config.region,
-                    aws_profile=config.aws_profile,
-                    web_adapter=config.web_adapter,
-                )
+                runner = configured_runner(config, timeout=config.timeout_seconds)
             if not config.model:
                 raise AnalysisPolicyError("model_id_missing")
             from agent_sdk.types import Message
@@ -553,6 +547,7 @@ async def analyze_async(
                 request_id=request_id,
                 source=source.path,
                 model=config.model,
+                runner=config.runner,
                 lineage_requested=lineage_requested,
                 background_comparison=combined and not lineage_requested,
                 description_count=len(description_targets),
@@ -608,6 +603,7 @@ async def analyze_async(
             ):
                 raise AnalysisPolicyError("incomplete_or_tool_response")
             output = "".join(b["text"] for b in completion.content if b.get("type") == "text")
+            candidate["response_digest"] = digest(output)
             if len(output) > config.max_output_tokens * 32:
                 raise AnalysisPolicyError("response_size_limit")
             response = AnalysisResponse.model_validate_json(output)
@@ -871,8 +867,22 @@ async def analyze_async(
                 str(exc)
                 if isinstance(exc, AnalysisPolicyError)
                 else (
-                    "timeout" if isinstance(exc, TimeoutError) else "provider_or_response_failure"
+                    "response_schema_invalid"
+                    if isinstance(exc, ValidationError)
+                    else "timeout"
+                    if isinstance(exc, TimeoutError)
+                    else "provider_or_response_failure"
                 )
+            )
+            validation_errors = (
+                [
+                    {"location": e["loc"], "type": e["type"]}
+                    for e in exc.errors(
+                        include_input=False, include_context=False, include_url=False
+                    )
+                ]
+                if isinstance(exc, ValidationError)
+                else []
             )
             observer.event(
                 "ai.work_failed",
@@ -882,6 +892,7 @@ async def analyze_async(
                 request_id=request_id,
                 error_type=type(exc).__name__,
                 reason=reason,
+                validation_errors=validation_errors,
             )
             result.warnings.append(f"{source.path}: {reason} ({type(exc).__name__})")
             result.decisions.append(
@@ -891,8 +902,20 @@ async def analyze_async(
                     "status": "failed",
                     "error_type": type(exc).__name__,
                     "reason": reason,
+                    "validation_errors": validation_errors,
                 }
             )
+        finally:
+            if owns_runner and runner is not None:
+                try:
+                    await close_runner(runner)
+                except Exception as exc:
+                    observer.partial()
+                    observer.event(
+                        "ai.runner_close_failed", level="WARNING", error_type=type(exc).__name__
+                    )
+                finally:
+                    runner = None
     if applied_columns or applied_tables:
         result.document = _rebuild(doc, applied_columns, applied_tables)
         result.catalog = export_agent_catalog(result.document, result.catalog)
