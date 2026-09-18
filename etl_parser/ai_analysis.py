@@ -6,6 +6,7 @@ import asyncio
 import copy
 import fnmatch
 import json
+import math
 import re
 import time
 from typing import Literal
@@ -39,11 +40,11 @@ class AnalysisConfig(RunnerConfig):
     dry_run: bool = False
     model: str | None = None
     max_calls: int = Field(default=20, ge=0, le=10000)
-    max_output_tokens: int = Field(default=4096, ge=1)
+    max_output_tokens: int = Field(default=16000, ge=1)
     max_context_chars: int = Field(default=60000, ge=1024, le=1_000_000)
     max_total_tokens: int | None = Field(default=None, ge=1)
-    timeout_seconds: float = Field(default=60, gt=0, le=600)
-    deadline_seconds: float = Field(default=600, gt=0)
+    timeout_seconds: float = Field(default=300, gt=0, le=600)
+    deadline_seconds: float = Field(default=3600, gt=0)
     include: list[str] = Field(default_factory=lambda: ["*"])
     exclude: list[str] = Field(default_factory=list)
 
@@ -113,6 +114,33 @@ class AnalysisRun:
         self.work = []
         self.status = "partial" if baseline.unresolved else "success"
         self.configuration = {}
+        self.run_id = None
+        self.metrics = {}
+        self.artifact_path = None
+        self.log_path = None
+
+    def to_dict(self):
+        """JSON-compatible service response; excludes raw source snapshots and secrets.
+
+        Lineage expressions and descriptions are still source-sensitive data.
+        """
+        return {
+            "status": self.status,
+            "run_id": self.run_id,
+            "lineage": self.document.model_dump(mode="json"),
+            "baseline": self.baseline.model_dump(mode="json"),
+            "ai_lineage": self.ai_document.model_dump(mode="json"),
+            "catalog": self.catalog,
+            "decisions": self.decisions,
+            "changes": self.changes,
+            "comparison": self.comparison,
+            "warnings": self.warnings,
+            "work_plan": self.work,
+            "configuration": self.configuration,
+            "metrics": self.metrics,
+            "artifact_path": str(self.artifact_path) if self.artifact_path else None,
+            "log_path": str(self.log_path) if self.log_path else None,
+        }
 
 
 def _edge_key(edge):
@@ -371,7 +399,8 @@ async def analyze_async(
         observer.protect(config.api_key.get_secret_value())
     observer.protect(*config.extra_headers.values())
     owns_runner = runner is None
-    graph = scan(path, **scan_options)
+    # Filesystem/GitHub indexing and static parsing must not block a service's event loop.
+    graph = await asyncio.to_thread(scan, path, **scan_options)
     doc, index = graph.document, graph.source_index
     result = AnalysisRun(doc, index, export_agent_catalog(doc, prior))
     result.configuration = sanitize(config.model_dump())
@@ -386,6 +415,7 @@ async def analyze_async(
     catalog_columns = _catalog_columns(result.catalog)
     start = time.perf_counter()
     calls, token_total = 0, 0
+    provider_blocked = False
     ai_columns, ai_tables, applied_columns, applied_tables = [], [], [], []
     new_descriptions = {}
     for source in index.files:
@@ -455,10 +485,24 @@ async def analyze_async(
         if config.dry_run:
             result.decisions.append({**candidate, "status": "planned", "reason": "dry_run"})
             continue
+        if provider_blocked:
+            result.decisions.append(
+                {**candidate, "status": "skipped", "reason": "provider_unavailable"}
+            )
+            observer.count("ai.skipped.provider")
+            observer.event(
+                "ai.file_skipped",
+                actor="provider_policy",
+                source=source.path,
+                reason="provider_unavailable",
+            )
+            continue
         remaining = config.deadline_seconds - (time.perf_counter() - start)
         if calls >= config.max_calls or remaining <= 0:
-            result.decisions.append(
-                {**candidate, "status": "skipped", "reason": "budget_exhausted"}
+            reason = "call_limit" if calls >= config.max_calls else "deadline_exceeded"
+            result.decisions.append({**candidate, "status": "skipped", "reason": reason})
+            observer.event(
+                "ai.file_skipped", actor="budget_policy", source=source.path, reason=reason
             )
             observer.count("ai.skipped.budget")
             observer.partial()
@@ -565,6 +609,9 @@ async def analyze_async(
                         "values. Cite source digest, lines and exact quote for lineage proposals. "
                         "Describe requested targets from evidence; when describe_proposed_targets "
                         "is true you may also describe your proposed output columns. "
+                        "Use the exact field names and enum values in response_schema; "
+                        "include all required fields and no extra fields. Return a JSON object, "
+                        "not Markdown. Keep evidence quotes short and exact. "
                         "If request_lineage is "
                         "false return empty columns/tables. Do not invent findings.",
                         tools=[],
@@ -601,6 +648,8 @@ async def analyze_async(
             if completion.stop_reason not in {None, "end_turn", "stop", "stop_sequence"} or any(
                 b.get("type") == "tool_use" for b in completion.content
             ):
+                if completion.stop_reason in {"max_tokens", "length"}:
+                    raise AnalysisPolicyError("output_token_limit")
                 raise AnalysisPolicyError("incomplete_or_tool_response")
             output = "".join(b["text"] for b in completion.content if b.get("type") == "text")
             candidate["response_digest"] = digest(output)
@@ -863,6 +912,17 @@ async def analyze_async(
                     observer.count("ai.changes.rolled_back")
             observer.count("ai.work.failed")
             observer.partial()
+            # Record only typed status metadata, never exception bodies or headers.
+            http_status = getattr(exc, "status_code", None)
+            if type(http_status) is not int or not 100 <= http_status <= 599:
+                http_status = None
+            retry_after = getattr(exc, "retry_after", None)
+            if (
+                type(retry_after) not in {int, float}
+                or not math.isfinite(retry_after)
+                or retry_after < 0
+            ):
+                retry_after = None
             reason = (
                 str(exc)
                 if isinstance(exc, AnalysisPolicyError)
@@ -874,6 +934,28 @@ async def analyze_async(
                     else "provider_or_response_failure"
                 )
             )
+            if http_status is not None:
+                reason = (
+                    "provider_authentication_failed"
+                    if http_status in {401, 403}
+                    else "provider_rate_limited"
+                    if http_status == 429
+                    else "provider_server_error"
+                    if http_status >= 500
+                    else "provider_request_rejected"
+                )
+                observer.count(f"ai.provider.http_{http_status}")
+                # Stop instead of hammering a blocked endpoint or rate-limited provider.
+                # Resuming is caller-controlled; no implicit sleep/retry or paid call.
+                if http_status in {401, 403, 404, 429}:
+                    provider_blocked = True
+                    observer.event(
+                        "ai.provider_blocked",
+                        actor="provider_policy",
+                        reason=reason,
+                        http_status=http_status,
+                        retry_after_seconds=retry_after,
+                    )
             validation_errors = (
                 [
                     {"location": e["loc"], "type": e["type"]}
@@ -893,6 +975,8 @@ async def analyze_async(
                 error_type=type(exc).__name__,
                 reason=reason,
                 validation_errors=validation_errors,
+                http_status=http_status,
+                retry_after_seconds=retry_after,
             )
             result.warnings.append(f"{source.path}: {reason} ({type(exc).__name__})")
             result.decisions.append(
@@ -903,6 +987,8 @@ async def analyze_async(
                     "error_type": type(exc).__name__,
                     "reason": reason,
                     "validation_errors": validation_errors,
+                    "http_status": http_status,
+                    "retry_after_seconds": retry_after,
                 }
             )
         finally:

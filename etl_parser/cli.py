@@ -82,7 +82,9 @@ def analysis_run(
     aws_profile: str | None = typer.Option(None, envvar="AWS_PROFILE"),
     web_adapter: bool | None = typer.Option(None, "--web-adapter/--no-web-adapter"),
     max_calls: int | None = typer.Option(None, min=0),
-    max_output_tokens: int | None = typer.Option(None, min=1),
+    max_output_tokens: int | None = typer.Option(
+        None, min=1, help="Maximum output tokens per AI file request (default: 16000)"
+    ),
     max_total_tokens: int | None = typer.Option(None, min=1),
     max_context_chars: int | None = typer.Option(None, min=1024),
     timeout_seconds: float | None = typer.Option(None, min=0.001),
@@ -377,7 +379,7 @@ def describe(
     region: str = typer.Option("us-east-1", envvar="AWS_REGION"),
     aws_profile: str | None = typer.Option(None, envvar="AWS_PROFILE"),
     web_adapter: bool = typer.Option(True, help="Use the SDK Lambda Web Adapter envelope"),
-    max_tokens: int = typer.Option(1024, min=1),
+    max_tokens: int = typer.Option(16000, min=1),
     log_dir: Path | None = None,
     log_level: str = "INFO",
     log_max_bytes: int = typer.Option(10_000_000, min=1024),

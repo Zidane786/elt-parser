@@ -131,7 +131,7 @@ def test_budget_zero_makes_no_call(tmp_path):
         config=AnalysisConfig(ai_lineage="improve", model="test", max_calls=0),
     )
     assert not runner.calls
-    assert result.decisions[0]["reason"] == "budget_exhausted"
+    assert result.decisions[0]["reason"] == "call_limit"
 
 
 def test_oversized_source_skips_comparison_not_second_call(tmp_path):

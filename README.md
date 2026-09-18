@@ -136,6 +136,99 @@ graph = scan("./etl-repo", schema=DictSchemaProvider("catalog.json"),
 document = graph.to_document()
 ```
 
+### Python SDK for backend services
+
+The same installed `etl-parser` package supports both CLI and direct Python use;
+no subprocess, CLI invocation, or additional HTTP service is required. Public imports:
+`ParserClient`, `AnalysisConfig`, `AnalysisRun`, `scan`, `analyze`, `analyze_async`.
+`scan` returns a `LineageGraph`; the analysis/client methods return `AnalysisRun`.
+
+```python
+from etl_parser import AnalysisConfig, ParserClient
+from etl_parser.workers.sql import DictSchemaProvider
+
+client = ParserClient(
+    config=AnalysisConfig(),  # AI lineage and descriptions both OFF
+    log_dir="./logs",         # omit for console-only logging
+    log_level="INFO",
+)
+result = client.run(
+    "./etl-repo",
+    schema=DictSchemaProvider("catalog.json"),
+    bindings={"env:ENV": "prod"},
+    out_dir="./artifacts",    # omit for in-memory results only
+)
+payload = result.to_dict()    # JSON-compatible response for your backend
+print(result.status, result.run_id, result.metrics)
+```
+
+Inside an async backend, reuse the client and **await `client.arun`**:
+
+```python
+async def analyze_job(trusted_source_path):
+    result = await client.arun(trusted_source_path)
+    return result.to_dict()
+```
+
+Synchronous filesystem/GitHub scanning and artifact export run in worker threads,
+not on the event loop. Each client invocation has isolated provider clients, metrics,
+logs and results, including concurrent invocations. Client configuration is copied
+on construction and per invocation. A call's `config=` replaces the client default
+configuration (it is not a partial merge). No source snapshots, credentials or custom
+header values are included in `to_dict()`; lineage expressions/descriptions are still
+sensitive. No artifact files are written unless `out_dir` is supplied, and no log
+files are written unless `log_dir` is supplied.
+
+Optional AI uses the same policy and runner controls as the CLI:
+
+```python
+import os
+from etl_parser import AnalysisConfig, ParserClient
+
+ai_client = ParserClient(config=AnalysisConfig(
+    runner="anthropic",
+    base_url=os.environ["ANTHROPIC_API_BASE_URL"],
+    api_key=os.environ["ANTHROPIC_API_KEY"],
+    model=os.environ["ETL_PARSER_MODEL"],
+    extra_headers={},          # optional JSON-compatible string dictionary
+    ai_lineage="improve",     # or "fallback"; "off" preserves deterministic main lineage
+    descriptions=True,
+    max_output_tokens=16000,   # configurable, e.g. 8000 or 24000 if your model allows
+    timeout_seconds=300,
+    deadline_seconds=3600,
+    max_calls=20,
+))
+# result = await ai_client.arun("./etl-repo")
+
+lambda_config = AnalysisConfig(
+    runner="lbi",             # alias for lambda-bedrock-invoke
+    lambda_arn=os.environ["ETL_PARSER_LAMBDA_ARN"],  # non-streaming ARN
+    model=os.environ["ETL_PARSER_MODEL"],
+    aws_profile="development",  # omit for a backend IAM role
+    ai_lineage="fallback",
+)
+```
+
+SDK settings are explicit: unlike CLI options, `AnalysisConfig` does not implicitly
+load environment credentials. Scanner options (`schema`, `bindings`, `parsers`,
+`source_provider`, `sql_engine`, `sql_dialect`, `default_db`, `products`, `ref`,
+`source_path`, `scan_commit`) are forwarded unchanged. GitHub example:
+`await client.arun("https://github.com/owner/repo", ref="main", source_path="etl")`.
+Use `prior=<catalog dict>` to preserve descriptions. Log directory/level and rotation
+limits can be overridden per invocation. Advanced caller-owned observers remain
+available through `analyze`/`analyze_async`; `ParserClient` owns its own observer.
+An injected `runner=` remains caller-owned: close it yourself and ensure it supports
+your concurrency/event-loop usage.
+
+Check `result.status`, `warnings`, `decisions`, and `document.unresolved` before treating
+results as complete. AI file failures return partial results; invalid configuration,
+scan/export failures, and cancellation raise to the caller. SDK log summaries finalize
+on errors/cancellation. Cancelling does not forcibly stop a synchronous scan already
+running in a worker thread, or guarantee that the remote provider stops billing.
+For production, bound job concurrency in your backend/queue, authorize source paths
+and GitHub repositories, and keep runner credentials/configuration server-controlled.
+There is no bundled HTTP server, distributed job queue, or tenant-authentication layer.
+
 Every parser or orchestrator returns the same `WorkerResult`. Add a plugin without changing
 the graph, impact analyzer or exporters:
 
@@ -308,10 +401,10 @@ it cannot compare missing source snapshots and never schedules a source audit.
 
 Controls and default bounds:
 
-- `--max-calls 20`, `--max-output-tokens 4096`, `--max-context-chars 60000`.
+- `--max-calls 20`, `--max-output-tokens 16000`, `--max-context-chars 60000`.
 - `--max-total-tokens` optionally bounds conservative reservations and reported usage.
   Missing usage retains the reservation; this is not a billing guarantee.
-- `--timeout-seconds 60`, `--deadline-seconds 600` for the AI stage; calls are serial.
+- `--timeout-seconds 300`, `--deadline-seconds 3600` for the AI stage; calls are serial.
   Cancelling a timed-out request cannot guarantee an already-running Lambda stops billing.
 - `--include` / `--exclude` select AI files, not deterministic source inventory.
 - `--strict` exits nonzero for unresolved or incomplete work; without it partial artifacts
@@ -319,6 +412,22 @@ Controls and default bounds:
 - `--config settings.json` accepts `AnalysisConfig` fields; explicit CLI flags override
   environment-backed provider settings, then config, then defaults. Unknown fields fail.
 - Existing schema/bindings/products/engine/dialect/Glue/trusted-plugin controls also work.
+
+The 16,000-token value is a maximum, not a request to fill the entire response. A larger
+limit can increase latency and token-budget reservations, and must be supported by the
+selected gateway/model. Override it with `run --max-output-tokens 8000`,
+`AnalysisConfig(max_output_tokens=8000)`, or `describe --max-tokens 8000`.
+The longer timeout/deadline reduce premature expiry; they cannot guarantee provider
+availability or complete every file. Increase `--max-calls` explicitly for larger runs.
+
+Failure decisions distinguish `call_limit`, `deadline_exceeded`, `output_token_limit`,
+`response_schema_invalid`, timeouts and provider HTTP errors. HTTP status and a numeric
+`retry_after_seconds` (when supplied) are logged without provider response bodies.
+On HTTP 401/403/404/429, remaining eligible AI files are skipped as
+`provider_unavailable`; deterministic results remain available. The framework does
+not sleep/retry automatically. Correct credentials/endpoint or wait for the provider's
+rate/quota window, then rerun the affected files with `--include`. There is no persisted
+automatic resume or global circuit breaker across independent service requests.
 
 Each `--out-dir` gets an exclusive `run_<id>/` folder with `lineage.json` (effective),
 `lineage.deterministic.json`, `catalog.json`, `decisions.json`, `changes.json`,
@@ -421,11 +530,11 @@ Example non-secret `settings.json`:
   "background_comparison": true,
   "extra_headers": {},
   "max_calls": 10,
-  "max_output_tokens": 4096,
+  "max_output_tokens": 16000,
   "max_context_chars": 60000,
   "max_total_tokens": 100000,
-  "timeout_seconds": 60,
-  "deadline_seconds": 600,
+  "timeout_seconds": 300,
+  "deadline_seconds": 3600,
   "include": ["*.py", "*.sql"],
   "exclude": ["*secret*"]
 }
@@ -578,11 +687,11 @@ GitHub limits and advanced provider configuration are documented above and in th
 | `--background-comparison` / `--no-background-comparison` | Allowed by default only within a needed description call; never enables AI alone |
 | `--dry-run` / `--no-dry-run` | Off; enabled means deterministic scan/work plan and zero model calls |
 | `--max-calls INTEGER` | 20; zero means no calls; upper validation bound 10,000 |
-| `--max-output-tokens INTEGER` | 4,096 per response; must also fit the selected model's limits |
+| `--max-output-tokens INTEGER` | 16,000 per response; must also fit the selected model's limits |
 | `--max-context-chars INTEGER` | 60,000 serialized context characters; valid range 1,024–1,000,000 |
 | `--max-total-tokens INTEGER` | Optional conservative reservation/accounting budget; not a provider billing guarantee |
-| `--timeout-seconds NUMBER` | 60 per model request; maximum 600 |
-| `--deadline-seconds NUMBER` | 600 for the AI stage; deterministic scan time is separate |
+| `--timeout-seconds NUMBER` | 300 per model request; maximum 600 |
+| `--deadline-seconds NUMBER` | 3,600 for the AI stage; deterministic scan time is separate |
 | `--include GLOB` | Repeatable AI file inclusions; defaults to `*` |
 | `--exclude GLOB` | Repeatable AI file exclusions; exclusions win |
 | `--strict` / `--no-strict` | Off; fail for unresolved/incomplete work instead of only reporting partial status |
@@ -615,7 +724,7 @@ if your deployment has separate buffered/streaming functions. No `--stream` or s
 
 | Command | Command-specific options |
 | --- | --- |
-| `describe` | Required `--catalog PATH`, `--out PATH`, `--model`; shared runner settings; `--max-tokens` defaults to 1,024 per column |
+| `describe` | Required `--catalog PATH`, `--out PATH`, `--model`; shared runner settings; `--max-tokens` defaults to 16,000 per column |
 | `export catalog` | Required `--out PATH`; optional `--prior PATH` to preserve metadata |
 | `export openlineage` | Required `--out DIRECTORY`; creates directory and writes one event per job |
 | `impact` | `--upstream` (otherwise downstream); optional `--depth INTEGER` ≥ 0; no limit when omitted |
@@ -701,7 +810,8 @@ Manual check options: required `--execute`, `--base-url`, `--model`; optional
 `--source`, `--schema`, `--out-dir`, `--ai-lineage off|fallback|improve` (improve),
 `--descriptions/--no-descriptions` (on),
 `--background-comparison/--no-background-comparison` (on), `--max-calls` (1),
-`--max-output-tokens` (4096), `--timeout-seconds` (60), `--deadline-seconds` (600).
+`--max-output-tokens` (16000), `--timeout-seconds` (300), `--deadline-seconds` (3600),
+and repeatable `--include` AI file globs. The checker uses the public Python client.
 This explicit diagnostic tool's descriptions-on default is different from the main
 `etl-parser run` defaults. Live checks are never part of routine tests/CI.
 

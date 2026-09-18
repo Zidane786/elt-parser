@@ -183,6 +183,117 @@ def test_anthropic_errors_do_not_retry_follow_redirect_or_leak(monkeypatch, tmp_
     )
     assert len(calls) == 1 and all(c.is_closed for c in clients)
     assert result.warnings and result.document == result.baseline
+    if status >= 400:
+        assert result.decisions[0]["http_status"] == status
     assert "PRIVATE_PROVIDER_BODY" not in "".join(
         f.read_text() for f in (tmp_path / "logs").rglob("*") if f.is_file()
     )
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429])
+def test_provider_circuit_stops_following_files(monkeypatch, tmp_path, status):
+    from etl_parser import ParserClient
+
+    for name in ("a", "b"):
+        (tmp_path / f"{name}.sql").write_text(f"CREATE TABLE db.{name} AS SELECT x FROM db.s")
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(status, text="PRIVATE_PROVIDER_BODY", headers={"Retry-After": "45"})
+
+    install_transport(monkeypatch, handler)
+    result = ParserClient(
+        config=AnalysisConfig(
+            runner="anthropic",
+            api_key="PRIVATE_KEY",
+            base_url="https://gateway.invalid",
+            model="test",
+            ai_lineage="improve",
+        ),
+        log_level="ERROR",
+    ).run(tmp_path)
+    assert len(calls) == 1
+    assert result.status == "partial"
+    assert result.document == result.baseline
+    assert result.decisions[0]["http_status"] == status
+    assert result.decisions[1]["reason"] == "provider_unavailable"
+    assert result.metrics["counters"]["ai.skipped.provider"] == 1
+    assert "PRIVATE_PROVIDER_BODY" not in json.dumps(result.to_dict())
+    if status == 429:
+        assert result.decisions[0]["retry_after_seconds"] == 45
+
+
+def test_output_token_limit_and_explicit_token_setting(monkeypatch, tmp_path):
+    source = tmp_path / "job.sql"
+    source.write_text("CREATE TABLE db.t AS SELECT x FROM db.s")
+
+    def handler(request):
+        assert json.loads(request.content)["max_tokens"] == 16000
+        data = response('{"columns":[').json()
+        data["stop_reason"] = "max_tokens"
+        return httpx.Response(200, json=data)
+
+    install_transport(monkeypatch, handler)
+    result = analyze(
+        source,
+        config=AnalysisConfig(
+            runner="anthropic",
+            api_key="PRIVATE_KEY",
+            base_url="https://gateway.invalid",
+            model="test",
+            ai_lineage="improve",
+        ),
+    )
+    assert result.decisions[0]["reason"] == "output_token_limit"
+    assert result.document == result.baseline
+
+
+def test_invalid_schema_reports_safe_details_and_preserves_graph(monkeypatch, tmp_path):
+    source = tmp_path / "job.sql"
+    source.write_text("CREATE TABLE db.t AS SELECT x FROM db.s")
+    install_transport(monkeypatch, lambda _: response('{"columns":[{"kind":"PRIVATE_VALUE"}]}'))
+    result = analyze(
+        source,
+        config=AnalysisConfig(
+            runner="anthropic",
+            api_key="PRIVATE_KEY",
+            base_url="https://gateway.invalid",
+            model="test",
+            ai_lineage="improve",
+        ),
+    )
+    failure = result.decisions[0]
+    assert failure["reason"] == "response_schema_invalid"
+    assert failure["response_digest"]
+    assert failure["validation_errors"]
+    assert "PRIVATE_VALUE" not in json.dumps(failure)
+    assert result.document == result.baseline
+
+
+def test_public_sdk_preserves_credentials_and_token_override(monkeypatch, tmp_path):
+    from etl_parser import ParserClient
+
+    source = tmp_path / "job.sql"
+    source.write_text("CREATE TABLE db.t AS SELECT x FROM db.s")
+
+    def handler(request):
+        assert request.headers["x-api-key"] == "PRIVATE_KEY"
+        assert json.loads(request.content)["max_tokens"] == 2222
+        return response('{"complete":true}')
+
+    clients = install_transport(monkeypatch, handler)
+    result = ParserClient(
+        config=AnalysisConfig(
+            runner="anthropic",
+            api_key="PRIVATE_KEY",
+            base_url="https://gateway.invalid",
+            model="test",
+            ai_lineage="improve",
+            max_output_tokens=2222,
+        ),
+        log_level="ERROR",
+    ).run(source)
+    assert not result.warnings and result.metrics["counters"]["ai.calls.completed"] == 1
+    assert all(client.is_closed for client in clients)
+    assert "PRIVATE_KEY" not in json.dumps(result.to_dict())

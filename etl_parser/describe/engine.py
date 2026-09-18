@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 
 class DescriptionEngine:
-    def __init__(self, runner: "LLMRunnerProtocol", *, model: str, max_tokens: int = 1024):
+    def __init__(self, runner: "LLMRunnerProtocol", *, model: str, max_tokens: int = 16000):
         if not model.strip():
             raise ValueError("An explicit SDK model ID or registered model slug is required")
         if max_tokens < 1:

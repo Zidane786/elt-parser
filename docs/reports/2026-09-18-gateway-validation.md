@@ -4,6 +4,9 @@ Date: 18 September 2026. Extends the release at `81f569d`.
 Status: implemented and locally tested; release checks passed. Live corpus
 evaluation remains partial, with follow-up live checks still outstanding.
 
+Follow-up: [SDK, token defaults and reliability report](2026-09-18-sdk-and-reliability.md)
+records the new public client, larger limits and the subsequent HTTP 429 live-test blocker.
+
 ## Requested changes delivered locally
 
 - `--runner lambda-bedrock-invoke` and `--runner lbi` select the same private SDK
