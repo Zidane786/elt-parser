@@ -37,6 +37,7 @@ from etl_parser.models import (
     ColumnRef,
     DatasetRef,
     Job,
+    JoinCondition,
     Provenance,
     TableEdge,
     Transformation,
@@ -476,6 +477,20 @@ class SqlWorker:
         for ds_id in sorted(analysis.inputs | analysis.outputs):
             if ds_id not in seen:
                 result.datasets.append(dataset_ref_from_id(ds_id))
+        unique = {j.model_dump_json(): j for j in result.join_conditions}
+        result.join_conditions = [
+            unique[k]
+            for k in sorted(
+                unique,
+                key=lambda k: (
+                    unique[k].left.dataset_id,
+                    unique[k].left.name,
+                    unique[k].right.dataset_id,
+                    unique[k].right.name,
+                    k,
+                ),
+            )
+        ]
         return analysis
 
     # --------------------------------------------------------------- parsing
@@ -849,6 +864,7 @@ class SqlWorker:
             prov = prov.model_copy(update={"confidence": "partial"})
 
         indirect = self._indirect_sources(qualified, norm, dialect)
+        self._emit_join_conditions(indirect["pairs"], prov, job_id, result)
         outer = qualified.this if isinstance(qualified, exp.Subquery) else qualified
         selects = outer.selects if isinstance(outer, (exp.Select, exp.SetOperation)) else []
         if target_columns and (has_star or len(target_columns) != len(selects)):
@@ -1243,6 +1259,41 @@ class SqlWorker:
         )
 
     # --------------------------------------------------------------- helpers
+    def _emit_join_conditions(self, pairs, prov: Provenance, job_id: str, result: WorkerResult):
+        """Record ``JOIN ... ON`` equalities as ``JoinCondition`` observations.
+
+        Each side is expanded through session temp tables (a side that maps to several or
+        no physical columns is dropped), the pair is ordered canonically by
+        ``(dataset_id, name)`` so ``a.x = b.y`` and ``b.y = a.x`` dedupe, and self-joins
+        on the same physical column are skipped. Deduplication and sorting across the
+        whole ``analyze`` call happen in ``analyze``.
+
+        Args:
+            pairs: ``(left, right)`` ``ColumnRef`` pairs from ``_indirect_sources``.
+            prov: Provenance of the enclosing statement (parser, dialect, confidence).
+            job_id: Job the observation belongs to.
+            result: Worker result the conditions are appended to.
+        """
+        for left, right in pairs:
+            sides = []
+            for ref in (left, right):
+                upstream = self._temp_tables.get(ref.dataset_id, {}).get(ref.name)
+                if upstream is not None:
+                    if len(upstream.sources) != 1:
+                        break
+                    ref = upstream.sources[0]
+                elif ref.dataset_id in self._temp_tables:
+                    break
+                sides.append(ref)
+            if len(sides) != 2:
+                continue
+            a, b = sorted(sides, key=lambda r: (r.dataset_id, r.name))
+            if (a.dataset_id, a.name) == (b.dataset_id, b.name):
+                continue
+            result.join_conditions.append(
+                JoinCondition(left=a, right=b, job_id=job_id, provenance=prov)
+            )
+
     def _physical(self, dataset_ids: Iterable[str]) -> set[str]:
         """Replace session temp table ids with the physical datasets they were built from.
 
@@ -1315,9 +1366,12 @@ class SqlWorker:
 
         Returns:
             Mapping with keys ``"filter"``, ``"join"``, and ``"aggregation"``, each a
-            deduplicated list of the ``ColumnRef``s referenced in that clause kind.
+            deduplicated list of the ``ColumnRef``s referenced in that clause kind, plus
+            ``"pairs"``: the ``(left, right)`` physical column pairs of every ``JOIN ON``
+            equality whose two sides each resolve to exactly one physical column (the
+            observations behind ``WorkerResult.join_conditions``).
         """
-        result: dict[str, list[ColumnRef]] = {"filter": [], "join": [], "aggregation": []}
+        result: dict[str, list] = {"filter": [], "join": [], "aggregation": [], "pairs": []}
         for scope in traverse_scope(qualified):
             query = scope.expression
             if not isinstance(query, exp.Select):
@@ -1333,32 +1387,52 @@ class SqlWorker:
                 if clause is None:
                     continue
                 for col in walk_in_scope(clause):
-                    if not isinstance(col, exp.Column):
+                    if isinstance(col, exp.Column):
+                        result[kind].extend(self._resolve_column(col, scope, norm, dialect))
+                if kind != "join":
+                    continue
+                for eq in walk_in_scope(clause):
+                    if not (
+                        isinstance(eq, exp.EQ)
+                        and isinstance(eq.this, exp.Column)
+                        and isinstance(eq.expression, exp.Column)
+                    ):
                         continue
-                    source = scope.sources.get(col.table)
-                    if isinstance(source, exp.Table):
-                        result[kind].append(
-                            ColumnRef(
-                                dataset_id=norm(_table_name(source)),
-                                name=col.name,
-                            )
-                        )
-                    elif isinstance(source, Scope):
-                        node = sqlglot_lineage(
-                            exp.column(col.name, quoted=True),
-                            source.expression,
-                            scope=source,
-                            dialect=dialect,
-                        )
-                        for leaf in node.walk():
-                            if not leaf.downstream and isinstance(leaf.source, exp.Table):
-                                result[kind].append(
-                                    ColumnRef(
-                                        dataset_id=norm(_table_name(leaf.source)),
-                                        name=exp.to_column(leaf.name).name,
-                                    )
-                                )
-        return {k: _dedup(v) for k, v in result.items()}
+                    left = self._resolve_column(eq.this, scope, norm, dialect)
+                    right = self._resolve_column(eq.expression, scope, norm, dialect)
+                    if len(left) == 1 and len(right) == 1:
+                        result["pairs"].append((left[0], right[0]))
+        return {k: (_dedup(v) if k != "pairs" else v) for k, v in result.items()}
+
+    def _resolve_column(self, col: exp.Column, scope: Scope, norm, dialect) -> list[ColumnRef]:
+        """Resolve one qualified column reference to the physical table columns behind it.
+
+        Args:
+            col: A column node inside ``scope`` whose ``table`` names one of the scope's
+                sources.
+            scope: The sqlglot scope the column appears in.
+            norm: Callable normalising a raw table name to a canonical dataset id.
+            dialect: sqlglot dialect used for the nested ``lineage`` call through a
+                subquery or CTE source.
+
+        Returns:
+            One ``ColumnRef`` when the column belongs to a real table; the leaf table
+            columns when it belongs to a subquery/CTE scope; empty when it cannot be tied
+            to any source.
+        """
+        source = scope.sources.get(col.table)
+        if isinstance(source, exp.Table):
+            return [ColumnRef(dataset_id=norm(_table_name(source)), name=col.name)]
+        if not isinstance(source, Scope):
+            return []
+        node = sqlglot_lineage(
+            exp.column(col.name, quoted=True), source.expression, scope=source, dialect=dialect
+        )
+        return [
+            ColumnRef(dataset_id=norm(_table_name(leaf.source)), name=exp.to_column(leaf.name).name)
+            for leaf in node.walk()
+            if not leaf.downstream and isinstance(leaf.source, exp.Table)
+        ]
 
 
 def _dedup(refs: Iterable[ColumnRef]) -> list[ColumnRef]:
