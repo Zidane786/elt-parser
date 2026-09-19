@@ -13,6 +13,13 @@ from openlineage.client.serde import Serde
 from etl_parser.export.openlineage_out import PRODUCER, export_openlineage
 from etl_parser.graph.builder import LineageGraph, build_graph
 from etl_parser.graph.impact import downstream
+from etl_parser.identity import (
+    agent_table_name,
+    dataset_ref_from_id,
+    is_unresolved_dataset_id,
+    normalize_dataset_id,
+    split_dataset_id,
+)
 from etl_parser.models import (
     ColumnEdge,
     ColumnRef,
@@ -20,6 +27,7 @@ from etl_parser.models import (
     Job,
     LineageDocument,
     Provenance,
+    Schedule,
     TableEdge,
     WorkerResult,
 )
@@ -322,6 +330,65 @@ def test_registry_matches_engine_families_to_schemes(tmp_path):
     # An undeclared engine still matches any scheme, so existing product.yaml keeps working.
     assert registry.product_for_database("anything", "glue").code == "p"
     assert registry.product_for_database("anything", "s3").code == "p"
+
+
+def test_empty_and_schemeless_dataset_ids_never_raise():
+    """Finding 27: degenerate identifiers return a sentinel instead of raising."""
+    assert normalize_dataset_id("") == "unknown://unresolved/empty"
+    assert normalize_dataset_id(".") == "unknown://unresolved/empty"
+    assert normalize_dataset_id("   ", engine="spark") == "unknown://unresolved/empty"
+    assert normalize_dataset_id("db.", engine="spark") == "glue://default/db"
+    assert split_dataset_id("no-scheme") == ("unknown", "unresolved", "no-scheme")
+    assert split_dataset_id("") == ("unknown", "unresolved", "")
+    assert dataset_ref_from_id("no-scheme").namespace == "unknown://unresolved"
+    assert agent_table_name("no-scheme") == "unresolved.no-scheme"
+    assert is_unresolved_dataset_id("unknown://unresolved/empty")
+    assert not is_unresolved_dataset_id("glue://db/t")
+
+
+def test_unresolved_dataset_ids_reach_the_document_as_notes():
+    """Finding 27: a call site that could not name a dataset is reported, not dropped."""
+    result = WorkerResult(
+        jobs=[
+            Job(
+                id="job",
+                name="job",
+                source_file="job.py",
+                inputs=[normalize_dataset_id("")],
+                outputs=["glue://db/t"],
+            )
+        ]
+    )
+    doc = build_graph([result]).document
+    note = next(u for u in doc.unresolved if u.kind == "analysis_note")
+    assert "unknown://unresolved/empty" in note.reason
+
+
+def test_conflicting_aliases_are_a_note_not_unsupported_syntax():
+    """Finding 30/plan: a conflicting alias is an analysis note, and never gates a scan."""
+    shared = "s3://bucket/shared/"
+    result = WorkerResult(
+        datasets=[
+            DatasetRef(id="glue://db/a", namespace="glue://db", name="a", aliases=[shared]),
+            DatasetRef(id="glue://db/b", namespace="glue://db", name="b", aliases=[shared]),
+        ]
+    )
+    doc = build_graph([result]).document
+    note = next(u for u in doc.unresolved if "Conflicting dataset alias" in u.reason)
+    assert note.kind == "analysis_note"
+    assert not [u for u in doc.unresolved if u.kind == "unsupported_syntax"]
+
+
+def test_orchestrator_cycles_are_a_note_not_unsupported_syntax():
+    """Plan: a task-graph cycle is reported without failing the scan."""
+    schedules = {
+        "one": Schedule(id="one", orchestrator="airflow", declared_upstream=["two"]),
+        "two": Schedule(id="two", orchestrator="airflow", declared_upstream=["one"]),
+    }
+    doc = build_graph([WorkerResult(schedules=schedules)]).document
+    note = next(u for u in doc.unresolved if "cycle" in u.reason)
+    assert note.kind == "analysis_note"
+    assert not [u for u in doc.unresolved if u.kind == "unsupported_syntax"]
 
 
 def _cross_product_document():

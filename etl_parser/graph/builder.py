@@ -14,7 +14,7 @@ from collections import defaultdict
 
 import networkx as nx
 
-from etl_parser.identity import DatasetRegistry, split_dataset_id
+from etl_parser.identity import DatasetRegistry, is_unresolved_dataset_id, split_dataset_id
 from etl_parser.models import (
     JobDependency,
     LineageDocument,
@@ -130,9 +130,10 @@ def build_graph(
         if len(owners) == 1:
             datasets.merge_alias(alias, next(iter(owners)))
         else:
+            # A shared alias is ambiguous, not unparseable: it must not gate a scan.
             combined.unresolved.append(
                 Unresolved(
-                    kind="unsupported_syntax",
+                    kind="analysis_note",
                     reason=f"Conflicting dataset alias {alias}: {sorted(owners)}",
                     remediation="Declare one canonical dataset for this alias.",
                 )
@@ -164,6 +165,17 @@ def build_graph(
         for ident in job.inputs + job.outputs:
             datasets.get_or_create(ident)
     refs = datasets.all()
+    # Identity helpers return a sentinel rather than raising on a reference they cannot
+    # name (finding 27); the graph records that here instead of shipping a fake dataset.
+    for ref in refs:
+        if is_unresolved_dataset_id(ref.id):
+            combined.unresolved.append(
+                Unresolved(
+                    kind="analysis_note",
+                    reason=f"Dataset reference could not be resolved to a name: {ref.id}",
+                    remediation="Name the table or path at the call site, or bind it.",
+                )
+            )
     schedules = dict(combined.schedules)
     if registry:
         registry.resolve_dependencies()
@@ -330,8 +342,13 @@ def build_graph(
             for root in roots:
                 task_graph.add_edge(root.id, schedule.id)
     if not nx.is_directed_acyclic_graph(task_graph):
+        # The DAG is the author's, not a parse failure: report it without gating the scan.
         combined.unresolved.append(
-            Unresolved(kind="unsupported_syntax", reason="Orchestrator task graph contains a cycle")
+            Unresolved(
+                kind="analysis_note",
+                reason="Orchestrator task graph contains a cycle",
+                remediation="Check the task dependencies the orchestrator file declares.",
+            )
         )
     for task, job in combined.task_jobs.items():
         if not job or task not in task_graph:
