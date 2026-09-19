@@ -154,6 +154,94 @@ def test_ai_only_document_marks_every_job_and_dataset_as_ai(tmp_path):
     assert all(d.origin == "ai" and d.provenance for d in result.ai_document.datasets)
 
 
+def catalog_table(catalog, dataset_id):
+    """Return one catalog table dict by dataset id."""
+    return next(
+        t for d in catalog["databases"] for t in d["tables"] if t.get("dataset_id") == dataset_id
+    )
+
+
+def with_table_description(*args, text="One row per source row.", confidence=0.8):
+    """Add a table-level description proposal to the standard column response."""
+    payload = json.loads(proposal_response(*args, confidence=confidence).content[0]["text"])
+    payload["table_descriptions"] = [
+        {
+            "dataset_id": "glue://db/t",
+            "description": text,
+            "confidence": confidence,
+            "rationale": "Summarised from the columns written here",
+        }
+    ]
+    return text_response(json.dumps(payload))
+
+
+def test_table_description_is_generated_alongside_its_columns(tmp_path):
+    source = tmp_path / "job.sql"
+    source.write_text("CREATE TABLE db.t AS SELECT x FROM db.s")
+    runner = FakeLLMRunner([with_table_description])
+    result = analyze(
+        source, runner=runner, config=AnalysisConfig(descriptions=True, model="test-model")
+    )
+    assert len(runner.calls) == 1
+    payload = json.loads(runner.calls[0]["messages"][0].content)
+    assert payload["table_description_targets"] == ["glue://db/t"]
+    assert payload["target_column_facts"]
+    table = catalog_table(result.catalog, "glue://db/t")
+    assert table["description"] == "One row per source row."
+    assert table["description_source"] == "ai"
+    assert table["ai_confidence"] == 0.8
+    assert table["ai_model"] == "test-model"
+
+
+def test_low_confidence_table_description_is_not_written(tmp_path):
+    source = tmp_path / "job.sql"
+    source.write_text("CREATE TABLE db.t AS SELECT x FROM db.s")
+    result = analyze(
+        source,
+        runner=FakeLLMRunner([lambda *args: with_table_description(*args, confidence=0.1)]),
+        config=AnalysisConfig(descriptions=True, model="test", min_ai_confidence=0.5),
+    )
+    assert not catalog_table(result.catalog, "glue://db/t")["description"]
+
+
+def test_human_text_survives_override_but_generated_text_does_not(tmp_path):
+    source = tmp_path / "job.sql"
+    source.write_text("CREATE TABLE db.t AS SELECT x FROM db.s")
+    prior = analyze(source).catalog
+    table = catalog_table(prior, "glue://db/t")
+    table.update(description="Human table text", description_source="human")
+    column = catalog_column(prior, "glue://db/t", "x")
+    column.update(description="Older model text", description_source="ai")
+    result = analyze(
+        source,
+        prior=prior,
+        runner=FakeLLMRunner([with_table_description]),
+        config=AnalysisConfig(descriptions=True, model="test-model", override_existing=True),
+    )
+    regenerated = catalog_column(result.catalog, "glue://db/t", "x")
+    assert regenerated["description"] == "The source value carried through unchanged."
+    assert regenerated["ai_model"] == "test-model"
+    assert catalog_table(result.catalog, "glue://db/t")["description"] == "Human table text"
+
+
+def test_existing_generated_text_is_kept_without_override(tmp_path):
+    source = tmp_path / "job.sql"
+    source.write_text("CREATE TABLE db.t AS SELECT x FROM db.s")
+    prior = analyze(source).catalog
+    catalog_column(prior, "glue://db/t", "x").update(
+        description="Older model text", description_source="ai"
+    )
+    runner = FakeLLMRunner([])
+    result = analyze(
+        source,
+        prior=prior,
+        runner=runner,
+        config=AnalysisConfig(descriptions=True, model="test"),
+    )
+    assert not runner.calls
+    assert catalog_column(result.catalog, "glue://db/t", "x")["description"] == "Older model text"
+
+
 def test_missing_provider_configuration_raises_before_any_file(tmp_path):
     from etl_parser.ai_analysis import AnalysisPolicyError
 
