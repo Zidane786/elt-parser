@@ -140,7 +140,25 @@ def test_legacy_describe_uses_anthropic_without_lambda_and_closes(monkeypatch, t
     def handler(request):
         calls.append(request)
         assert "x-duke-mode" not in request.headers
-        return response('{"description":"Twice the source value"}')
+        return response(
+            json.dumps(
+                {
+                    "columns": [
+                        {
+                            "name": "doubled",
+                            "description": "Twice the source value",
+                            "confidence": 0.8,
+                            "rationale": "The expression multiplies the source by two",
+                        }
+                    ],
+                    "table": {
+                        "description": "One row per source row, with doubled values",
+                        "confidence": 0.7,
+                        "rationale": "Built from a single select over the source table",
+                    },
+                }
+            )
+        )
 
     clients = install_transport(monkeypatch, handler)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "PRIVATE_KEY")
