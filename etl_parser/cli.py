@@ -3,10 +3,14 @@
 Typer app with commands ``run`` (deterministic lineage plus optional, explicitly enabled AI
 work), ``scan`` (deterministic lineage only), ``export catalog``/``export openlineage``,
 ``impact``, ``products``, and ``describe`` (AI column descriptions). Each command's
-docstring is also its ``--help`` text. Exit code is non-zero when a scan finds an
-``unsupported_syntax`` unresolved item, or when ``--strict`` is set on ``run`` and any
-unresolved items, warnings, or a non-success run status remain, so CI can gate on parser
-coverage.
+docstring is also its ``--help`` text.
+
+Exit codes come from :func:`etl_parser.pipeline.exit_code`: ``1`` when an
+``unsupported_syntax`` unresolved item remains (informational kinds never gate) or when
+``--strict`` is set on ``run`` and unresolved items, warnings or a non-success run status
+remain, and ``2`` for a usage error or an AI stage that failed provider
+authentication/authorization. CI can therefore gate on parser coverage without failing on
+heuristic notes.
 """
 
 from __future__ import annotations
