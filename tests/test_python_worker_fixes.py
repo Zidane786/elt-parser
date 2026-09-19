@@ -71,3 +71,45 @@ def test_analyze_file_outside_index_root_is_not_an_error(tmp_path):
     result = PythonWorker(index=index).analyze_file(outside)
     assert [j.source_file for j in result.jobs] == [str(outside)]
     assert result.jobs[0].inputs == ["glue://a/b"]
+
+
+FAKE_NAMES = {"{{?}}", "*", ""}
+
+
+def names_in(doc):
+    """Return every column name that appears on either end of a column edge."""
+    refs = [r for e in doc.column_edges for r in [*e.sources, *e.indirect_sources]]
+    return {e.target.name for e in doc.column_edges} | {r.name for r in refs}
+
+
+def test_unresolved_column_name_is_a_diagnostic_not_an_edge(tmp_path):
+    doc = run(
+        tmp_path,
+        'from pyspark.sql import functions as F\ndf = spark.table("a.b")\n'
+        'df.withColumn(name_var, F.lit(1)).write.saveAsTable("a.t")\n',
+    )
+    assert not names_in(doc) & FAKE_NAMES
+    assert any(u.kind == "unknown_column" for u in doc.unresolved)
+
+
+def test_select_star_expression_keeps_known_columns_not_a_star_column(tmp_path):
+    doc = run(
+        tmp_path,
+        'df = spark.table("a.b")\ndf.selectExpr("*").write.saveAsTable("a.t")\n',
+        schema={"a": {"b": ["id", "amount"]}},
+    )
+    assert not names_in(doc) & FAKE_NAMES
+    assert {e.target.name for e in doc.column_edges} == {"id", "amount"}
+
+
+def test_positional_union_with_open_right_frame_reports_unknown_column(tmp_path):
+    doc = run(
+        tmp_path,
+        'a = spark.table("x.a").select("id")\nb = spark.table("x.b")\n'
+        'a.union(b).write.saveAsTable("x.t")\n',
+    )
+    assert not names_in(doc) & FAKE_NAMES
+    assert any(u.kind == "unknown_column" for u in doc.unresolved)
+    edge = next(e for e in doc.column_edges if e.target.dataset_id == "glue://x/t")
+    assert origin(edge) == {("glue://x/a", "id")}
+    assert edge.provenance.confidence == "partial"

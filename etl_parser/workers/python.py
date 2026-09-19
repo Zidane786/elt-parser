@@ -72,6 +72,23 @@ def unparse(node) -> str:
     return ast.unparse(node)
 
 
+def resolvable_column(name) -> bool:
+    """Whether a tracked column name is a real name rather than an analyzer placeholder.
+
+    ``{{?}}`` (an unfolded runtime value), ``*`` (an unexpanded star) and the empty string
+    are artefacts of analysis, not columns; an edge naming one would be wrong rather than
+    incomplete, so callers record an ``unknown_column`` item instead (review finding 18).
+
+    Args:
+        name: The candidate column name.
+
+    Returns:
+        bool: ``True`` when ``name`` is a non-blank string that is neither a placeholder
+        nor a bare star.
+    """
+    return isinstance(name, str) and bool(name.strip()) and name != "*" and "{{" not in name
+
+
 @dataclass
 class Column:
     """A single tracked DataFrame column's provenance, as understood so far.
@@ -887,8 +904,17 @@ class PythonWorker:
             if frame.open_columns:
                 issue(node, "Output contains columns requiring an input schema", "missing_schema")
             for name, column in frame.columns.items():
-                confidence = "partial" if partial or column.partial else "exact"
-                if column.partial:
+                if not resolvable_column(name):
+                    # A placeholder is not a column name; report it instead of inventing one.
+                    issue(node, f"Output column name is unresolved: {name!r}", "unknown_column")
+                    continue
+                sources = sorted(s for s in column.sources if resolvable_column(s[1]))
+                indirect = sorted(
+                    s for s in frame.indirect | column.indirect if resolvable_column(s[1])
+                )
+                unnamed = len(sources) != len(column.sources)
+                confidence = "partial" if partial or column.partial or unnamed else "exact"
+                if column.partial or unnamed:
                     issue(
                         node,
                         f"Output {name!r} contains unresolved columns or unsupported expressions",
@@ -897,13 +923,8 @@ class PythonWorker:
                 result.column_edges.append(
                     ColumnEdge(
                         target=ColumnRef(dataset_id=ds, name=name),
-                        sources=[
-                            ColumnRef(dataset_id=d, name=c) for d, c in sorted(column.sources)
-                        ],
-                        indirect_sources=[
-                            ColumnRef(dataset_id=d, name=c)
-                            for d, c in sorted(frame.indirect | column.indirect)
-                        ],
+                        sources=[ColumnRef(dataset_id=d, name=c) for d, c in sources],
+                        indirect_sources=[ColumnRef(dataset_id=d, name=c) for d, c in indirect],
                         transformation=Transformation(
                             expression=column.text,
                             kind=column.kind,
@@ -1160,13 +1181,27 @@ class PythonWorker:
                             import sqlglot
 
                             expr = sqlglot.parse_one(text, read="spark")
+                            if isinstance(expr, sqlglot.exp.Star):
+                                # "*" is every known column, not a column named "*".
+                                out.columns.update(copy.deepcopy(receiver.columns))
+                                out.open_columns |= receiver.open_columns
+                                continue
                             value = sql_expression(ast.Constant(expr.unalias().sql()), receiver)
-                            out.columns[expr.alias_or_name] = value
+                            if resolvable_column(expr.alias_or_name):
+                                out.columns[expr.alias_or_name] = value
+                            else:
+                                out.partial = True
+                                issue(arg, "Cannot determine output column name", "unknown_column")
                     else:
                         out = select_frame(receiver, node.args)
                 elif method in {"withColumn", "with_columns", "assign"}:
                     if method == "withColumn":
-                        out.columns[folded(node.args[0]).text] = col_expr(node.args[1], receiver)
+                        name = folded(node.args[0]).text
+                        if resolvable_column(name):
+                            out.columns[name] = col_expr(node.args[1], receiver)
+                        else:
+                            out.partial = True
+                            issue(node, "Cannot determine output column name", "unknown_column")
                     elif method == "assign":
                         for key, value in keywords.items():
                             if isinstance(value, ast.Lambda):
@@ -1325,18 +1360,26 @@ class PythonWorker:
                         out.partial |= right.partial
                         out.open_columns |= right.open_columns
                         for position, key in enumerate(list(out.columns)):
-                            right_key = (
-                                key
-                                if method != "union"
-                                else (
-                                    list(right.columns)[position]
-                                    if position < len(right.columns)
-                                    else ""
-                                )
-                            )
+                            right_key = key
+                            if method == "union":
+                                # Positional union: the right frame's column list must be
+                                # known, or the branch's contribution cannot be named.
+                                if position >= len(right.columns):
+                                    out.columns[key].partial = True
+                                    issue(
+                                        node,
+                                        f"Union branch has no column matching position "
+                                        f"{position} for {key!r}",
+                                        "unknown_column",
+                                    )
+                                    continue
+                                right_key = list(right.columns)[position]
                             col = right.column(right_key)
                             out.columns[key].sources |= col.sources
                             out.columns[key].partial |= col.partial
+                            out.columns[key].indirect |= col.indirect
+                            if method == "unionByName" and col.kind != out.columns[key].kind:
+                                out.columns[key].kind = "expression"
                         if method == "unionByName":
                             for key in right.columns.keys() - out.columns.keys():
                                 out.columns[key] = right.columns[key]
