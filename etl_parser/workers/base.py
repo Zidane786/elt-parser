@@ -17,6 +17,7 @@ from etl_parser.models import Schedule
 
 HEADER_KEYS = {"source", "target", "owner", "grain", "schedule", "dependencies", "description"}
 _HEADER_LINE = re.compile(r"^\s*(?:--|#)?\s*(?P<key>[A-Za-z][A-Za-z _]*):\s*(?P<value>.+?)\s*$")
+_TRAILING_COMMENT = re.compile(r"\s+--.*$")
 
 CRON_PRESETS = {
     "@once": None,
@@ -77,7 +78,8 @@ def parse_header(text: str) -> dict[str, str]:
             continue
         key = m.group("key").strip().lower()
         if key in HEADER_KEYS and key not in out:
-            out[key] = m.group("value").strip()
+            # ``Schedule: 0 5 1 * *  -- monthly``: the trailing comment is not the value.
+            out[key] = _TRAILING_COMMENT.sub("", m.group("value")).strip()
     return out
 
 
@@ -227,6 +229,39 @@ def repo_relative(path: Path, root: Path | None) -> str:
         return str(path.resolve().relative_to(root.resolve())) if root else str(path)
     except ValueError:
         return str(path)
+
+
+def sql_line_offset(node: ast.AST | None) -> int:
+    """Return the ``line_offset`` to pass to ``SqlWorker.analyze`` for embedded SQL.
+
+    ``SqlWorker`` reports line ``line_offset + n`` for the ``n``-th line of the SQL text,
+    so the offset must be the line *before* the one where the SQL text itself starts.
+    Anchoring to the string constant rather than the enclosing call (review finding 15)
+    keeps reported lines exact for multi-line ``query=\"\"\"...\"\"\"`` arguments. The
+    helper descends to the leftmost string-bearing leaf: the receiver of a method call
+    such as ``"...".format(...)``/``.strip()``, the left operand of ``+`` concatenation,
+    and a parenthesised implicit concatenation (already one ``Constant`` in the AST).
+
+    Both ``AirflowWorker`` and ``PythonWorker`` embed SQL from AST string nodes; the
+    Python worker can adopt this helper in place of ``call.lineno - 1``.
+
+    Args:
+        node: The AST expression that carries the SQL text (a ``Constant``, ``JoinedStr``,
+            ``BinOp``, ``Call`` on a string, or a ``Name`` referring to one), or ``None``.
+
+    Returns:
+        ``node.lineno - 1`` for the leftmost string-bearing leaf, or ``0`` when ``node`` is
+        ``None`` or carries no line information.
+    """
+    while node is not None:
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            node = node.func.value
+        elif isinstance(node, ast.BinOp):
+            node = node.left
+        else:
+            break
+    lineno = getattr(node, "lineno", None)
+    return lineno - 1 if isinstance(lineno, int) and lineno > 0 else 0
 
 
 def job_id_for(path: Path, root: Path | None) -> str:
