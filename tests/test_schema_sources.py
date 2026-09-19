@@ -473,6 +473,37 @@ def test_postgres_never_leaks_dsn(monkeypatch):
         PostgresSchemaSource().catalog()
 
 
+def test_no_credentials_reach_any_serialized_output(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from etl_parser.schema import write_schema_catalog
+    from etl_parser.schema.postgres import PostgresSchemaSource
+    from etl_parser.schema.redshift import RedshiftSchemaSource
+
+    monkeypatch.setenv("PGPASSWORD", SECRET)
+    monkeypatch.setenv("REDSHIFT_PASSWORD", SECRET)
+    sources = [
+        PostgresSchemaSource(
+            f"postgresql://user:{SECRET}@db.example.internal/app",
+            connection=FakeConnection(PG_ROWS),
+        ),
+        RedshiftSchemaSource(
+            f"redshift://user:{SECRET}@cluster.example.internal/dw",
+            connection=FakeConnection(RS_ROWS),
+        ),
+    ]
+    out = tmp_path / "catalog.json"
+    with caplog.at_level(logging.DEBUG):
+        catalog = write_schema_catalog(sources, out)
+    for source in sources:
+        assert SECRET not in json.dumps(source.catalog())
+        assert SECRET not in json.dumps(source.relations())
+        assert SECRET not in repr(source) and SECRET not in str(vars(source))
+    assert SECRET not in json.dumps(catalog)
+    assert SECRET not in out.read_text()
+    assert SECRET not in caplog.text
+
+
 def test_postgres_missing_driver_names_extra(monkeypatch):
     import builtins
 
@@ -792,6 +823,31 @@ def test_scan_cli_glue_uses_profile_region_and_schema_from_code(tmp_path, monkey
     )
     assert result.exit_code == 0, result.output
     assert built == {"profile": "example-profile", "region": "eu-west-1"}
+
+
+def test_run_cli_threads_schema_from_code_to_the_exporter(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    import etl_parser.sdk as sdk
+    from etl_parser.cli import app
+
+    seen = {}
+    original = sdk.apply_export_options
+
+    def record(result, **kwargs):
+        seen.update(kwargs)
+        return original(result, **kwargs)
+
+    monkeypatch.setattr(sdk, "apply_export_options", record)
+    monkeypatch.setattr("etl_parser.cli.apply_export_options", record)
+    (tmp_path / "job.sql").write_text("CREATE TABLE db.t AS SELECT x FROM db.s")
+    result = CliRunner().invoke(
+        app,
+        ["run", str(tmp_path), "--out-dir", str(tmp_path / "artifacts"), "--schema-from-code"],
+    )
+    assert result.exit_code == 0, result.output
+    assert seen["include_code_schema"] is True
+    assert seen["prior"] is None and seen["schema"] is None
 
 
 # ---------------------------------------------------------------- SDK surface
