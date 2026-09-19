@@ -1281,6 +1281,9 @@ class PythonWorker:
                     if resolved is not None:
                         reader.options[key] = ast.Constant(resolved)
                 return reader
+            if isinstance(receiver, Connection) and method in {"cursor", "connect", "begin"}:
+                # A cursor speaks its connection's dialect (review finding 34).
+                return receiver
             if isinstance(receiver, Column):
                 return col_expr(node, Frame())
             if isinstance(receiver, Frame) and method not in {
@@ -1589,6 +1592,14 @@ class PythonWorker:
                 sink = writer if writer and writer.direction == "write" else sink
             if method in {"load", "save"} and not isinstance(receiver, (Reader, Frame)):
                 sink = None
+            if (
+                sink
+                and sink.callee in {"execute", "executemany"}
+                and not isinstance(receiver, Connection)
+            ):
+                # Any object can have an "execute" method; only a connection or cursor
+                # makes its first argument SQL (review finding 32).
+                sink = None
             if sink:
                 arg = (
                     node.args[sink.arg]
@@ -1631,6 +1642,9 @@ class PythonWorker:
                         if len(node.args) > 1
                         else evaluate(keywords.get("con") or keywords.get("connection"))
                     )
+                    if not isinstance(connection, Connection) and isinstance(receiver, Connection):
+                        # conn.cursor().execute(...): the receiver carries the dialect.
+                        connection = receiver
                     engine = (
                         connection.engine if isinstance(connection, Connection) else default_engine
                     )

@@ -151,9 +151,12 @@ SINKS: list[SinkSpec] = [
     # --- DB-API / SQLAlchemy / PyAthena --------------------------------------
     SinkSpec("cursor.execute", "sql", 0, "sql", "unknown", None, alt_arg="operation"),
     SinkSpec("cur.execute", "sql", 0, "sql", "unknown", None, alt_arg="operation"),
+    # Bare "execute"/"executemany" only count on a tracked connection or cursor; the
+    # worker guards them, since any object may have a method by that name.
     SinkSpec("execute", "sql", 0, "sql", "unknown", None),
     SinkSpec("executemany", "sql", 0, "sql", "unknown", None),
-    SinkSpec("text", "sql", 0, "sql", "unknown", None),
+    # Qualified by its import, so a scraped document's ".text" is not SQL.
+    SinkSpec("sqlalchemy.text", "sql", 0, "sql", "unknown", None),
 ]
 
 # Engine implied by a connection URL / client prefix seen in the same file.

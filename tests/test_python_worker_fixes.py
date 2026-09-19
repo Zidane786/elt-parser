@@ -243,6 +243,44 @@ def test_spark_imports_set_language_engine_and_parser(tmp_path, header):
     assert {e.provenance.parser for e in doc.column_edges} == {"spark_static"}
 
 
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        'import json\nwith open("f") as fh:\n    data = json.load(fh)',
+        'import numpy as np\nnp.save("out.npy", rows)',
+        "text = soup.text\nbody = soup.text()",
+        'pool.execute("not sql at all")',
+    ],
+)
+def test_bare_io_suffixes_do_not_match_unrelated_calls(tmp_path, snippet):
+    doc = run(tmp_path, snippet + "\n")
+    assert doc.jobs[0].inputs == [] and doc.jobs[0].outputs == []
+    unwanted = {"dynamic_sql", "dynamic_path", "dynamic_table_name"}
+    assert not [u for u in doc.unresolved if u.kind in unwanted]
+
+
+def test_cursor_execute_still_analyzed_and_inherits_the_connection_dialect(tmp_path):
+    doc = run(
+        tmp_path,
+        "import psycopg2\n"
+        'conn = psycopg2.connect("postgresql://etl@host:5432/warehouse")\n'
+        "cur = conn.cursor()\n"
+        'cur.execute("INSERT INTO shop.target SELECT id FROM shop.source")\n',
+    )
+    job = doc.jobs[0]
+    assert job.inputs == ["postgres://shop/source"] and job.outputs == ["postgres://shop/target"]
+    assert {e.provenance.dialect for e in doc.column_edges} == {"postgres"}
+
+
+def test_sqlalchemy_text_is_matched_through_its_import(tmp_path):
+    doc = run(
+        tmp_path,
+        "from sqlalchemy import text\n"
+        'statement = text("INSERT INTO shop.target SELECT id FROM shop.source")\n',
+    )
+    assert doc.jobs[0].outputs == ["table://shop/target"]
+
+
 def test_spark_static_worker_stamps_spark_without_an_import(tmp_path):
     from etl_parser.scanner.repo import SourceFile
     from etl_parser.workers.spark_static import SparkStaticWorker
