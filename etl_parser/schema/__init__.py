@@ -1,0 +1,17 @@
+"""Source-of-truth schema fetchers: Glue, Postgres and Redshift, plus catalog merging.
+
+Importing this package pulls in no driver or AWS SDK; each source imports its transport
+lazily on first use, so ``import etl_parser.schema`` is safe in environments without
+``boto3``, ``psycopg`` or ``redshift_connector`` installed.
+"""
+
+from etl_parser.schema.base import SchemaSource, SchemaSourceError, as_schema_provider
+from etl_parser.schema.glue import GlueSchemaProvider, GlueSchemaSource
+
+__all__ = [
+    "GlueSchemaProvider",
+    "GlueSchemaSource",
+    "SchemaSource",
+    "SchemaSourceError",
+    "as_schema_provider",
+]
