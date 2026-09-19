@@ -113,3 +113,53 @@ def test_positional_union_with_open_right_frame_reports_unknown_column(tmp_path)
     edge = next(e for e in doc.column_edges if e.target.dataset_id == "glue://x/t")
     assert origin(edge) == {("glue://x/a", "id")}
     assert edge.provenance.confidence == "partial"
+
+
+@pytest.mark.parametrize(
+    ("snippet", "expected"),
+    [
+        ('process(spark.table("a.b"))', {"glue://a/b"}),
+        ('frames = []\nframes.append(spark.table("a.b"))', {"glue://a/b"}),
+        ('for row in spark.table("a.b").collect():\n    print(row)', {"glue://a/b"}),
+        ('a, b = spark.table("x.a"), spark.table("x.b")', {"glue://x/a", "glue://x/b"}),
+        (
+            'try:\n    spark.table("t.body")\nexcept ValueError:\n    spark.table("t.handler")\n'
+            'else:\n    spark.table("t.orelse")\nfinally:\n    spark.table("t.final")',
+            {"glue://t/body", "glue://t/handler", "glue://t/orelse", "glue://t/final"},
+        ),
+        (
+            'match mode:\n    case "a":\n        spark.table("m.a")\n'
+            '    case _:\n        spark.table("m.b")',
+            {"glue://m/a", "glue://m/b"},
+        ),
+        ('class Config:\n    source = spark.table("a.b")', {"glue://a/b"}),
+        ('if (df := spark.table("a.b")).count():\n    print(df)', {"glue://a/b"}),
+    ],
+)
+def test_reads_in_unevaluated_positions_reach_inputs(tmp_path, snippet, expected):
+    doc = run(tmp_path, snippet + "\n")
+    assert set(doc.jobs[0].inputs) >= expected
+
+
+def test_augmented_string_assignment_does_not_fabricate_a_table(tmp_path):
+    doc = run(tmp_path, 't = "a."\nt += "b"\nspark.table(t).write.saveAsTable("a.t")\n')
+    assert "glue://default/a" not in doc.jobs[0].inputs
+    assert doc.jobs[0].inputs == ["glue://a/b"] or any(
+        u.kind == "dynamic_table_name" for u in doc.unresolved
+    )
+
+
+def test_return_nested_in_a_branch_is_not_discarded(tmp_path):
+    (tmp_path / "helpers.py").write_text(
+        "def load(cond):\n"
+        '    if cond:\n        return spark.table("a.a")\n'
+        '    return spark.table("a.b")\n'
+    )
+    doc = run(
+        tmp_path,
+        'from helpers import load\nload(flag).select("id").write.saveAsTable("a.t")\n',
+    )
+    assert set(doc.jobs[0].inputs) == {"glue://a/a", "glue://a/b"}
+    edge = next(e for e in doc.column_edges if e.target.dataset_id == "glue://a/t")
+    assert origin(edge) == {("glue://a/a", "id"), ("glue://a/b", "id")}
+    assert edge.provenance.confidence == "inferred"

@@ -72,6 +72,58 @@ def unparse(node) -> str:
     return ast.unparse(node)
 
 
+NO_RETURN = object()
+"""Sentinel for "no ``return`` was reached", distinct from a ``return None``."""
+
+
+def merge_returns(first, second):
+    """Combine the values two paths through a function can produce.
+
+    A ``return`` inside an ``if``/``for``/``with`` does not end the analysis: the function
+    may still fall through to a later ``return``, so both outcomes have to survive (review
+    finding 20). Two frames merge into one frame carrying every branch's sources, marked
+    ``inferred`` because only one of them runs at a time (design spec section 13).
+
+    Args:
+        first: The value of the earlier path, or :data:`NO_RETURN`.
+        second: The value of the later path, or :data:`NO_RETURN`.
+
+    Returns:
+        The merged :class:`Frame` when both paths return frames, the single returned value
+        when only one path returns, otherwise the later path's value.
+    """
+    if first is NO_RETURN:
+        return second
+    if second is NO_RETURN:
+        return first
+    if not isinstance(first, Frame) or not isinstance(second, Frame):
+        return first if isinstance(first, Frame) else second
+    merged = copy.deepcopy(first)
+    merged.sources |= second.sources
+    merged.indirect |= second.indirect
+    merged.aliases.update(second.aliases)
+    merged.partial |= second.partial
+    merged.open_columns |= second.open_columns
+    merged.inferred = True
+    merged.parallel_sources = (
+        first.parallel_sources
+        or second.parallel_sources
+        # With no schema on either side, an unknown column may come from either branch.
+        or (first.open_columns and second.open_columns)
+    )
+    for key, column in second.columns.items():
+        if key in merged.columns:
+            merged.columns[key].sources |= column.sources
+            merged.columns[key].indirect |= column.indirect
+            merged.columns[key].partial |= column.partial
+        else:
+            merged.columns[key] = copy.deepcopy(column)
+    for key, column in merged.columns.items():
+        # A column only one branch produces is not guaranteed to be there.
+        column.partial |= key not in first.columns or key not in second.columns
+    return merged
+
+
 def resolvable_column(name) -> bool:
     """Whether a tracked column name is a real name rather than an analyzer placeholder.
 
@@ -913,7 +965,13 @@ class PythonWorker:
                     s for s in frame.indirect | column.indirect if resolvable_column(s[1])
                 )
                 unnamed = len(sources) != len(column.sources)
-                confidence = "partial" if partial or column.partial or unnamed else "exact"
+                confidence = (
+                    "partial"
+                    if partial or column.partial or unnamed
+                    else "inferred"
+                    if frame.inferred
+                    else "exact"
+                )
                 if column.partial or unnamed:
                     issue(
                         node,
@@ -980,7 +1038,12 @@ class PythonWorker:
             active.add(key)
             invoked.add(key)
             try:
-                return statements(function.body)
+                returned = statements(function.body)
+                if isinstance(returned, Frame):
+                    # A frame that reached here came through a helper call: a heuristic.
+                    returned = copy.deepcopy(returned)
+                    returned.inferred = True
+                return None if returned is NO_RETURN else returned
             finally:
                 active.remove(key)
                 state = old
@@ -1051,6 +1114,18 @@ class PythonWorker:
             """
             if node is None:
                 return None
+            if isinstance(node, ast.NamedExpr):
+                # Walrus: bind the name, then behave as the assigned expression.
+                value = evaluate(node.value)
+                if isinstance(node.target, ast.Name):
+                    state.env[node.target.id] = value
+                return value
+            if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+                # Container elements are real call sites; a tuple assignment reads them.
+                values = [evaluate(element) for element in node.elts]
+                if any(isinstance(v, (Frame, Column)) for v in values):
+                    return values
+                return folded(node)
             if isinstance(node, ast.Name):
                 return state.env.get(node.id, folded(node))
             if isinstance(node, ast.Constant):
@@ -1423,6 +1498,8 @@ class PythonWorker:
                 else:
                     out.partial = True
                     issue(node, f"Frame method {method!r} has no handler", "unknown_column")
+                    for argument in [*node.args, *(kw.value for kw in node.keywords)]:
+                        evaluate(argument)
                 return out
 
             sink = match_sink(name)
@@ -1590,6 +1667,9 @@ class PythonWorker:
                 ("F.", "pl.", "pyspark.sql.functions.", "Window.", "pyspark.sql.Window.")
             ):
                 return Expression(node)
+            # An unknown call is still a call: its arguments may read datasets.
+            for argument in [*node.args, *(kw.value for kw in node.keywords)]:
+                evaluate(argument)
             return folded(node)
 
         def statements(body):
@@ -1614,10 +1694,14 @@ class PythonWorker:
                 The value of a ``return`` statement encountered directly in ``body``, or
                 ``None`` when none is reached.
             """
+            pending = NO_RETURN
             for node in body:
                 try:
                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         state.functions[node.name] = node
+                    elif isinstance(node, ast.ClassDef):
+                        # Class bodies read datasets too; methods register as functions.
+                        pending = merge_returns(pending, statements(node.body))
                     elif isinstance(node, ast.Import):
                         for alias in node.names:
                             state.imports[alias.asname or alias.name] = (alias.name, 0)
@@ -1639,36 +1723,66 @@ class PythonWorker:
                         for target in targets:
                             if isinstance(target, ast.Name):
                                 state.env[target.id] = value
+                            elif isinstance(target, (ast.Tuple, ast.List)):
+                                # Unpacking: bind each name to its own element.
+                                items = value if isinstance(value, list) else []
+                                for element, item in zip(target.elts, items, strict=False):
+                                    if isinstance(element, ast.Name):
+                                        state.env[element.id] = item
+                                for element in target.elts[len(items) :]:
+                                    if isinstance(element, ast.Name):
+                                        state.env[element.id] = Folded("{{?}}", False, [element.id])
                             elif isinstance(target, ast.Subscript):
                                 frame = evaluate(target.value)
                                 if isinstance(frame, Frame):
                                     frame.columns[folded(target.slice).text] = col_expr(
                                         node.value, frame
                                     )
+                    elif isinstance(node, ast.AugAssign):
+                        # "t += x" is "t = t + x"; folding it keeps the name concrete.
+                        combined = ast.copy_location(
+                            ast.BinOp(
+                                left=ast.copy_location(
+                                    ast.Name(id=getattr(node.target, "id", ""), ctx=ast.Load()),
+                                    node,
+                                ),
+                                op=node.op,
+                                right=node.value,
+                            ),
+                            node,
+                        )
+                        value = evaluate(combined)
+                        if isinstance(node.target, ast.Name):
+                            state.env[node.target.id] = value
                     elif isinstance(node, ast.Expr):
                         evaluate(node.value)
                     elif isinstance(node, ast.Return):
-                        return evaluate(node.value)
+                        return merge_returns(pending, evaluate(node.value))
                     elif isinstance(node, ast.If):
                         if "__name__" in unparse(node.test):
-                            statements(node.body)
+                            pending = merge_returns(pending, statements(node.body))
                         else:
+                            evaluate(node.test)
                             original = copy.deepcopy(state.env)
-                            statements(node.body)
+                            taken = statements(node.body)
                             left = state.env
                             state.env = copy.deepcopy(original)
-                            statements(node.orelse)
+                            skipped = statements(node.orelse)
                             for key in set(left) | set(state.env):
                                 a, b = left.get(key), state.env.get(key)
                                 if a != b:
                                     if isinstance(a, Frame) and isinstance(b, Frame):
-                                        a.sources |= b.sources
-                                        a.partial = True
-                                        state.env[key] = a
+                                        state.env[key] = merge_returns(a, b)
                                     else:
                                         state.env[key] = Folded("{{?}}", False, [key])
+                            if taken is not NO_RETURN and skipped is not NO_RETURN:
+                                # Every path through this statement returns.
+                                return merge_returns(pending, merge_returns(taken, skipped))
+                            pending = merge_returns(pending, merge_returns(taken, skipped))
                     elif isinstance(node, (ast.With, ast.AsyncWith)):
-                        statements(node.body)
+                        returned = statements(node.body)
+                        if returned is not NO_RETURN:
+                            return merge_returns(pending, returned)
                     elif (
                         isinstance(node, ast.For)
                         and isinstance(node.target, ast.Name)
@@ -1685,15 +1799,40 @@ class PythonWorker:
                             state.env[node.target.id] = evaluate(item)
                             statements(node.body)
                         statements(node.orelse)
-                    elif isinstance(node, (ast.For, ast.While, ast.Try)):
+                    elif isinstance(node, (ast.For, ast.AsyncFor, ast.While, ast.Try, ast.Match)):
                         issue(node, "Dynamic control flow analyzed conservatively")
-                        statements(node.body)
+                        bodies = []
+                        if isinstance(node, (ast.For, ast.AsyncFor)):
+                            iterated = evaluate(node.iter)
+                            if isinstance(node.target, ast.Name):
+                                state.env[node.target.id] = (
+                                    iterated
+                                    if isinstance(iterated, Frame)
+                                    else Folded("{{?}}", False, [node.target.id])
+                                )
+                            bodies = [node.body, node.orelse]
+                        elif isinstance(node, ast.While):
+                            evaluate(node.test)
+                            bodies = [node.body, node.orelse]
+                        elif isinstance(node, ast.Match):
+                            evaluate(node.subject)
+                            bodies = [case.body for case in node.cases]
+                        else:
+                            # Every part of a try statement can run, handlers included.
+                            bodies = [
+                                node.body,
+                                *(handler.body for handler in node.handlers),
+                                node.orelse,
+                                node.finalbody,
+                            ]
+                        for branch in bodies:
+                            pending = merge_returns(pending, statements(branch))
                         for value in state.env.values():
                             if isinstance(value, Frame):
                                 value.partial = True
                 except Exception as exc:
                     issue(node, f"{type(exc).__name__}: {exc}")
-            return None
+            return pending
 
         def load_module(source, module_state, definitions_only=False):
             """Parse a module and interpret its body under ``module_state``.
