@@ -84,7 +84,7 @@ def test_cli_header_json_validation_and_env_config_overrides(tmp_path, monkeypat
         "--runner",
         "anthropic",
         "--extra-headers",
-        '{"x-duke-mode":"invoke"}',
+        '{"x-example-mode":"invoke"}',
         "--out-dir",
         str(tmp_path / "out"),
     ]

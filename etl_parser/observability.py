@@ -36,6 +36,14 @@ from functools import wraps
 from pathlib import Path
 from uuid import uuid4
 
+LIBRARY_LOG_LEVEL = "WARNING"
+"""Console level used when no level is requested, e.g. by ``etl_parser.scan()``.
+
+Embedded use stays quiet by convention: a library should not stream INFO records to an
+application's stderr unless asked (review finding 39). The CLI passes ``"INFO"``
+explicitly, and file logs always retain DEBUG events regardless of this default.
+"""
+
 _CURRENT = contextvars.ContextVar("etl_parser_observer", default=None)
 _SPAN = contextvars.ContextVar("etl_parser_span", default=None)
 _SENSITIVE = {
@@ -176,7 +184,7 @@ class RunObserver:
         self,
         *,
         log_dir=None,
-        log_level="INFO",
+        log_level=None,
         max_log_bytes=10_000_000,
         max_log_files=20,
         secrets=(),
@@ -188,7 +196,9 @@ class RunObserver:
                 timestamp and the run id). When ``None``, only console logging is
                 used.
             log_level: Minimum level for console logging: one of ``DEBUG``, ``INFO``,
-                ``WARNING``, ``ERROR`` or ``CRITICAL`` (case-insensitive).
+                ``WARNING``, ``ERROR`` or ``CRITICAL`` (case-insensitive). ``None``
+                selects the quiet library default :data:`LIBRARY_LOG_LEVEL`; the CLI
+                passes its own level explicitly.
             max_log_bytes: Maximum size in bytes of one ``events*.jsonl`` file before
                 rotating; must be at least 1024.
             max_log_files: Maximum number of rotated event files; must be at least 1.
@@ -202,7 +212,7 @@ class RunObserver:
             OSError: If ``log_dir`` cannot be created or the initial log file cannot
                 be opened.
         """
-        level = str(log_level).upper()
+        level = str(log_level if log_level is not None else LIBRARY_LOG_LEVEL).upper()
         if level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ValueError("log_level must be DEBUG, INFO, WARNING, ERROR or CRITICAL")
         if max_log_bytes < 1024 or max_log_files < 1:
@@ -614,7 +624,8 @@ def observed(stage):
     The decorated function joins an existing run (via an ``observer`` keyword
     argument or one already active in the current context) when present, or else
     creates and owns a new :class:`RunObserver` from ``log_dir``/``log_level``/
-    ``log_max_bytes``/``log_max_files`` keyword arguments. Every call runs inside
+    ``log_max_bytes``/``log_max_files`` keyword arguments. A call that passes no
+    ``log_level`` gets the quiet library default :data:`LIBRARY_LOG_LEVEL`. Every call runs inside
     :meth:`RunObserver.span` for ``stage``; any exception, including cancellation,
     is recorded and, for an owned observer, finalizes the run via
     :meth:`RunObserver.finish` before propagating. Works for both sync and async
@@ -664,7 +675,7 @@ def observed(stage):
             if owned:
                 observer = RunObserver(
                     log_dir=kwargs.get("log_dir"),
-                    log_level=kwargs.get("log_level", "INFO"),
+                    log_level=kwargs.get("log_level"),
                     max_log_bytes=kwargs.get("log_max_bytes", 10_000_000),
                     max_log_files=kwargs.get("log_max_files", 20),
                 )
