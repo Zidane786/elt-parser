@@ -20,8 +20,6 @@ from etl_parser.observability import RunObserver, observed
 from etl_parser.schema.base import is_schema_source
 from etl_parser.schema.catalog import write_schema_catalog
 
-EXPORT_OPTIONS = ("schema", "include_code_schema", "generate", "databases")
-
 
 def apply_export_options(
     result,
