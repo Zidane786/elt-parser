@@ -257,3 +257,58 @@ def test_export_openlineage_creates_missing_output_directories(lineage_file, tmp
     )
     assert result.exit_code == 0, result.output
     assert out.is_dir()
+
+
+@pytest.fixture
+def sql_fixture(tmp_path):
+    """Write one small SQL job to scan.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+
+    Returns:
+        Path: The written ``.sql`` file.
+    """
+    source = tmp_path / "job.sql"
+    source.write_text("CREATE TABLE b.t AS SELECT x FROM a.s")
+    return source
+
+
+def levels(text):
+    """Collect the ``level`` field of every JSON event line in ``text``.
+
+    Args:
+        text: Captured stderr.
+
+    Returns:
+        set[str]: The distinct levels emitted.
+    """
+    found = set()
+    for line in text.splitlines():
+        try:
+            found.add(json.loads(line)["level"])
+        except (ValueError, KeyError):
+            continue
+    return found
+
+
+def test_library_scan_is_quiet_by_default(sql_fixture, capsys):
+    from etl_parser.pipeline import scan
+
+    scan(sql_fixture)
+    assert "INFO" not in levels(capsys.readouterr().err)
+
+
+def test_library_scan_honours_an_explicit_level(sql_fixture, capsys):
+    from etl_parser.pipeline import scan
+
+    scan(sql_fixture, log_level="INFO")
+    assert "INFO" in levels(capsys.readouterr().err)
+
+
+def test_cli_scan_keeps_info_logging(sql_fixture, tmp_path):
+    result = CliRunner().invoke(
+        app, ["scan", str(sql_fixture), "--out", str(tmp_path / "lineage.json")]
+    )
+    assert result.exit_code == 0, result.output
+    assert "INFO" in levels(result.stderr)

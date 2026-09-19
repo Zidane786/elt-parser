@@ -338,7 +338,7 @@ def scan(
     sql_dialect: str | None = None,
     scan_commit: str | None = None,
     log_dir: Path | str | None = None,
-    log_level: str = "INFO",
+    log_level: str | None = None,
     log_max_bytes: int = 10_000_000,
     log_max_files: int = 20,
     observer=None,
@@ -367,7 +367,9 @@ def scan(
         scan_commit: Commit identifier to stamp on the result; defaults to the source
             provider's detected revision.
         log_dir: Directory to persist run events and metrics in.
-        log_level: Console log level; the log file always retains DEBUG events.
+        log_level: Console log level. Left unset, embedded use stays quiet at
+            :data:`~etl_parser.observability.LIBRARY_LOG_LEVEL` (WARNING); the CLI
+            passes ``"INFO"``. The log file always retains DEBUG events.
         log_max_bytes: Maximum size of a single log file before rotation.
         log_max_files: Maximum number of rotated log files to keep.
         observer: Unused; the active observer is always looked up via
