@@ -12,6 +12,7 @@ path (spec section 2, goal 1). The public entry point is :func:`scan`; see
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -27,6 +28,81 @@ from etl_parser.workers.airflow import AirflowWorker
 from etl_parser.workers.base import comment_schedule, parse_header
 from etl_parser.workers.python import PythonWorker
 from etl_parser.workers.sql import SchemaProvider, SqlWorker, _sql_description
+
+GATING_UNRESOLVED_KINDS = frozenset({"unsupported_syntax"})
+"""Unresolved kinds that make a command exit non-zero.
+
+Only genuinely unparsed code gates. Informational kinds (``analysis_note``,
+``skipped_entry``, ``missing_in_source``) stay visible in the JSON summary so CI can gate
+on parser coverage without failing on heuristic notes (review finding 23).
+"""
+
+PROVIDER_AUTH_REASONS = frozenset(
+    {"provider_authentication_failed", "provider_authorization_failed"}
+)
+"""AI-stage failure reasons that mean the provider rejected our credentials (HTTP 401/403).
+
+These are configuration errors rather than partial results, so they are visible in the exit
+code without ``--strict`` (review finding 24).
+"""
+
+
+def blocking_unresolved(document) -> list[Unresolved]:
+    """Return the unresolved items that should make a command fail.
+
+    Args:
+        document: The :class:`~etl_parser.models.LineageDocument` to inspect.
+
+    Returns:
+        list[Unresolved]: Items whose ``kind`` is in :data:`GATING_UNRESOLVED_KINDS`.
+    """
+    return [issue for issue in document.unresolved if issue.kind in GATING_UNRESOLVED_KINDS]
+
+
+def provider_authentication_failed(decisions=(), warnings=()) -> bool:
+    """Report whether the AI stage failed because the provider rejected our credentials.
+
+    Args:
+        decisions: Per-file decision records from an analysis run; each may carry a
+            ``reason``.
+        warnings: Human-readable warning strings from an analysis run.
+
+    Returns:
+        bool: True if any decision reason, or any warning text, names a provider
+        authentication or authorization failure.
+    """
+    for decision in decisions:
+        if isinstance(decision, Mapping) and decision.get("reason") in PROVIDER_AUTH_REASONS:
+            return True
+    return any(
+        isinstance(warning, str) and reason in warning
+        for warning in warnings
+        for reason in PROVIDER_AUTH_REASONS
+    )
+
+
+def exit_code(document, *, decisions=(), warnings=(), status="success", strict=False) -> int:
+    """Compute the process exit code for a ``scan`` or ``run`` command.
+
+    Args:
+        document: The effective :class:`~etl_parser.models.LineageDocument`.
+        decisions: Per-file AI decision records, when an AI stage ran.
+        warnings: Warning strings collected during the run.
+        status: The observer's final run status.
+        strict: Whether ``--strict`` was requested, which also fails for any unresolved
+            item, any warning, or a non-success status.
+
+    Returns:
+        int: ``2`` for a provider authentication/authorization failure, ``1`` for blocking
+        unresolved items or an unmet ``--strict`` requirement, and ``0`` otherwise.
+    """
+    if provider_authentication_failed(decisions, warnings):
+        return 2
+    if blocking_unresolved(document):
+        return 1
+    if strict and (document.unresolved or warnings or status != "success"):
+        return 1
+    return 0
 
 
 @dataclass

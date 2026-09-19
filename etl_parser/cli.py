@@ -27,7 +27,7 @@ from etl_parser.graph.builder import LineageGraph
 from etl_parser.graph.impact import downstream, upstream
 from etl_parser.graph.products import orchestration_drift, product_dependencies
 from etl_parser.observability import current_observer, digest, observed
-from etl_parser.pipeline import ParserRegistry
+from etl_parser.pipeline import ParserRegistry, exit_code
 from etl_parser.pipeline import scan as scan_repository
 from etl_parser.workers.sql import DictSchemaProvider, GlueSchemaProvider
 
@@ -244,10 +244,15 @@ def analysis_run(
             sort_keys=True,
         )
     )
-    if strict and (
-        result.document.unresolved or result.warnings or current_observer().status != "success"
-    ):
-        raise typer.Exit(1)
+    code = exit_code(
+        result.document,
+        decisions=result.decisions,
+        warnings=result.warnings,
+        status=current_observer().status,
+        strict=strict,
+    )
+    if code:
+        raise typer.Exit(code)
 
 
 def _json(path):
@@ -420,7 +425,7 @@ def scan(
             sort_keys=True,
         )
     )
-    if any(issue.kind == "unsupported_syntax" for issue in doc.unresolved):
+    if exit_code(doc):
         raise typer.Exit(1)
 
 
