@@ -163,6 +163,12 @@ def test_sdk_cancellation_finalizes_logs_and_keeps_injected_runner_open(tmp_path
 
 
 def test_deadline_skip_is_distinct_from_call_limit(tmp_path):
+    class NeverCalled:
+        """Stands in for a configured provider the budget policy must never reach."""
+
+        async def complete(self, **kwargs):
+            raise AssertionError("Budget policy must not reach the provider")
+
     result = ParserClient(
         config=AnalysisConfig(
             ai_lineage="improve",
@@ -170,7 +176,7 @@ def test_deadline_skip_is_distinct_from_call_limit(tmp_path):
             deadline_seconds=1e-12,
         ),
         log_level="ERROR",
-    ).run(source_file(tmp_path))
+    ).run(source_file(tmp_path), runner=NeverCalled())
     assert result.decisions[0]["reason"] == "deadline_exceeded"
     assert result.metrics["gauges"]["ai.calls.total"] == 0
     assert result.status == "partial"

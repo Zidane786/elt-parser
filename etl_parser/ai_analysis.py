@@ -1121,6 +1121,22 @@ async def analyze_async(
         observer.gauge("ai.tokens.accounted", 0)
         observer.event("ai.disabled", actor="policy", reason="all_ai_stages_off")
         return result
+    if runner is None and not config.dry_run:
+        # Configuration is wrong for the whole run, not for one file: fail loudly once
+        # instead of reporting a misconfiguration as a per-file provider outage.
+        try:
+            if not config.model:
+                raise ValueError("A model id is required for AI work")
+            runner = configured_runner(config, timeout=config.timeout_seconds)
+        except (ValueError, RuntimeError) as exc:
+            observer.count("ai.provider.configuration_invalid")
+            observer.event(
+                "ai.provider_configuration_invalid",
+                level="WARNING",
+                actor="provider_policy",
+                error_type=type(exc).__name__,
+            )
+            raise AnalysisPolicyError(f"provider_configuration_invalid: {exc}") from None
     catalog_columns = _catalog_columns(result.catalog)
     catalog_tables = _catalog_tables(result.catalog)
     start = time.perf_counter()
@@ -1312,6 +1328,9 @@ async def analyze_async(
         }
         new_descriptions_before = dict(new_descriptions)
         table_description_before = {}
+        # Which side of the provider boundary the file is currently on, so a failure can
+        # be attributed to the provider or to this package.
+        stage = "provider"
         try:
             if runner is None:
                 if not config.model:
@@ -1370,6 +1389,7 @@ async def analyze_async(
                     timeout=min(config.timeout_seconds, remaining),
                 )
             observer.count("ai.calls.completed")
+            stage = "response"
             usage = completion.usage.model_dump(exclude={"raw"}) if completion.usage else {}
             observer.count("ai.usage.reported" if usage else "ai.usage.unavailable")
             used = sum(
@@ -1759,7 +1779,12 @@ async def analyze_async(
                     if isinstance(exc, ValidationError)
                     else "timeout"
                     if isinstance(exc, TimeoutError)
+                    # Only failures raised while talking to the provider are reported as
+                    # provider failures. A bug in this package's own merge/validation
+                    # code is an internal error, not an outage.
                     else "provider_or_response_failure"
+                    if stage == "provider"
+                    else "internal_error"
                 )
             )
             if http_status is not None:
@@ -1839,6 +1864,13 @@ async def analyze_async(
                     )
                 finally:
                     runner = None
+    if owns_runner and runner is not None:
+        # Pre-flight built a runner that no file ended up using.
+        try:
+            await close_runner(runner)
+        except Exception as exc:
+            observer.partial()
+            observer.event("ai.runner_close_failed", level="WARNING", error_type=type(exc).__name__)
     if applied_columns or applied_tables:
         result.document = _rebuild(doc, applied_columns, applied_tables)
         _record_additions(result, doc, observer)

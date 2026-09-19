@@ -154,6 +154,51 @@ def test_ai_only_document_marks_every_job_and_dataset_as_ai(tmp_path):
     assert all(d.origin == "ai" and d.provenance for d in result.ai_document.datasets)
 
 
+def test_missing_provider_configuration_raises_before_any_file(tmp_path):
+    from etl_parser.ai_analysis import AnalysisPolicyError
+
+    for name in ("a", "b"):
+        (tmp_path / f"{name}.sql").write_text(f"CREATE TABLE db.{name} AS SELECT x FROM db.s")
+    with pytest.raises(AnalysisPolicyError) as failure:
+        analyze(
+            tmp_path,
+            config=AnalysisConfig(ai_lineage="improve", model="test", lambda_arn=None),
+        )
+    assert str(failure.value).startswith("provider_configuration_invalid:")
+    assert "lambda_arn" in str(failure.value)
+
+
+def test_dry_run_needs_no_provider_configuration(tmp_path):
+    source = tmp_path / "job.sql"
+    source.write_text("CREATE TABLE db.t AS SELECT x FROM db.s")
+    result = analyze(
+        source, config=AnalysisConfig(ai_lineage="improve", model="test", dry_run=True)
+    )
+    assert result.work and result.decisions[0]["reason"] == "dry_run"
+
+
+def test_non_provider_failure_is_reported_as_internal_error(tmp_path, monkeypatch):
+    import etl_parser.ai_analysis as ai_analysis
+
+    source = tmp_path / "job.sql"
+    source.write_text("CREATE TABLE db.t AS SELECT x FROM db.s")
+
+    def boom(*args, **kwargs):
+        raise KeyError("internal bookkeeping bug")
+
+    monkeypatch.setattr(ai_analysis, "_proposal_edges", boom)
+    result = analyze(
+        source,
+        runner=FakeLLMRunner([proposal_response]),
+        config=AnalysisConfig(ai_lineage="improve", model="test"),
+    )
+    failure = result.decisions[0]
+    assert failure["status"] == "failed"
+    assert failure["reason"] == "internal_error"
+    assert failure["error_type"] == "KeyError"
+    assert result.document == result.baseline
+
+
 def test_below_threshold_proposal_is_deferred_but_visible(tmp_path):
     source = tmp_path / "job.py"
     source.write_text('spark.table("db.s").select("x").custom().write.saveAsTable("db.t")')
