@@ -265,6 +265,17 @@ def test_join_conditions_resolve_through_aliases_and_ctes_sorted_and_deduped():
     assert j.job_id == "j" and j.provenance.parser == "sqlglot" and j.provenance.dialect == "trino"
 
 
+def test_merge_on_and_analysis_property_expose_the_same_conditions():
+    a = SqlWorker().analyze(
+        "MERGE INTO b.t t USING a.s s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v",
+        dialect="spark",
+        engine="spark",
+        job_id="j",
+    )
+    assert a.join_conditions is a.result.join_conditions
+    assert _pairs(a.result) == [(("glue://a/s", "id"), ("glue://b/t", "id"))]
+
+
 def test_non_equality_and_constant_join_predicates_are_not_conditions():
     a = SqlWorker().analyze(
         "CREATE TABLE b.t AS SELECT s.x FROM a.s s JOIN a.u u ON s.id > u.id AND u.flag = 1",

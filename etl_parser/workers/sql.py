@@ -187,6 +187,17 @@ class SqlAnalysis:
     outputs: set[str] = field(default_factory=set)
     output_columns: dict[str, list[str]] = field(default_factory=dict)
 
+    @property
+    def join_conditions(self) -> list[JoinCondition]:
+        """The ``JOIN ... ON`` equalities observed in the analysed text.
+
+        Returns:
+            ``result.join_conditions``: deduplicated and sorted ``JoinCondition``
+            observations, each resolved to physical columns, for relation inference by
+            the catalog exporter.
+        """
+        return self.result.join_conditions
+
 
 @dataclass
 class _Statement:
