@@ -227,3 +227,56 @@ wrote them on disjoint file sets under a docstrings-only rule; the coordinating 
 zero missing definitions, ruff clean, the full suite green, and cross-checked every `Raises:`
 section against actual `raise` statements (five internally-caught raises are correctly
 omitted). Design-doc section references in module docstrings were checked against the spec.
+
+---
+
+## 8. Resolution (same day)
+
+Every finding above was worked in seven parallel packages, each on its own branch with
+tests written first, then merged into one integration branch. The suite grew from 226 to
+531 tests. `ruff check`, `ruff format --check`, byte-identical double scans of both
+fixtures under different hash seeds, and an import guard proving a scan works with
+`agent_sdk`, `anthropic`, `openai`, `psycopg` and `redshift_connector` all blocked, all pass.
+
+| Finding | Resolution |
+| --- | --- |
+| 1 Catalog duplicated databases | Prior databases match on name first; `db_type: glue` is never emitted. Verified against the real catalog: 2 databases, all 321 columns and 47 relations preserved. |
+| 2 Prior script descriptions lost | Matched by job id, then exact path, then script name, then path suffix. Unmatched prior scripts are kept. |
+| 3 In-place writer dropped real dependencies | A job whose every input is also an output is a pure mutator and creates no dependency; a job reading anything it does not write stays a producer. Golden diff is exactly the two `dim_customer_scd2` additions. |
+| 4 Chained Spark writers dropped | `write.mode(...).parquet(path)` and friends resolve, including `option("path", ...)`. |
+| 5 Constructor DAGs misattributed | Tasks bind by `dag=` and `with dag_var:`; two DAGs in one file stay separate. |
+| 6 Loop-generated tasks vanished | `for`/`while`/`try`/comprehensions are visited; literal loops unroll, unknown iterables raise `dynamic_schedule`. |
+| 7 One Jinja placeholder discarded a script | Placeholders in value position are analysed at `partial` confidence with the note at the hole's line; clean statements are kept. |
+| 8 RecursionError escaped | Caught and reported; the job is still emitted. |
+| 9 AI datasets and job I/O unmarked | Datasets carry `origin="ai"` with provenance; accepted reads and writes go to `ai_inputs`/`ai_outputs` and never touch deterministic inputs. |
+| 10 Evidence trivially satisfiable | Quotes need 12+ characters and must name the target column or an identifier from the expression; dataset grounding is whole-token. |
+| 11-13 Impact and OpenLineage gaps | Column walks report cross-product edges, dataset walks list columns, `job_io` fallback edges make declared reads reachable, INDIRECT subtypes are populated. |
+| 14-16, 25 SQL and Airflow gaps | Temp tables leave the catalog, SQL line numbers anchor to the string literal, variable reuse no longer cycles, more statement forms modelled. |
+| 17-20 Python worker silent drops | Guards for paths outside the root, placeholder column names rejected, unevaluated positions walked, nested returns respected, helper and branch frames marked `inferred`. |
+| 21 Provider misconfiguration looked like an outage | Pre-flight raises `provider_configuration_invalid`; other failures carry `internal_error`. |
+| 22 GitHub symlinks gated the scan | Now `skipped_entry`, with a breaker after three consecutive failures. |
+| 23-24 Exit codes | Only `unsupported_syntax` gates; authentication and authorization failures exit 2; `describe` prints a summary. |
+| 26, 40 Hygiene | `astroid` removed, extras added for Postgres and Redshift, `docs/dependencies.md` added, example header names and the private SDK reference made generic. |
+| 27-39 Remaining low findings | Sentinel ids instead of exceptions, per-dataset in-place flag, engine-preferring product ownership, both product YAML schedule shapes, guarded sink suffixes, language detection by imports, bounded ZIP reads, dead code removed. |
+
+Beyond the findings, this pass added what the user asked for during the work: `ai_confidence`
+and `ai_rationale` on every AI edge and description, `min_ai_confidence` as a floor, table
+descriptions generated alongside their columns in one call, `--generate` and `--database`
+selection on the CLI and the SDK, source-of-truth schema fetching from Glue, Postgres and
+Redshift with a `schema fetch` command, a `schema_drift` block reporting what exists in code
+but not in the source system, and inferred relations from join conditions kept separate from
+declared ones.
+
+### Live gateway validation of the merged branch
+
+Six scenarios through the Agent SDK against the user's Anthropic-compatible gateway, with
+credentials supplied only through the environment.
+
+| Scenario | Result |
+| --- | --- |
+| Descriptions for a table with real gaps | One call covered the table and its columns. Table description confidence 0.85, column 0.7. 12 identity columns inherited without a model call. No parser or lineage jargon in the text. |
+| AI lineage, fallback mode | One inferred edge accepted at confidence 0.96 with a rationale. 177 deterministic edges and all 9 diagnostics preserved. |
+| `--min-ai-confidence 0.99` | The same 0.96 proposal was deferred. Effective graph identical to the deterministic baseline. |
+| `--generate scripts --database ecommerce` | Selected sections regenerated, unselected ones passed through from the prior. |
+| Invalid credentials | Exit code 2, reported as an authentication failure. |
+| Secret scan over every artifact and log | The key appears nowhere. |

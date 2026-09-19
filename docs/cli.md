@@ -337,7 +337,7 @@ GitHub limits and advanced provider configuration are documented above and in th
 | `--timeout-seconds NUMBER` | 300 per model request; maximum 600 |
 | `--deadline-seconds NUMBER` | 3,600 for the AI stage; deterministic scan time is separate |
 | `--min-ai-confidence FLOAT` | Unset; 0–1 threshold below which an AI proposal is deferred rather than applied |
-| `--override-existing` | Off; regenerate descriptions this tool wrote (`description_source` `ai` or `code`). Text marked `human` or `verified` is never overwritten. Available on `run` and `describe` |
+| `--override-existing` / `--no-override-existing` | Off; regenerate descriptions this tool wrote (`description_source` `ai` or `code`). Text marked `human` or `verified` is never overwritten. Available on `run` and `describe` |
 | `--include GLOB` | Repeatable AI file inclusions; defaults to `*` |
 | `--exclude GLOB` | Repeatable AI file exclusions; exclusions win |
 | `--strict` / `--no-strict` | Off; fail for unresolved/incomplete work instead of only reporting partial status |
