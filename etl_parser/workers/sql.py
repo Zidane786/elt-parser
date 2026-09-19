@@ -1250,7 +1250,13 @@ class SqlWorker:
         ]
         query = exp.select(*projections).from_(e.this.copy())
         if e.args.get("from_"):
-            query = query.join(e.args["from_"].this.copy(), join_type="CROSS")
+            source = e.args["from_"].this.copy()
+            # sqlglot nests ``UPDATE ... FROM s JOIN u ON ...`` joins under the FROM table;
+            # hoist them so the join predicates become indirect sources (finding 25).
+            nested = source.args.pop("joins", None) or []
+            query = query.join(source, join_type="CROSS")
+            for join in nested:
+                query.append("joins", join.copy())
         for key in ("where", "with_"):
             if e.args.get(key):
                 query.set(key, e.args[key].copy())
