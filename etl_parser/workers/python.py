@@ -34,11 +34,116 @@ from etl_parser.models import (
     Unresolved,
     WorkerResult,
 )
-from etl_parser.scanner.repo import ScanIndex, SourceFile
+from etl_parser.scanner.imports import resolve_import
+from etl_parser.scanner.references import qualified_callee
+from etl_parser.scanner.repo import ScanIndex, SourceFile, imports_package
 from etl_parser.scanner.sinks import ENGINE_DIALECT, URL_ENGINE_HINTS, match_sink
 from etl_parser.scanner.strings import Folded, fold_string
 from etl_parser.workers.base import comment_schedule, first_docstring_line, parse_header
 from etl_parser.workers.sql import SqlWorker
+
+MAX_EXPRESSION_DEPTH = 200
+"""Deepest expression the analyzer renders as source text (design spec section 13).
+
+``ast.unparse`` recurses once per nesting level, so an expression nested deeper than this
+would raise ``RecursionError`` inside the very diagnostic that reports it. Real code stays
+an order of magnitude below this limit; generated code does not.
+"""
+
+
+def unparse(node) -> str:
+    """Render an AST node as source text without risking ``RecursionError``.
+
+    Measures the node's nesting depth iteratively first, so a pathologically deep
+    expression (a machine-generated 400-term chain, say) yields a placeholder instead of
+    exhausting the interpreter stack. Workers never raise on user code.
+
+    Args:
+        node: The AST node to render.
+
+    Returns:
+        str: ``ast.unparse(node)``, or a short placeholder naming the node type when the
+        expression nests deeper than :data:`MAX_EXPRESSION_DEPTH`.
+    """
+    stack = [(node, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > MAX_EXPRESSION_DEPTH:
+            return f"<{type(node).__name__} nested deeper than {MAX_EXPRESSION_DEPTH} levels>"
+        stack.extend((child, depth + 1) for child in ast.iter_child_nodes(current))
+    return ast.unparse(node)
+
+
+SPARK_PACKAGES = ("pyspark", "awsglue")
+"""Imports that make a file a Spark job: PySpark itself and the Glue runtime built on it."""
+
+NO_RETURN = object()
+"""Sentinel for "no ``return`` was reached", distinct from a ``return None``."""
+
+
+def merge_returns(first, second):
+    """Combine the values two paths through a function can produce.
+
+    A ``return`` inside an ``if``/``for``/``with`` does not end the analysis: the function
+    may still fall through to a later ``return``, so both outcomes have to survive (review
+    finding 20). Two frames merge into one frame carrying every branch's sources, marked
+    ``inferred`` because only one of them runs at a time (design spec section 13).
+
+    Args:
+        first: The value of the earlier path, or :data:`NO_RETURN`.
+        second: The value of the later path, or :data:`NO_RETURN`.
+
+    Returns:
+        The merged :class:`Frame` when both paths return frames, the single returned value
+        when only one path returns, otherwise the later path's value.
+    """
+    if first is NO_RETURN:
+        return second
+    if second is NO_RETURN:
+        return first
+    if not isinstance(first, Frame) or not isinstance(second, Frame):
+        return first if isinstance(first, Frame) else second
+    merged = copy.deepcopy(first)
+    merged.sources |= second.sources
+    merged.indirect |= second.indirect
+    merged.aliases.update(second.aliases)
+    merged.partial |= second.partial
+    merged.open_columns |= second.open_columns
+    merged.inferred = True
+    merged.parallel_sources = (
+        first.parallel_sources
+        or second.parallel_sources
+        # With no schema on either side, an unknown column may come from either branch.
+        or (first.open_columns and second.open_columns)
+    )
+    for key, column in second.columns.items():
+        if key in merged.columns:
+            merged.columns[key].sources |= column.sources
+            merged.columns[key].indirect |= column.indirect
+            merged.columns[key].partial |= column.partial
+        else:
+            merged.columns[key] = copy.deepcopy(column)
+    for key, column in merged.columns.items():
+        # A column only one branch produces is not guaranteed to be there.
+        column.partial |= key not in first.columns or key not in second.columns
+    return merged
+
+
+def resolvable_column(name) -> bool:
+    """Whether a tracked column name is a real name rather than an analyzer placeholder.
+
+    ``{{?}}`` (an unfolded runtime value), ``*`` (an unexpanded star) and the empty string
+    are artefacts of analysis, not columns; an edge naming one would be wrong rather than
+    incomplete, so callers record an ``unknown_column`` item instead (review finding 18).
+
+    Args:
+        name: The candidate column name.
+
+    Returns:
+        bool: ``True`` when ``name`` is a non-blank string that is neither a placeholder
+        nor a bare star.
+    """
+    return isinstance(name, str) and bool(name.strip()) and name != "*" and "{{" not in name
 
 
 @dataclass
@@ -114,6 +219,13 @@ class Frame:
         parallel_sources (bool): Whether this frame was read from multiple dataset arguments
             at once (for example ``pd.read_csv([a, b])``), so an unknown column's origin
             fans out across all of ``sources`` rather than just one.
+        write_options (dict[str, ast.AST]): Writer builder options accumulated by
+            ``.format(...)``/``.option(...)``/``.options(...)`` calls on a ``df.write``
+            chain, keyed by option name, with values as their literal AST nodes. A
+            ``"path"`` entry supplies the output location for a terminal ``.save()``.
+        inferred (bool): Whether this frame's shape was reached through a heuristic (a
+            helper function followed one level, or a branch merge), so edges built from it
+            are ``inferred`` rather than ``exact`` (design spec section 13).
     """
 
     columns: dict[str, Column] = field(default_factory=dict)
@@ -124,6 +236,8 @@ class Frame:
     open_columns: bool = True
     group: list[str] = field(default_factory=list)
     parallel_sources: bool = False
+    write_options: dict[str, ast.AST] = field(default_factory=dict)
+    inferred: bool = False
 
     def column(self, name: str) -> Column:
         """Resolve a column reference against this frame, including dotted alias access.
@@ -196,7 +310,11 @@ class PythonWorker:
         default_db (str | None): Default database used to qualify one-part dataset/table
             names.
         max_import_depth (int): Maximum depth of helper-module calls to follow.
+        language (str | None): Language every file analyzed by this worker is written in,
+            or ``None`` (the default) to detect it from each file's imports.
     """
+
+    language: str | None = None
 
     def __init__(
         self,
@@ -238,7 +356,12 @@ class PythonWorker:
         """
         root = self.index.root if self.index else path.parent
         try:
-            source = SourceFile(path.relative_to(root).as_posix(), path.read_text(), ".py")
+            # A file outside the index root has no repository-relative name; use its path.
+            try:
+                relative = path.relative_to(root).as_posix()
+            except ValueError:
+                relative = str(path)
+            source = SourceFile(relative, path.read_text(), ".py")
         except (OSError, UnicodeError) as exc:
             return WorkerResult(
                 unresolved=[
@@ -283,7 +406,9 @@ class PythonWorker:
         outputs: set[str] = set()
         job_id = job_id_override or source.job_id
         root_source = source
-        language = "pyspark" if "pyspark" in source.text else "python"
+        language = self.language or (
+            "pyspark" if imports_package(source, *SPARK_PACKAGES) else "python"
+        )
         default_engine = "spark" if language == "pyspark" else "unknown"
         invoked: set[tuple[str, str]] = set()
         active: set[tuple[str, str]] = set()
@@ -308,7 +433,7 @@ class PythonWorker:
                     line=getattr(node, "lineno", None),
                     reason=reason,
                     job_id=job_id,
-                    expression=ast.unparse(node),
+                    expression=unparse(node),
                     partial_text=folded.text if folded else None,
                     symbols=folded.placeholders if folded else [],
                     assumptions=folded.assumptions if folded else {},
@@ -404,19 +529,39 @@ class PythonWorker:
                 node: The ``Call.func`` expression to render.
 
             Returns:
-                str: The dotted callee text with the leading name resolved through
-                ``state.imports`` and, for ``pandas``/``polars``/``awswrangler`` targets,
-                rewritten to the ``pd.``/``pl.``/``wr.`` shorthand used by the sink table.
+                str: The dotted callee text, as resolved by
+                :func:`~etl_parser.scanner.references.qualified_callee` against this
+                module's imports, so a call site resolves to the same sink table entry
+                here and in the standalone references pass.
             """
-            text = ast.unparse(node)
-            first, dot, rest = text.partition(".")
-            imported = state.imports.get(first)
-            if imported:
-                text = imported[0] + (dot + rest if dot else "")
-            for package, alias in (("pandas", "pd"), ("polars", "pl"), ("awswrangler", "wr")):
-                if text.startswith(package + "."):
-                    return alias + text[len(package) :]
-            return text
+            return qualified_callee(node, {k: v[0] for k, v in state.imports.items()})
+
+        def is_udf(func):
+            """Whether a call target is a user-defined function applied to columns.
+
+            Recognises both spellings: a name bound to ``F.udf(...)``/``F.pandas_udf(...)``
+            and a function declared with a ``@udf``/``@pandas_udf`` decorator. The call
+            that *builds* a UDF is not itself a UDF application, so attribute targets such
+            as ``F.udf`` return ``False``.
+
+            Args:
+                func: The ``Call.func`` expression of the call being evaluated.
+
+            Returns:
+                bool: ``True`` when the call applies a UDF to its arguments.
+            """
+            if not isinstance(func, ast.Name):
+                return False
+            value = state.env.get(func.id)
+            if isinstance(value, Expression) and isinstance(value.node, ast.Call):
+                builder = callee(value.node.func).rsplit(".", 1)[-1]
+                if builder in {"udf", "pandas_udf"}:
+                    return True
+            function = state.functions.get(func.id)
+            return bool(function) and any(
+                unparse(decorator).rsplit(".", 1)[-1].partition("(")[0] in {"udf", "pandas_udf"}
+                for decorator in function.decorator_list
+            )
 
         def col_expr(node, frame):
             """Evaluate a column expression and stamp it with its source location.
@@ -484,22 +629,32 @@ class PythonWorker:
                     return owner.column(node.attr)
             if isinstance(node, ast.Call):
                 method = (
-                    node.func.attr
-                    if isinstance(node.func, ast.Attribute)
-                    else ast.unparse(node.func)
+                    node.func.attr if isinstance(node.func, ast.Attribute) else unparse(node.func)
                 )
+                if is_udf(node.func):
+                    # A UDF body is opaque: its arguments feed the output and nothing more
+                    # is known about how (design spec section 8.3).
+                    values = [col_expr(argument, frame) for argument in node.args]
+                    return Column(
+                        set().union(set(), *(v.sources for v in values)),
+                        unparse(node),
+                        "unknown",
+                        True,
+                        next((v.name for v in values if v.name), None),
+                        set().union(set(), *(v.indirect for v in values)),
+                    )
                 if method in {"col", "column"} and node.args:
                     name = folded(node.args[0])
                     return frame.column(name.text) if name.complete else Column(partial=True)
                 if method in {"lit", "literal"}:
-                    return Column(text=ast.unparse(node), kind="expression")
+                    return Column(text=unparse(node), kind="expression")
                 if method in {"cast", "astype"}:
                     value = col_expr(node.func.value, frame)
-                    value.text = ast.unparse(node)
+                    value.text = unparse(node)
                     return value
                 if method == "over":
                     value = col_expr(node.func.value, frame)
-                    value.kind, value.text = "window", ast.unparse(node)
+                    value.kind, value.text = "window", unparse(node)
                     for arg in node.args:
                         window = col_expr(arg, frame)
                         value.indirect |= window.sources | window.indirect
@@ -679,7 +834,7 @@ class PythonWorker:
                 )
                 return Column(
                     set().union(*(v.sources for v in values)),
-                    ast.unparse(node),
+                    unparse(node),
                     "window" if method == "over" else "aggregation" if aggregate else "expression",
                     not known or any(v.partial for v in values),
                     next((v.name for v in values if v.name), None),
@@ -690,7 +845,7 @@ class PythonWorker:
             ]
             return Column(
                 set().union(*(v.sources for v in children)),
-                ast.unparse(node),
+                unparse(node),
                 "expression",
                 any(v.partial for v in children),
                 indirect=set().union(*(v.indirect for v in children)),
@@ -824,13 +979,20 @@ class PythonWorker:
                         source_file=state.source.path,
                         line=node.lineno,
                         transformation=Transformation(
-                            expression=ast.unparse(node),
+                            expression=unparse(node),
                             source_file=state.source.path,
                             line_start=node.lineno,
                             line_end=getattr(node, "end_lineno", node.lineno),
                         ),
                         provenance=Provenance(
-                            parser="python_ast", confidence="partial" if partial else "exact"
+                            parser="python_ast",
+                            confidence=(
+                                "partial"
+                                if partial
+                                else "inferred"
+                                if isinstance(frame, Frame) and frame.inferred
+                                else "exact"
+                            ),
                         ),
                     )
                 )
@@ -844,8 +1006,23 @@ class PythonWorker:
             if frame.open_columns:
                 issue(node, "Output contains columns requiring an input schema", "missing_schema")
             for name, column in frame.columns.items():
-                confidence = "partial" if partial or column.partial else "exact"
-                if column.partial:
+                if not resolvable_column(name):
+                    # A placeholder is not a column name; report it instead of inventing one.
+                    issue(node, f"Output column name is unresolved: {name!r}", "unknown_column")
+                    continue
+                sources = sorted(s for s in column.sources if resolvable_column(s[1]))
+                indirect = sorted(
+                    s for s in frame.indirect | column.indirect if resolvable_column(s[1])
+                )
+                unnamed = len(sources) != len(column.sources)
+                confidence = (
+                    "partial"
+                    if partial or column.partial or unnamed
+                    else "inferred"
+                    if frame.inferred
+                    else "exact"
+                )
+                if column.partial or unnamed:
                     issue(
                         node,
                         f"Output {name!r} contains unresolved columns or unsupported expressions",
@@ -854,13 +1031,8 @@ class PythonWorker:
                 result.column_edges.append(
                     ColumnEdge(
                         target=ColumnRef(dataset_id=ds, name=name),
-                        sources=[
-                            ColumnRef(dataset_id=d, name=c) for d, c in sorted(column.sources)
-                        ],
-                        indirect_sources=[
-                            ColumnRef(dataset_id=d, name=c)
-                            for d, c in sorted(frame.indirect | column.indirect)
-                        ],
+                        sources=[ColumnRef(dataset_id=d, name=c) for d, c in sources],
+                        indirect_sources=[ColumnRef(dataset_id=d, name=c) for d, c in indirect],
                         transformation=Transformation(
                             expression=column.text,
                             kind=column.kind,
@@ -916,7 +1088,12 @@ class PythonWorker:
             active.add(key)
             invoked.add(key)
             try:
-                return statements(function.body)
+                returned = statements(function.body)
+                if isinstance(returned, Frame):
+                    # A frame that reached here came through a helper call: a heuristic.
+                    returned = copy.deepcopy(returned)
+                    returned.inferred = True
+                return None if returned is NO_RETURN else returned
             finally:
                 active.remove(key)
                 state = old
@@ -940,7 +1117,7 @@ class PythonWorker:
             """
             if not self.index:
                 return None
-            helper = self.index.resolve_module(module, state.source, level)
+            helper = resolve_import(module, level, state.source, self.index)
             if helper is None:
                 return None
             if helper.path in loading_modules or state.depth >= self.max_import_depth:
@@ -987,6 +1164,18 @@ class PythonWorker:
             """
             if node is None:
                 return None
+            if isinstance(node, ast.NamedExpr):
+                # Walrus: bind the name, then behave as the assigned expression.
+                value = evaluate(node.value)
+                if isinstance(node.target, ast.Name):
+                    state.env[node.target.id] = value
+                return value
+            if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+                # Container elements are real call sites; a tuple assignment reads them.
+                values = [evaluate(element) for element in node.elts]
+                if any(isinstance(v, (Frame, Column)) for v in values):
+                    return values
+                return folded(node)
             if isinstance(node, ast.Name):
                 return state.env.get(node.id, folded(node))
             if isinstance(node, ast.Constant):
@@ -1013,7 +1202,7 @@ class PythonWorker:
                     return out
                 return folded(node)
             if isinstance(node, ast.Attribute):
-                if node.attr == "read" and ast.unparse(node.value) in {"spark", "sqlContext"}:
+                if node.attr == "read" and unparse(node.value) in {"spark", "sqlContext"}:
                     return Reader()
                 base = evaluate(node.value)
                 if isinstance(base, State):
@@ -1034,7 +1223,7 @@ class PythonWorker:
                     {k: evaluate(v) for k, v in keywords.items()},
                     state,
                 )
-            first = ast.unparse(node.func).split(".")[0]
+            first = unparse(node.func).split(".")[0]
             imported = state.imports.get(first)
             if imported and self.index:
                 module_name, level = imported
@@ -1087,6 +1276,9 @@ class PythonWorker:
                     if resolved is not None:
                         reader.options[key] = ast.Constant(resolved)
                 return reader
+            if isinstance(receiver, Connection) and method in {"cursor", "connect", "begin"}:
+                # A cursor speaks its connection's dialect (review finding 34).
+                return receiver
             if isinstance(receiver, Column):
                 return col_expr(node, Frame())
             if isinstance(receiver, Frame) and method not in {
@@ -1117,13 +1309,27 @@ class PythonWorker:
                             import sqlglot
 
                             expr = sqlglot.parse_one(text, read="spark")
+                            if isinstance(expr, sqlglot.exp.Star):
+                                # "*" is every known column, not a column named "*".
+                                out.columns.update(copy.deepcopy(receiver.columns))
+                                out.open_columns |= receiver.open_columns
+                                continue
                             value = sql_expression(ast.Constant(expr.unalias().sql()), receiver)
-                            out.columns[expr.alias_or_name] = value
+                            if resolvable_column(expr.alias_or_name):
+                                out.columns[expr.alias_or_name] = value
+                            else:
+                                out.partial = True
+                                issue(arg, "Cannot determine output column name", "unknown_column")
                     else:
                         out = select_frame(receiver, node.args)
                 elif method in {"withColumn", "with_columns", "assign"}:
                     if method == "withColumn":
-                        out.columns[folded(node.args[0]).text] = col_expr(node.args[1], receiver)
+                        name = folded(node.args[0]).text
+                        if resolvable_column(name):
+                            out.columns[name] = col_expr(node.args[1], receiver)
+                        else:
+                            out.partial = True
+                            issue(node, "Cannot determine output column name", "unknown_column")
                     elif method == "assign":
                         for key, value in keywords.items():
                             if isinstance(value, ast.Lambda):
@@ -1263,7 +1469,7 @@ class PythonWorker:
                     for key, value in keywords.items():
                         if isinstance(value, ast.Tuple) and len(value.elts) == 2:
                             col = receiver.column(folded(value.elts[0]).text)
-                            col.kind, col.text = "aggregation", ast.unparse(value)
+                            col.kind, col.text = "aggregation", unparse(value)
                             out.columns[key] = col
                 elif method in {"sum", "mean", "min", "max", "count"}:
                     if receiver.group:
@@ -1273,7 +1479,7 @@ class PythonWorker:
                                 col.text = f"{method}({col.text})"
                         out.open_columns = False
                     else:
-                        return Column(text=ast.unparse(node), kind="aggregation")
+                        return Column(text=unparse(node), kind="aggregation")
                 elif method in {"union", "unionByName", "vstack"}:
                     right = evaluate(node.args[0])
                     if isinstance(right, Frame):
@@ -1282,29 +1488,55 @@ class PythonWorker:
                         out.partial |= right.partial
                         out.open_columns |= right.open_columns
                         for position, key in enumerate(list(out.columns)):
-                            right_key = (
-                                key
-                                if method != "union"
-                                else (
-                                    list(right.columns)[position]
-                                    if position < len(right.columns)
-                                    else ""
-                                )
-                            )
+                            right_key = key
+                            if method == "union":
+                                # Positional union: the right frame's column list must be
+                                # known, or the branch's contribution cannot be named.
+                                if position >= len(right.columns):
+                                    out.columns[key].partial = True
+                                    issue(
+                                        node,
+                                        f"Union branch has no column matching position "
+                                        f"{position} for {key!r}",
+                                        "unknown_column",
+                                    )
+                                    continue
+                                right_key = list(right.columns)[position]
                             col = right.column(right_key)
                             out.columns[key].sources |= col.sources
                             out.columns[key].partial |= col.partial
+                            out.columns[key].indirect |= col.indirect
+                            # A union column is derived the way either branch derived it.
+                            kinds = {out.columns[key].kind, col.kind} - {"identity"}
+                            out.columns[key].kind = (
+                                kinds.pop()
+                                if len(kinds) == 1
+                                else "expression"
+                                if kinds
+                                else "identity"
+                            )
                         if method == "unionByName":
                             for key in right.columns.keys() - out.columns.keys():
                                 out.columns[key] = right.columns[key]
                     else:
                         out.partial = True
+                elif method in {"format", "option", "options"}:
+                    # Writer builder options; ".option('path', ...)" names the output.
+                    if method == "option" and len(node.args) >= 2:
+                        out.write_options[folded(node.args[0]).text] = node.args[1]
+                    elif method == "options":
+                        out.write_options.update(keywords)
+                    elif node.args:
+                        out.write_options["format"] = node.args[0]
+                    # Capture the path at the builder call, not after a later reassignment.
+                    path = out.write_options.get("path")
+                    if path is not None and not isinstance(path, ast.Constant):
+                        resolved = concrete(path, "dynamic_path")
+                        if resolved is not None:
+                            out.write_options["path"] = ast.Constant(resolved)
                 elif method in {
                     "mode",
                     "partitionBy",
-                    "format",
-                    "option",
-                    "options",
                     "copy",
                     "dropDuplicates",
                     "drop_duplicates",
@@ -1326,6 +1558,8 @@ class PythonWorker:
                 else:
                     out.partial = True
                     issue(node, f"Frame method {method!r} has no handler", "unknown_column")
+                    for argument in [*node.args, *(kw.value for kw in node.keywords)]:
+                        evaluate(argument)
                 return out
 
             sink = match_sink(name)
@@ -1339,7 +1573,27 @@ class PythonWorker:
                 "table",
             }:
                 sink = match_sink("read." + method)
+            if isinstance(receiver, Frame) and method in {
+                "parquet",
+                "csv",
+                "json",
+                "orc",
+                "text",
+                "save",
+            }:
+                # Writer builder chains (df.write.mode(...).parquet(path)) lose the
+                # "write." prefix from the callee text, so resolve them the way readers are.
+                writer = match_sink("write." + method)
+                sink = writer if writer and writer.direction == "write" else sink
             if method in {"load", "save"} and not isinstance(receiver, (Reader, Frame)):
+                sink = None
+            if (
+                sink
+                and sink.callee in {"execute", "executemany"}
+                and not isinstance(receiver, Connection)
+            ):
+                # Any object can have an "execute" method; only a connection or cursor
+                # makes its first argument SQL (review finding 32).
                 sink = None
             if sink:
                 arg = (
@@ -1349,6 +1603,8 @@ class PythonWorker:
                 )
                 if arg is None and isinstance(receiver, Reader):
                     arg = receiver.options.get("path")
+                if arg is None and isinstance(receiver, Frame):
+                    arg = receiver.write_options.get("path")
                 if arg is None:
                     # Builder calls such as .load() require option tracking, not a guessed path.
                     issue(node, "Dataset argument is unavailable", "dynamic_table_name")
@@ -1364,7 +1620,7 @@ class PythonWorker:
                     (
                         list(arg.elts)
                         if isinstance(arg, (ast.List, ast.Tuple))
-                        else list(node.args)
+                        else (list(node.args) or [arg])
                         if isinstance(receiver, Reader) and method == "parquet"
                         else [arg]
                     )
@@ -1381,6 +1637,9 @@ class PythonWorker:
                         if len(node.args) > 1
                         else evaluate(keywords.get("con") or keywords.get("connection"))
                     )
+                    if not isinstance(connection, Connection) and isinstance(receiver, Connection):
+                        # conn.cursor().execute(...): the receiver carries the dialect.
+                        connection = receiver
                     engine = (
                         connection.engine if isinstance(connection, Connection) else default_engine
                     )
@@ -1479,6 +1738,9 @@ class PythonWorker:
                 ("F.", "pl.", "pyspark.sql.functions.", "Window.", "pyspark.sql.Window.")
             ):
                 return Expression(node)
+            # An unknown call is still a call: its arguments may read datasets.
+            for argument in [*node.args, *(kw.value for kw in node.keywords)]:
+                evaluate(argument)
             return folded(node)
 
         def statements(body):
@@ -1503,10 +1765,14 @@ class PythonWorker:
                 The value of a ``return`` statement encountered directly in ``body``, or
                 ``None`` when none is reached.
             """
+            pending = NO_RETURN
             for node in body:
                 try:
                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         state.functions[node.name] = node
+                    elif isinstance(node, ast.ClassDef):
+                        # Class bodies read datasets too; methods register as functions.
+                        pending = merge_returns(pending, statements(node.body))
                     elif isinstance(node, ast.Import):
                         for alias in node.names:
                             state.imports[alias.asname or alias.name] = (alias.name, 0)
@@ -1528,36 +1794,66 @@ class PythonWorker:
                         for target in targets:
                             if isinstance(target, ast.Name):
                                 state.env[target.id] = value
+                            elif isinstance(target, (ast.Tuple, ast.List)):
+                                # Unpacking: bind each name to its own element.
+                                items = value if isinstance(value, list) else []
+                                for element, item in zip(target.elts, items, strict=False):
+                                    if isinstance(element, ast.Name):
+                                        state.env[element.id] = item
+                                for element in target.elts[len(items) :]:
+                                    if isinstance(element, ast.Name):
+                                        state.env[element.id] = Folded("{{?}}", False, [element.id])
                             elif isinstance(target, ast.Subscript):
                                 frame = evaluate(target.value)
                                 if isinstance(frame, Frame):
                                     frame.columns[folded(target.slice).text] = col_expr(
                                         node.value, frame
                                     )
+                    elif isinstance(node, ast.AugAssign):
+                        # "t += x" is "t = t + x"; folding it keeps the name concrete.
+                        combined = ast.copy_location(
+                            ast.BinOp(
+                                left=ast.copy_location(
+                                    ast.Name(id=getattr(node.target, "id", ""), ctx=ast.Load()),
+                                    node,
+                                ),
+                                op=node.op,
+                                right=node.value,
+                            ),
+                            node,
+                        )
+                        value = evaluate(combined)
+                        if isinstance(node.target, ast.Name):
+                            state.env[node.target.id] = value
                     elif isinstance(node, ast.Expr):
                         evaluate(node.value)
                     elif isinstance(node, ast.Return):
-                        return evaluate(node.value)
+                        return merge_returns(pending, evaluate(node.value))
                     elif isinstance(node, ast.If):
-                        if "__name__" in ast.unparse(node.test):
-                            statements(node.body)
+                        if "__name__" in unparse(node.test):
+                            pending = merge_returns(pending, statements(node.body))
                         else:
+                            evaluate(node.test)
                             original = copy.deepcopy(state.env)
-                            statements(node.body)
+                            taken = statements(node.body)
                             left = state.env
                             state.env = copy.deepcopy(original)
-                            statements(node.orelse)
+                            skipped = statements(node.orelse)
                             for key in set(left) | set(state.env):
                                 a, b = left.get(key), state.env.get(key)
                                 if a != b:
                                     if isinstance(a, Frame) and isinstance(b, Frame):
-                                        a.sources |= b.sources
-                                        a.partial = True
-                                        state.env[key] = a
+                                        state.env[key] = merge_returns(a, b)
                                     else:
                                         state.env[key] = Folded("{{?}}", False, [key])
+                            if taken is not NO_RETURN and skipped is not NO_RETURN:
+                                # Every path through this statement returns.
+                                return merge_returns(pending, merge_returns(taken, skipped))
+                            pending = merge_returns(pending, merge_returns(taken, skipped))
                     elif isinstance(node, (ast.With, ast.AsyncWith)):
-                        statements(node.body)
+                        returned = statements(node.body)
+                        if returned is not NO_RETURN:
+                            return merge_returns(pending, returned)
                     elif (
                         isinstance(node, ast.For)
                         and isinstance(node.target, ast.Name)
@@ -1574,15 +1870,44 @@ class PythonWorker:
                             state.env[node.target.id] = evaluate(item)
                             statements(node.body)
                         statements(node.orelse)
-                    elif isinstance(node, (ast.For, ast.While, ast.Try)):
-                        issue(node, "Dynamic control flow analyzed conservatively")
-                        statements(node.body)
+                    elif isinstance(node, (ast.For, ast.AsyncFor, ast.While, ast.Try, ast.Match)):
+                        issue(
+                            node,
+                            "Dynamic control flow analyzed conservatively",
+                            "analysis_note",
+                        )
+                        bodies = []
+                        if isinstance(node, (ast.For, ast.AsyncFor)):
+                            iterated = evaluate(node.iter)
+                            if isinstance(node.target, ast.Name):
+                                state.env[node.target.id] = (
+                                    iterated
+                                    if isinstance(iterated, Frame)
+                                    else Folded("{{?}}", False, [node.target.id])
+                                )
+                            bodies = [node.body, node.orelse]
+                        elif isinstance(node, ast.While):
+                            evaluate(node.test)
+                            bodies = [node.body, node.orelse]
+                        elif isinstance(node, ast.Match):
+                            evaluate(node.subject)
+                            bodies = [case.body for case in node.cases]
+                        else:
+                            # Every part of a try statement can run, handlers included.
+                            bodies = [
+                                node.body,
+                                *(handler.body for handler in node.handlers),
+                                node.orelse,
+                                node.finalbody,
+                            ]
+                        for branch in bodies:
+                            pending = merge_returns(pending, statements(branch))
                         for value in state.env.values():
                             if isinstance(value, Frame):
                                 value.partial = True
                 except Exception as exc:
                     issue(node, f"{type(exc).__name__}: {exc}")
-            return None
+            return pending
 
         def load_module(source, module_state, definitions_only=False):
             """Parse a module and interpret its body under ``module_state``.

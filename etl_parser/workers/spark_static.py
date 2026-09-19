@@ -4,13 +4,23 @@ The design spec describes ``SparkStaticWorker`` as sharing the DataFrame tracker
 ``PythonWorker`` and handling ``select``, ``withColumn``, ``withColumnRenamed``, ``drop``,
 ``filter``, ``where``, ``join``, ``groupBy().agg``, ``alias``, ``union``, and
 ``F.col``/``F.expr``/``F.lit`` expressions, with ``F.expr``/``selectExpr`` strings routed to
-sqlglot under the ``spark`` dialect. In this implementation that behavior lives entirely in
-:class:`etl_parser.workers.python.PythonWorker` (see section 8.2), which already recognizes
-PySpark call patterns and sets ``engine="spark"`` when ``pyspark`` appears in the source text.
-``SparkStaticWorker`` is therefore a re-export: an alias to ``PythonWorker`` so callers that
-expect a distinct PySpark entry point get the same analyzer.
+sqlglot under the ``spark`` dialect. That behavior lives in
+:class:`etl_parser.workers.python.PythonWorker` (see section 8.2), which recognizes PySpark
+call patterns as part of one shared tracker. ``SparkStaticWorker`` is the PySpark entry
+point onto it: it pins the language instead of detecting it, so a Spark file that never
+imports ``pyspark`` (a Databricks notebook or a Glue script with an injected session) is
+still reported as ``pyspark``/``spark`` and stamps ``parser="spark_static"`` on its edges.
 """
 
 from etl_parser.workers.python import PythonWorker
 
-SparkStaticWorker = PythonWorker
+
+class SparkStaticWorker(PythonWorker):
+    """A :class:`~etl_parser.workers.python.PythonWorker` pinned to PySpark.
+
+    Attributes:
+        language (str): Always ``"pyspark"``, so edges carry ``parser="spark_static"`` and
+            jobs carry ``engine="spark"`` without depending on the file's imports.
+    """
+
+    language = "pyspark"

@@ -316,6 +316,8 @@ class RepoScanner:
             relative = path.relative_to(root).as_posix()
             try:
                 if path.suffix == ".zip":
+                    if path.stat().st_size > self.max_archive_bytes:
+                        raise ValueError("ZIP archive exceeds configured size limit")
                     if observer:
                         observer.count("archives.opened")
                     self._zip(path, relative, index)
@@ -389,6 +391,7 @@ class RepoScanner:
             if sum(m.file_size for m in members) > self.max_archive_bytes:
                 raise ValueError("ZIP exceeds configured uncompressed size limit")
             names: set[str] = set()
+            total = 0
             for member in members:
                 name = PurePosixPath(member.filename)
                 invalid = (
@@ -421,20 +424,75 @@ class RepoScanner:
                     if observer:
                         observer.count("archives.members_skipped")
                     continue
-                if member.file_size > self.max_file_bytes:
-                    raise ValueError(f"ZIP member exceeds file size limit: {member.filename}")
-                text = archive.read(member).decode("utf-8")
-                index.files.append(
-                    SourceFile(f"{relative}!/{member.filename}", text, name.suffix, relative)
-                )
+                member_path = f"{relative}!/{member.filename}"
+                try:
+                    if member.file_size > self.max_file_bytes:
+                        raise ValueError("ZIP member exceeds file size limit")
+                    # The header's size is a claim, not a fact: read one byte past the
+                    # limit and judge by what actually arrives (review finding 36).
+                    with archive.open(member) as handle:
+                        raw = handle.read(self.max_file_bytes + 1)
+                    if len(raw) > self.max_file_bytes:
+                        raise ValueError("ZIP member exceeds file size limit when decompressed")
+                    total += len(raw)
+                    if total > self.max_archive_bytes:
+                        raise ValueError("ZIP exceeds configured uncompressed size limit")
+                    text = raw.decode("utf-8")
+                except (OSError, UnicodeError, ValueError, zipfile.BadZipFile, RuntimeError) as exc:
+                    # One unreadable member is not a reason to drop the others.
+                    if observer:
+                        observer.count("archives.members_rejected")
+                        observer.event(
+                            "archive.member_rejected",
+                            level="WARNING",
+                            source=member_path,
+                            reason=type(exc).__name__,
+                        )
+                    index.unresolved.append(
+                        Unresolved(
+                            kind="unsupported_syntax",
+                            source_file=member_path,
+                            reason=f"archive member read: {exc}",
+                        )
+                    )
+                    continue
+                index.files.append(SourceFile(member_path, text, name.suffix, relative))
                 if observer:
                     observer.count("archives.members_read")
                     observer.event(
                         "archive.member_read",
                         level="DEBUG",
-                        source=f"{relative}!/{member.filename}",
-                        size_bytes=member.file_size,
+                        source=member_path,
+                        size_bytes=len(raw),
                     )
+
+
+def imports_package(source: SourceFile, *packages: str) -> bool:
+    """Detect whether a Python source file imports any of ``packages``.
+
+    Import statements are the only reliable statement of what a file runs on: a package
+    name in a comment or a string is not a dependency (review finding 33). The file is
+    parsed, never imported or executed.
+
+    Args:
+        source (SourceFile): The Python file to inspect.
+        *packages (str): Top-level package names to look for, for example ``"pyspark"``.
+
+    Returns:
+        bool: ``True`` if any top-level or nested ``import <pkg>...`` or
+        ``from <pkg>... import ...`` statement is present; ``False`` if none is found or
+        the file fails to parse as Python.
+    """
+    try:
+        tree = ast.parse(source.text)
+    except SyntaxError:
+        return False
+    roots = tuple(packages)
+    return any(
+        (isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] in roots)
+        or (isinstance(n, ast.Import) and any(a.name.split(".")[0] in roots for a in n.names))
+        for n in ast.walk(tree)
+    )
 
 
 def imports_airflow(source: SourceFile) -> bool:
@@ -447,16 +505,7 @@ def imports_airflow(source: SourceFile) -> bool:
         source (SourceFile): The Python file to inspect.
 
     Returns:
-        bool: ``True`` if any top-level or nested ``import airflow...`` or
-        ``from airflow... import ...`` statement is present; ``False`` if none is found or
-        the file fails to parse as Python.
+        bool: ``True`` if the file imports ``airflow``; ``False`` if it does not or the
+        file fails to parse as Python.
     """
-    try:
-        tree = ast.parse(source.text)
-    except SyntaxError:
-        return False
-    return any(
-        (isinstance(n, ast.ImportFrom) and (n.module or "").startswith("airflow"))
-        or (isinstance(n, ast.Import) and any(a.name.startswith("airflow") for a in n.names))
-        for n in ast.walk(tree)
-    )
+    return imports_package(source, "airflow")

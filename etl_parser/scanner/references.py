@@ -25,6 +25,31 @@ from etl_parser.scanner.strings import Folded, fold_string
 from etl_parser.workers.base import job_id_for, repo_relative
 
 
+def qualified_callee(node: ast.AST, aliases: Mapping[str, str]) -> str:
+    """Render a call target's fully qualified name, resolving import aliases.
+
+    Shared by this pass and :class:`etl_parser.workers.python.PythonWorker` so both
+    resolve a call site to the same name and therefore to the same sink table entry.
+
+    Args:
+        node (ast.AST): The ``Call.func`` expression to render.
+        aliases (Mapping[str, str]): Local name to dotted module/callable name, as
+            introduced by the file's import statements.
+
+    Returns:
+        str: The dotted callee text with its leading name resolved through ``aliases``
+        and, for ``pandas``/``polars``/``awswrangler`` targets, rewritten to the
+        ``pd.``/``pl.``/``wr.`` shorthand the sink table is written in.
+    """
+    text = ast.unparse(node)
+    first, dot, rest = text.partition(".")
+    text = aliases.get(first, first) + (dot + rest if dot else "")
+    for package, shorthand in (("pandas", "pd"), ("polars", "pl"), ("awswrangler", "wr")):
+        if text.startswith(package + "."):
+            return shorthand + text[len(package) :]
+    return text
+
+
 class Reference(BaseModel):
     """One recognized sink call site and the resolved (or partially resolved) value found.
 
@@ -151,19 +176,10 @@ def inspect_references(
                 node (ast.expr): The ``Call.func`` expression to render.
 
             Returns:
-                str: The dotted callee text with the leading name resolved through
-                ``self.aliases`` and, when the target is ``pandas``, ``polars``, or
-                ``awswrangler``, rewritten to the ``pd.``/``pl.``/``wr.`` shorthand used by
-                the sink vocabulary.
+                str: The dotted callee text, as resolved by :func:`qualified_callee`
+                against the aliases collected so far.
             """
-            text = ast.unparse(node)
-            first, dot, rest = text.partition(".")
-            text = self.aliases.get(first, first) + (dot + rest if dot else "")
-            # Match sink vocabulary after resolving pandas/polars/wrangler import aliases.
-            for package, shorthand in (("pandas", "pd"), ("polars", "pl"), ("awswrangler", "wr")):
-                if text.startswith(package + "."):
-                    return shorthand + text[len(package) :]
-            return text
+            return qualified_callee(node, self.aliases)
 
         def visit_Assign(self, node):
             """Visit an assignment's value, fold it, and bind or invalidate each target.
