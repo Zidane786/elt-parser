@@ -184,6 +184,10 @@ def build_graph(
     def add(job, upstream, evidence, dataset=None):
         """Record that ``job`` depends on ``upstream``, merging evidence if already known.
 
+        ``in_place_writer`` is computed per linking dataset (review finding 29): it is true
+        only when ``upstream`` both reads and writes one of the datasets that actually link
+        the two jobs, not merely when it reads and writes something.
+
         Args:
             job: Id of the dependent job.
             upstream: Id of the job it depends on.
@@ -196,14 +200,20 @@ def build_graph(
         dep.sources = sorted(set(dep.sources) | {evidence})
         if dataset:
             dep.via_datasets = sorted(set(dep.via_datasets) | {dataset})
-        parent = jobs[upstream]
-        dep.in_place_writer = bool(set(parent.inputs) & set(parent.outputs))
+            parent = jobs[upstream]
+            if dataset in parent.inputs and dataset in parent.outputs:
+                dep.in_place_writer = True
 
+    # An in-place writer is only excluded while some other job also writes the dataset, in
+    # which case that other job is the producer and ordering is unknowable (finding 3). A
+    # sole writer is always the producer, flagged so consumers can see it rewrites in place.
     for job in jobs.values():
         for dataset in job.inputs:
             for upstream in writers[dataset]:
-                if dataset not in jobs[upstream].inputs:
-                    add(job.id, upstream, "data", dataset)
+                in_place = dataset in jobs[upstream].inputs
+                if in_place and writers[dataset] - {upstream}:
+                    continue
+                add(job.id, upstream, "data", dataset)
     # Task-only nodes (e.g. EmptyOperator) still carry ordering between linked jobs.
     task_graph = nx.DiGraph()
 
