@@ -220,6 +220,21 @@ def test_variable_reuse_binds_at_assignment_time(tmp_path):
     assert upstream(result, "d", "one") == []
 
 
+def test_assignment_from_a_plain_call_binds_nothing_and_terminates(tmp_path):
+    result = analyze(
+        tmp_path,
+        "import os\n"
+        'INTERVAL = os.getenv("SCHEDULE", "@daily")\n'
+        'with DAG("d", schedule=INTERVAL):\n'
+        '    a = EmptyOperator(task_id="a")\n'
+        "    helper = compute()\n"
+        "    helper >> a\n",
+    )
+    assert set(tasks(result)) == {"airflow.dag.d.a"}
+    assert upstream(result, "d", "a") == []
+    assert all(u.kind != "unsupported_syntax" for u in result.unresolved)
+
+
 # --------------------------------------------------- SQL operators, offsets (15)
 def test_embedded_sql_lines_anchor_to_the_string_constant(tmp_path):
     result = analyze(
