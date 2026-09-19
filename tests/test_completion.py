@@ -250,11 +250,14 @@ def test_catalog_keeps_engines_separate_and_preserves_descriptions():
             }
         ]
     }
-    catalog = export_agent_catalog(doc, prior)
+    # The glue table exists only in code, so adding it now requires include_code_schema;
+    # every assertion below is unchanged (WP-A source-of-truth default).
+    catalog = export_agent_catalog(doc, prior, include_code_schema=True)
     tables = {t["dataset_id"]: t for d in catalog["databases"] for t in d["tables"]}
     assert set(tables) == {"glue://db/t", "postgres://db/t"}
     assert tables["postgres://db/t"]["description"] == "Postgres source"
     assert not tables["glue://db/t"]["description"]
+    assert {d["db_type"] for d in catalog["databases"]} == {"postgres", "athena"}
 
 
 def test_openlineage_preserves_direct_and_indirect_roles(tmp_path):

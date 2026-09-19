@@ -6,14 +6,16 @@ from pathlib import Path
 import pytest
 
 from etl_parser.export import agent_catalog
-from etl_parser.export.agent_catalog import export_agent_catalog
+from etl_parser.export.agent_catalog import CATALOG_SECTIONS, export_agent_catalog
 from etl_parser.models import (
+    ColumnEdge,
     ColumnRef,
     DatasetRef,
     Job,
     JoinCondition,
     LineageDocument,
     Provenance,
+    Schedule,
     Unresolved,
 )
 from etl_parser.pipeline import scan
@@ -80,6 +82,34 @@ def test_several_same_name_prior_databases_prefer_matching_scheme():
     assert len(catalog["databases"]) == 2
     assert "dataset_id" not in catalog["databases"][0]["tables"][0]
     assert catalog["databases"][1]["tables"][0]["dataset_id"] == "glue://db/t"
+
+
+def test_single_name_match_is_withheld_when_another_scheme_claims_it():
+    doc = LineageDocument(
+        datasets=[
+            DatasetRef(id=f"{engine}://db/t", namespace=f"{engine}://db", name="t", columns=["x"])
+            for engine in ("glue", "postgres")
+        ]
+    )
+    prior = {
+        "databases": [
+            {
+                "db_name": "db",
+                "db_type": "postgres",
+                "tables": [{"table_name": "t", "description": "Postgres source", "schema": []}],
+            }
+        ]
+    }
+    catalog = export_agent_catalog(doc, prior, include_code_schema=True)
+    tables = {t["dataset_id"]: t for d in catalog["databases"] for t in d["tables"]}
+    assert set(tables) == {"glue://db/t", "postgres://db/t"}
+    assert tables["postgres://db/t"]["description"] == "Postgres source"
+    assert [d["db_type"] for d in catalog["databases"]] == ["postgres", "athena"]
+    # Without a rival postgres dataset the same prior entry is the glue dataset's target.
+    only_glue = LineageDocument(datasets=[doc.datasets[0]])
+    merged = export_agent_catalog(only_glue, prior)
+    assert len(merged["databases"]) == 1
+    assert merged["databases"][0]["tables"][0]["dataset_id"] == "glue://db/t"
 
 
 def test_glue_database_names_match_prior_case_insensitively():
@@ -394,3 +424,87 @@ def test_schema_drift_is_logged_once_with_counts(monkeypatch):
             },
         )
     ]
+
+
+def test_generate_validates_section_names():
+    assert CATALOG_SECTIONS == ("databases", "scripts", "relations", "lineage", "schedules")
+    with pytest.raises(ValueError) as error:
+        export_agent_catalog(LineageDocument(), generate=["scripts", "bogus"])
+    assert "bogus" in str(error.value)
+    assert all(name in str(error.value) for name in CATALOG_SECTIONS)
+
+
+def test_generate_regenerates_only_selected_sections_and_passes_the_rest_through():
+    prior = {
+        **drift_prior(),
+        "scripts": [{"script_name": "stale", "script_path": "stale.py"}],
+        "relations": [{"custom": "kept"}],
+        "lineage": {"column_edges": ["prior"], "unresolved": ["prior"]},
+        "schedules": {"prior": "kept"},
+    }
+    catalog = export_agent_catalog(drift_document(), prior, generate=["scripts"])
+    assert [s["job_id"] for s in catalog["scripts"][:3]] == ["j1", "j2", "j3"]
+    assert catalog["scripts"][-1] == prior["scripts"][0]
+    for section in ("databases", "relations", "lineage", "schedules"):
+        assert catalog[section] == prior[section]
+    assert "schema_drift" not in catalog and "relations_inferred" not in catalog
+    only_scripts = export_agent_catalog(drift_document(), generate=("scripts",))
+    assert set(only_scripts) == {"scripts"}
+    databases_only = export_agent_catalog(drift_document(), prior, generate=["databases"])
+    assert databases_only["scripts"] == prior["scripts"]
+    assert "schema_drift" in databases_only and "relations_inferred" not in databases_only
+    everything = export_agent_catalog(drift_document(), prior, generate=[])
+    assert set(everything) >= set(CATALOG_SECTIONS) | {"schema_drift", "relations_inferred"}
+
+
+def selection_document():
+    provenance = Provenance(parser="sqlglot")
+    doc = drift_document()
+    doc.column_edges = [
+        ColumnEdge(
+            target=ColumnRef(dataset_id="glue://db/t", name="x"),
+            sources=[ColumnRef(dataset_id="glue://db/new", name="a")],
+            provenance=provenance,
+            job_id="j2",
+        ),
+        ColumnEdge(
+            target=ColumnRef(dataset_id="glue://other/o", name="k"),
+            provenance=provenance,
+            job_id="j3",
+        ),
+    ]
+    doc.join_conditions = [
+        join(("glue://db/t", "x"), ("glue://db/new", "a"), "j2"),
+        join(("glue://other/o", "k"), ("glue://elsewhere/e", "k"), "j3"),
+    ]
+    doc.unresolved.append(Unresolved(kind="dynamic_sql", reason="other", job_id="j3"))
+    doc.schedules = {
+        "d.j2": Schedule(id="d.j2", orchestrator="airflow"),
+        "d.j3": Schedule(id="d.j3", orchestrator="airflow"),
+    }
+    doc.jobs[1].schedule_id = "d.j2"
+    doc.jobs[2].schedule_id = "d.j3"
+    return doc
+
+
+def test_databases_filter_restricts_generation_to_the_named_databases():
+    prior = drift_prior()
+    prior["databases"].append(
+        {"db_name": "other", "db_type": "sqlite", "tables": [{"table_name": "o", "schema": []}]}
+    )
+    prior["scripts"] = [{"job_id": "j3", "script_path": "z/j3.py", "description": "stale"}]
+    prior["lineage"] = {"column_edges": [{"target": {"dataset_id": "glue://other/o"}}]}
+    prior["schedules"] = {"d.j3": {"id": "prior"}}
+    catalog = export_agent_catalog(selection_document(), prior, databases=["DB"])
+    other = next(d for d in catalog["databases"] if d["db_name"] == "other")
+    assert other == prior["databases"][1]
+    assert catalog["schema_drift"]["unused_in_code"] == [{"db_name": "db", "table_name": "unused"}]
+    assert [d["db_name"] for d in catalog["schema_drift"]["code_only"]["databases"]] == ["db"]
+    assert [s.get("job_id") for s in catalog["scripts"]] == ["j1", "j2", "j3"]
+    assert catalog["scripts"][2] == prior["scripts"][0]
+    assert [r["from_table"] for r in catalog["relations_inferred"]] == ["db.new"]
+    assert [e["job_id"] for e in catalog["lineage"]["column_edges"] if "job_id" in e] == ["j2"]
+    assert catalog["lineage"]["column_edges"][-1] == prior["lineage"]["column_edges"][0]
+    assert [u["job_id"] for u in catalog["lineage"]["unresolved"]] == ["j1", "j1", "j2"]
+    generated = Schedule(id="d.j2", orchestrator="airflow").model_dump(mode="json")
+    assert catalog["schedules"] == {"d.j2": generated, "d.j3": {"id": "prior"}}

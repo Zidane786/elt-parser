@@ -62,29 +62,33 @@ def _same_db_name(prior_name, namespace, scheme):
     return prior_name == namespace
 
 
-def _find_database(databases, namespace, scheme):
+def _find_database(databases, namespace, scheme, rival_schemes=()):
     """Pick the catalog database a dataset belongs to, matching by name first.
 
-    A single database with the dataset's name is the target regardless of its
-    ``db_type`` (the source system, not the code, decides the engine). When several
-    share the name, the one whose type maps to the dataset scheme wins, then one with no
-    type; otherwise there is no match.
+    A database whose type maps to the dataset's scheme wins, then one with no type. A
+    single database with the dataset's name is otherwise the target regardless of its
+    ``db_type``, because the source system (which may catalogue a Glue database as
+    ``sqlite``), not the code, decides the engine. That last fallback is withheld when
+    another dataset in the same namespace does have the prior entry's scheme: the entry
+    describes that dataset's database, so this one needs its own.
 
     Args:
         databases: The catalog ``databases`` list.
         namespace: Namespace part of the dataset id.
         scheme: Scheme part of the dataset id.
+        rival_schemes: Schemes of every dataset sharing this namespace, used to withhold
+            the single-name fallback.
 
     Returns:
         dict | None: The matching database entry, or ``None`` when a new one is needed.
     """
     candidates = [d for d in databases if _same_db_name(d.get("db_name"), namespace, scheme)]
-    if len(candidates) == 1:
-        return candidates[0]
     for wanted in (scheme, ""):
         for database in candidates:
             if _database_scheme(database) == wanted:
                 return database
+    if len(candidates) == 1 and _database_scheme(candidates[0]) not in set(rival_schemes):
+        return candidates[0]
     return None
 
 
@@ -311,6 +315,127 @@ def _log_drift(schema_drift):
     )
 
 
+CATALOG_SECTIONS = ("databases", "scripts", "relations", "lineage", "schedules")
+"""Top-level catalog sections ``export_agent_catalog(generate=...)`` can (re)generate.
+
+``schema_drift`` belongs to ``databases`` and ``relations_inferred`` to ``relations``.
+"""
+
+
+def _sections(generate):
+    """Validate and normalize the ``generate`` selection.
+
+    Args:
+        generate: Iterable of section names, a single name, or ``None``/empty for all.
+
+    Returns:
+        set[str]: The selected section names.
+
+    Raises:
+        ValueError: If a name is not one of :data:`CATALOG_SECTIONS`.
+    """
+    if isinstance(generate, str):
+        generate = [generate]
+    selected = set(generate or ())
+    unknown = sorted(selected - set(CATALOG_SECTIONS))
+    if unknown:
+        raise ValueError(
+            f"Unknown catalog section(s) {unknown}; valid sections are {list(CATALOG_SECTIONS)}"
+        )
+    return selected or set(CATALOG_SECTIONS)
+
+
+class _Scope:
+    """The ``databases`` restriction: which databases the export may (re)generate.
+
+    Glue identifiers are case-insensitive, so glue-scheme datasets and prior databases
+    with a Glue-family (or missing) ``db_type`` match names ignoring case; other schemes
+    match exactly.
+
+    Attributes:
+        names: The selected database names as given.
+        lowered: The same names lower-cased.
+    """
+
+    def __init__(self, names):
+        """Record the selected names.
+
+        Args:
+            names: Iterable of ``db_name`` values.
+        """
+        self.names = set(names)
+        self.lowered = {name.lower() for name in self.names}
+
+    def namespace(self, namespace, scheme):
+        """Tell whether a dataset namespace is selected.
+
+        Args:
+            namespace: Namespace part of a dataset id.
+            scheme: Scheme part of a dataset id.
+
+        Returns:
+            bool: True when the namespace names a selected database.
+        """
+        if namespace in self.names:
+            return True
+        return scheme in {"glue", ""} and namespace.lower() in self.lowered
+
+    def dataset(self, dataset_id):
+        """Tell whether a canonical dataset id lies in a selected database.
+
+        Args:
+            dataset_id: A ``scheme://namespace/name`` id (anything else is out of scope).
+
+        Returns:
+            bool: True when the dataset's namespace is selected.
+        """
+        if not isinstance(dataset_id, str) or "://" not in dataset_id:
+            return False
+        scheme, namespace, _ = split_dataset_id(dataset_id)
+        return self.namespace(namespace, scheme)
+
+    def table_name(self, agent_name):
+        """Tell whether an agent-style ``db.table`` name lies in a selected database.
+
+        Args:
+            agent_name: ``db.table`` as written in ``relations`` entries.
+
+        Returns:
+            bool: True when the ``db`` part is selected.
+        """
+        if not isinstance(agent_name, str) or "://" in agent_name:
+            return False
+        return self.namespace(agent_name.split(".", 1)[0], "")
+
+    def database(self, database):
+        """Tell whether a prior catalog database entry is selected.
+
+        The entry's own ``db_type`` is not consulted: the source system may record a
+        Glue-catalogued database as ``sqlite``, ``athena`` or anything else, and
+        :func:`_find_database` already routes datasets to it by name. Names are therefore
+        compared case-insensitively here.
+
+        Args:
+            database: A ``databases[]`` dict.
+
+        Returns:
+            bool: True when its ``db_name`` is selected.
+        """
+        name = database.get("db_name") or ""
+        return name in self.names or name.lower() in self.lowered
+
+    def job(self, job):
+        """Tell whether a job reads or writes any selected database.
+
+        Args:
+            job: A :class:`~etl_parser.models.Job`.
+
+        Returns:
+            bool: True when at least one input or output dataset is in scope.
+        """
+        return any(self.dataset(d) for d in [*job.inputs, *job.outputs])
+
+
 def _path_suffix_match(prior_path, source_file):
     """Tell whether two script paths denote the same file up to a directory prefix.
 
@@ -370,7 +495,9 @@ def _match_prior_scripts(prior_scripts, jobs):
     return matched, unmatched
 
 
-def export_agent_catalog(doc, prior=None, *, include_code_schema=False):
+def export_agent_catalog(
+    doc, prior=None, *, include_code_schema=False, generate=None, databases=None
+):
     """Build (or update) an agent ``catalog.json`` dict from a lineage document.
 
     The source system (or the prior catalog produced from it) is the truth for
@@ -389,6 +516,17 @@ def export_agent_catalog(doc, prior=None, *, include_code_schema=False):
         include_code_schema: When True, code-only tables and columns are added to
             ``databases`` marked ``schema_source: "code"`` (new glue databases get
             ``db_type: "athena"``). They are still listed under ``schema_drift``.
+        generate: Section names from :data:`CATALOG_SECTIONS` to (re)generate; ``None``
+            or empty means all. Unselected sections are passed through from ``prior``
+            unchanged, or omitted when there is no prior. ``schema_drift`` follows
+            ``databases`` and ``relations_inferred`` follows ``relations``.
+        databases: ``db_name`` values to restrict generation to; ``None`` means all. Only
+            tables, scripts, relations, lineage entries and schedules touching those
+            databases are generated; everything else is passed through from ``prior``
+            unchanged. Glue-scheme names match case-insensitively.
+
+    Raises:
+        ValueError: If ``generate`` names an unknown section.
 
     Returns:
         dict: The catalog, with ``databases`` (schema per table, preserving prior flags
@@ -400,20 +538,54 @@ def export_agent_catalog(doc, prior=None, *, include_code_schema=False):
         ``missing_in_source`` items) and ``schema_drift`` (``code_only.databases`` in the
         ``databases`` shape plus ``unused_in_code``).
     """
-    catalog = copy.deepcopy(prior) if prior is not None else {"databases": [], "relations": []}
-    databases = catalog.setdefault("databases", [])
-    _mark_human_descriptions(databases)
-    prior_scripts, unmatched_scripts = _match_prior_scripts(catalog.get("scripts", []), doc.jobs)
+    sections = _sections(generate)
+    scope = _Scope(databases) if databases is not None else None
+    catalog = copy.deepcopy(prior) if prior is not None else {}
+    missing: list[Unresolved] = []
+    if "databases" in sections:
+        missing = _export_databases(doc, catalog, scope, include_code_schema)
+    if "scripts" in sections:
+        _export_scripts(doc, catalog, scope)
+    if "relations" in sections:
+        _export_relations(doc, catalog, scope)
+    if "schedules" in sections:
+        _export_schedules(doc, catalog, scope)
+    if "lineage" in sections:
+        _export_lineage(doc, catalog, scope, missing)
+    return catalog
 
+
+def _export_databases(doc, catalog, scope, include_code_schema):
+    """Generate the ``databases`` section and ``schema_drift`` (see the exporter docstring).
+
+    Args:
+        doc: The lineage document.
+        catalog: The catalog being built; ``databases`` and ``schema_drift`` are set on it.
+        scope: The ``databases`` restriction, or ``None`` for all.
+        include_code_schema: Whether code-only tables and columns are added to ``databases``.
+
+    Returns:
+        list[Unresolved]: The ``missing_in_source`` items, sorted, for the lineage section.
+    """
+    databases = catalog.setdefault("databases", [])
+    selected = [d for d in databases if scope is None or scope.database(d)]
+    _mark_human_descriptions(selected)
     drift: dict = {}
     missing: list[Unresolved] = []
     touched: set[int] = set()
+    schemes: dict[str, set[str]] = {}
+    for dataset in doc.datasets:
+        if dataset.kind == "table" and not dataset.id.startswith("frame://"):
+            dataset_scheme, dataset_namespace, _ = split_dataset_id(dataset.id)
+            schemes.setdefault(dataset_namespace, set()).add(dataset_scheme)
     for dataset in doc.datasets:
         if dataset.kind != "table" or dataset.id.startswith("frame://"):
             continue
         scheme, namespace, name = split_dataset_id(dataset.id)
+        if scope is not None and not scope.namespace(namespace, scheme):
+            continue
         jobs = _referencing_jobs(doc, dataset)
-        database = _find_database(databases, namespace, scheme)
+        database = _find_database(databases, namespace, scheme, schemes.get(namespace, set()))
         table = None
         if database is not None:
             table = next(
@@ -455,6 +627,27 @@ def export_agent_catalog(doc, prior=None, *, include_code_schema=False):
                     {"field_name": column, "description": "", "schema_source": "code"}
                 )
 
+    missing.sort(key=lambda u: (u.source_file or "", u.line or 0, u.kind, u.reason))
+    catalog["schema_drift"] = {
+        "code_only": {"databases": _drift_databases(drift)},
+        "unused_in_code": _unused_in_code(selected, touched),
+    }
+    _log_drift(catalog["schema_drift"])
+    return missing
+
+
+def _export_scripts(doc, catalog, scope):
+    """Generate the ``scripts`` section, keeping unmatched prior entries at the end.
+
+    Args:
+        doc: The lineage document.
+        catalog: The catalog being built; ``scripts`` is set on it.
+        scope: The ``databases`` restriction, or ``None`` for all. Jobs touching no
+            selected database are left to their prior entries.
+    """
+    in_scope = [j for j in doc.jobs if scope is None or scope.job(j)]
+    prior_scripts, unmatched_scripts = _match_prior_scripts(catalog.get("scripts", []), in_scope)
+
     def reference(ident):
         """Build a ``reads_from``/``writes_to`` entry for a dataset id.
 
@@ -475,7 +668,7 @@ def export_agent_catalog(doc, prior=None, *, include_code_schema=False):
 
     jobs = {j.id: j for j in doc.jobs}
     scripts = []
-    for job in sorted(doc.jobs, key=lambda j: j.id):
+    for job in sorted(in_scope, key=lambda j: j.id):
         old = prior_scripts.get(job.id, {})
         schedule = doc.schedules.get(job.schedule_id)
         deps = doc.job_dependencies.get(job.id, [])
@@ -496,17 +689,90 @@ def export_agent_catalog(doc, prior=None, *, include_code_schema=False):
             }
         )
     catalog["scripts"] = scripts + unmatched_scripts
+
+
+def _export_relations(doc, catalog, scope):
+    """Generate ``relations_inferred``; ``relations`` is only passed through.
+
+    Referential relations belong to the source system, so ``relations`` keeps whatever
+    the prior catalog (or a schema source, with ``source: "database"``) recorded.
+
+    Args:
+        doc: The lineage document.
+        catalog: The catalog being built.
+        scope: The ``databases`` restriction, or ``None`` for all.
+    """
     catalog.setdefault("relations", [])
-    catalog["relations_inferred"] = _relations_inferred(doc.join_conditions)
-    catalog["schedules"] = {k: v.model_dump(mode="json") for k, v in sorted(doc.schedules.items())}
-    missing.sort(key=lambda u: (u.source_file or "", u.line or 0, u.kind, u.reason))
+    inferred = _relations_inferred(doc.join_conditions)
+    if scope is not None:
+        kept = [
+            r
+            for r in catalog.get("relations_inferred", [])
+            if not (scope.table_name(r.get("from_table")) or scope.table_name(r.get("to_table")))
+        ]
+        inferred = [
+            r
+            for r in inferred
+            if scope.table_name(r["from_table"]) or scope.table_name(r["to_table"])
+        ]
+        inferred = sorted(
+            inferred + kept,
+            key=lambda r: (
+                r.get("from_table", ""),
+                r.get("from_column", ""),
+                r.get("to_table", ""),
+                r.get("to_column", ""),
+            ),
+        )
+    catalog["relations_inferred"] = inferred
+
+
+def _export_schedules(doc, catalog, scope):
+    """Generate the ``schedules`` extension dict.
+
+    Args:
+        doc: The lineage document.
+        catalog: The catalog being built.
+        scope: The ``databases`` restriction, or ``None`` for all. Under a restriction only
+            schedules of in-scope jobs are regenerated and the rest are passed through.
+    """
+    schedules = dict(catalog.get("schedules") or {}) if scope is not None else {}
+    wanted = {j.schedule_id for j in doc.jobs if scope is None or scope.job(j)}
+    for key, schedule in doc.schedules.items():
+        if scope is None or key in wanted:
+            schedules[key] = schedule.model_dump(mode="json")
+    catalog["schedules"] = dict(sorted(schedules.items()))
+
+
+def _export_lineage(doc, catalog, scope, missing):
+    """Generate the ``lineage`` block: column edges and unresolved items.
+
+    Args:
+        doc: The lineage document.
+        catalog: The catalog being built.
+        scope: The ``databases`` restriction, or ``None`` for all. Under a restriction,
+            out-of-scope prior entries are kept after the regenerated ones.
+        missing: ``missing_in_source`` items from the databases section, already sorted.
+    """
+    prior_lineage = catalog.get("lineage") or {}
+    edges = [e for e in doc.column_edges if scope is None or scope.dataset(e.target.dataset_id)]
+    column_edges = [e.model_dump(mode="json") for e in edges]
+    items = [*doc.unresolved, *missing]
+    kept_unresolved: list[dict] = []
+    if scope is not None:
+        in_scope_jobs = {j.id for j in doc.jobs if scope.job(j)}
+        items = [u for u in items if u.job_id is None or u.job_id in in_scope_jobs]
+        column_edges += [
+            edge
+            for edge in prior_lineage.get("column_edges", [])
+            if not scope.dataset((edge.get("target") or {}).get("dataset_id", ""))
+        ]
+        kept_unresolved = [
+            item
+            for item in prior_lineage.get("unresolved", [])
+            if item.get("job_id") not in in_scope_jobs
+        ]
     catalog["lineage"] = {
-        "column_edges": [e.model_dump(mode="json") for e in doc.column_edges],
-        "unresolved": [u.model_dump(mode="json") for u in [*doc.unresolved, *missing]],
+        "column_edges": column_edges,
+        "unresolved": [u.model_dump(mode="json") for u in items] + kept_unresolved,
     }
-    catalog["schema_drift"] = {
-        "code_only": {"databases": _drift_databases(drift)},
-        "unused_in_code": _unused_in_code(databases, touched),
-    }
-    _log_drift(catalog["schema_drift"])
-    return catalog
