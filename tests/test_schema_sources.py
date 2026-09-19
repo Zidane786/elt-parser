@@ -298,6 +298,198 @@ def test_write_schema_catalog_merges_sorts_and_is_readable_by_dict_provider(tmp_
     assert write_schema_catalog([first, second]) == catalog
 
 
+# ---------------------------------------------------------------- Postgres / Redshift fakes
+
+
+class FakeCursor:
+    def __init__(self, connection):
+        self._connection = connection
+        self._rows = []
+
+    def execute(self, sql, params=None):
+        self._connection.executed.append((sql, params))
+        for needle, rows in self._connection.rows:
+            if needle in sql:
+                self._rows = list(rows)
+                return
+        raise AssertionError(f"Unexpected SQL: {sql[:80]}")
+
+    def fetchall(self):
+        return self._rows
+
+
+class FakeConnection:
+    """DB-API connection whose ``rows`` map a SQL substring to canned rows (first match)."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.executed = []
+
+    def cursor(self):
+        return FakeCursor(self)
+
+
+PG_ROWS = [
+    (
+        "referential_constraints",
+        [
+            (
+                "public",
+                "orders_customer_fk",
+                "public",
+                "orders",
+                "customer_id",
+                "public",
+                "customers",
+                "id",
+                1,
+            ),
+            (
+                "public",
+                "profile_customer_fk",
+                "public",
+                "profiles",
+                "customer_id",
+                "public",
+                "customers",
+                "id",
+                1,
+            ),
+            ("public", "lines_fk", "public", "lines", "order_id", "public", "orders", "id", 1),
+            ("public", "lines_fk", "public", "lines", "order_no", "public", "orders", "no", 2),
+        ],
+    ),
+    (
+        "table_constraints",
+        [
+            ("public", "customers_pkey", "PRIMARY KEY", "public", "customers", "id", 1),
+            ("public", "profiles_customer_key", "UNIQUE", "public", "profiles", "customer_id", 1),
+            ("public", "orders_pkey", "PRIMARY KEY", "public", "orders", "id", 1),
+        ],
+    ),
+    ("pg_attribute", [("public", "customers", "id", "Customer key")]),
+    ("objsubid = 0", [("public", "customers", "Customer master")]),
+    (
+        "information_schema.columns",
+        [
+            ("public", "orders", "id", "bigint", 1),
+            ("public", "orders", "no", "text", 2),
+            ("public", "orders", "customer_id", "bigint", 3),
+            ("public", "customers", "id", "bigint", 1),
+            ("public", "customers", "email", "text", 2),
+            ("public", "profiles", "customer_id", "bigint", 1),
+            ("public", "lines", "order_id", "bigint", 1),
+            ("public", "lines", "order_no", "text", 2),
+            ("audit", "log", "id", "integer", 1),
+        ],
+    ),
+]
+
+
+def test_postgres_catalog_relations_and_columns():
+    from etl_parser.schema.postgres import PostgresSchemaSource
+
+    connection = FakeConnection(PG_ROWS)
+    source = PostgresSchemaSource(connection=connection, schemas=["public", "audit"])
+    catalog = source.catalog()
+    assert [d["db_name"] for d in catalog["databases"]] == ["audit", "public"]
+    public = catalog["databases"][1]
+    assert public["db_type"] == "postgresql"
+    assert [t["table_name"] for t in public["tables"]] == [
+        "customers",
+        "lines",
+        "orders",
+        "profiles",
+    ]
+    customers = public["tables"][0]
+    assert customers["description"] == "Customer master"
+    assert customers["schema"] == [
+        {"field_name": "id", "datatype": "bigint", "description": "Customer key"},
+        {"field_name": "email", "datatype": "text", "description": ""},
+    ]
+    assert source.relations() == [
+        relation("public.customers", "public.orders", "customer_id", source="database")
+        | {"from_column": "id"},
+        relation(
+            "public.customers", "public.profiles", "customer_id", "one_to_one", source="database"
+        )
+        | {"from_column": "id"},
+        relation("public.orders", "public.lines", "order_id", source="database")
+        | {"from_column": "id"},
+        relation("public.orders", "public.lines", "order_no", source="database")
+        | {"from_column": "no"},
+    ]
+    assert source.columns("postgres://public/orders") == ["id", "no", "customer_id"]
+    assert source.columns("postgres://PUBLIC/Orders") == ["id", "no", "customer_id"]
+    assert source.columns("postgres://public/nope") is None
+    assert source.columns("glue://public/orders") is None
+    assert source.aliases() == []
+    # Every query bound the schema filter as a parameter, and ran exactly once.
+    assert len(connection.executed) == 5
+    assert all(params == {"schemas": ["public", "audit"]} for _sql, params in connection.executed)
+    source.catalog()
+    assert len(connection.executed) == 5
+
+
+def test_postgres_never_leaks_dsn(monkeypatch):
+    import sys
+    import types
+
+    from etl_parser.schema.postgres import PostgresSchemaSource
+
+    dsn = f"postgresql://user:{SECRET}@db.example.internal:5432/app"
+    attempts = []
+
+    def connect(*args, **kwargs):
+        attempts.append((args, kwargs))
+        raise OSError(f"cannot reach {SECRET}")
+
+    monkeypatch.setitem(sys.modules, "psycopg", types.SimpleNamespace(connect=connect))
+    source = PostgresSchemaSource(dsn, schemas=["public"])
+    assert SECRET not in repr(source) and SECRET not in str(vars(source))
+    with pytest.raises(SchemaSourceError) as info:
+        source.catalog()
+    assert SECRET not in str(info.value) and "OSError" in str(info.value)
+    assert attempts == [((dsn,), {})]
+    # Environment fallbacks: full DSN first, then PG* variables as keyword arguments.
+    monkeypatch.setenv("ETL_PARSER_POSTGRES_DSN", dsn)
+    with pytest.raises(SchemaSourceError):
+        PostgresSchemaSource().catalog()
+    assert attempts[-1] == ((dsn,), {})
+    monkeypatch.delenv("ETL_PARSER_POSTGRES_DSN")
+    monkeypatch.setenv("PGHOST", "db.example.internal")
+    monkeypatch.setenv("PGDATABASE", "app")
+    monkeypatch.setenv("PGUSER", "user")
+    monkeypatch.setenv("PGPASSWORD", SECRET)
+    with pytest.raises(SchemaSourceError):
+        PostgresSchemaSource().catalog()
+    assert attempts[-1] == (
+        (),
+        {"host": "db.example.internal", "dbname": "app", "user": "user", "password": SECRET},
+    )
+    for name in ("PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD"):
+        monkeypatch.delenv(name)
+    with pytest.raises(SchemaSourceError, match="ETL_PARSER_POSTGRES_DSN"):
+        PostgresSchemaSource().catalog()
+
+
+def test_postgres_missing_driver_names_extra(monkeypatch):
+    import builtins
+
+    from etl_parser.schema.postgres import PostgresSchemaSource
+
+    original = builtins.__import__
+
+    def no_driver(name, *args, **kwargs):
+        if name == "psycopg":
+            raise ImportError("No module named 'psycopg'")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_driver)
+    with pytest.raises(ImportError, match=r"etl-parser\[postgres\]"):
+        PostgresSchemaSource("postgresql://localhost/app").catalog()
+
+
 def test_glue_schema_provider_alias_keeps_old_signature(glue_client):
     from etl_parser.workers import sql
 
