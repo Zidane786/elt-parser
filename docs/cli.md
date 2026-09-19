@@ -191,6 +191,7 @@ GitHub limits and advanced provider configuration are documented above and in th
 | `--max-total-tokens INTEGER` | Optional conservative reservation/accounting budget; not a provider billing guarantee |
 | `--timeout-seconds NUMBER` | 300 per model request; maximum 600 |
 | `--deadline-seconds NUMBER` | 3,600 for the AI stage; deterministic scan time is separate |
+| `--min-ai-confidence FLOAT` | Unset; 0–1 threshold below which an AI proposal is deferred rather than applied |
 | `--include GLOB` | Repeatable AI file inclusions; defaults to `*` |
 | `--exclude GLOB` | Repeatable AI file exclusions; exclusions win |
 | `--strict` / `--no-strict` | Off; fail for unresolved/incomplete work instead of only reporting partial status |

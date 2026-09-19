@@ -148,6 +148,12 @@ def analysis_run(
     exclude: list[str] | None = typer.Option(
         None, help="Glob excluding files from AI work; repeatable, wins over --include"
     ),
+    min_ai_confidence: float | None = typer.Option(
+        None,
+        min=0.0,
+        max=1.0,
+        help="Defer AI proposals whose reported confidence is below this threshold (0-1)",
+    ),
     strict: bool = typer.Option(False, help="Fail if any unresolved/AI-incomplete work remains"),
     log_dir: Path | None = typer.Option(None, help="Persist run events and metrics in this folder"),
     log_level: str = typer.Option("INFO", help="Console level; file logs retain DEBUG events"),
@@ -197,6 +203,9 @@ def analysis_run(
         deadline_seconds: Overall deadline for AI work.
         include: Glob patterns limiting which files AI work considers.
         exclude: Glob patterns excluding files from AI work.
+        min_ai_confidence: Minimum model-reported confidence an AI proposal needs to be
+            applied; lower proposals are recorded as deferred. Requires an
+            :class:`~etl_parser.ai_analysis.AnalysisConfig` that declares the field.
         strict: Fail if any unresolved item, warning, or non-success status remains.
         log_dir: Directory to persist run events and metrics in.
         log_level: Console log level; file logs always retain DEBUG events.
@@ -205,10 +214,12 @@ def analysis_run(
 
     Raises:
         typer.BadParameter: If ``config`` is not a JSON object, the merged configuration
-            fails validation, both ``schema`` and ``glue`` are given, or ``bindings`` is
-            not a JSON object of string keys and values.
-        typer.Exit: With code 1 if ``strict`` is set and unresolved items, warnings, or a
-            non-success run status remain.
+            fails validation, both ``schema`` and ``glue`` are given, ``bindings`` is not a
+            JSON object of string keys and values, or ``min_ai_confidence`` is given but
+            unsupported by the installed configuration model.
+        typer.Exit: With code 1 when a blocking ``unsupported_syntax`` item remains or
+            ``strict`` is set and unresolved items, warnings, or a non-success status
+            remain, and code 2 when the AI stage failed provider authentication.
     """
     from etl_parser.ai_analysis import AnalysisConfig, analyze
     from etl_parser.artifacts import write_analysis
@@ -245,6 +256,14 @@ def analysis_run(
             if v is not None
         }
     )
+    if min_ai_confidence is not None:
+        if "min_ai_confidence" not in AnalysisConfig.model_fields:
+            raise typer.BadParameter(
+                "This build's AnalysisConfig has no min_ai_confidence field; "
+                "upgrade etl-parser to filter AI proposals by confidence",
+                param_hint="--min-ai-confidence",
+            )
+        settings["min_ai_confidence"] = min_ai_confidence
     try:
         options = AnalysisConfig.model_validate(settings)
     except ValueError as exc:

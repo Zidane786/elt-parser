@@ -343,3 +343,78 @@ def test_every_command_parameter_has_a_help_string():
         if not getattr(parameter, "help", None)
     )
     assert not missing, f"Undocumented parameters: {missing}"
+
+
+@pytest.fixture
+def captured_config(monkeypatch):
+    """Record the :class:`AnalysisConfig` ``run`` builds, without analyzing anything.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+
+    Returns:
+        list: One-element list that receives the configuration ``run`` passes on.
+    """
+    seen = []
+
+    class Result:
+        """Empty analysis result."""
+
+        document = document()
+        decisions = ()
+        warnings = ()
+
+    def analyze(source, *, config, **kwargs):
+        """Capture the resolved configuration."""
+        seen.append(config)
+        return Result()
+
+    monkeypatch.setattr("etl_parser.ai_analysis.analyze", analyze)
+    monkeypatch.setattr("etl_parser.artifacts.write_analysis", lambda result, out: Path(out))
+    return seen
+
+
+def with_confidence_field(monkeypatch):
+    """Install an :class:`AnalysisConfig` that already has ``min_ai_confidence`` (WP-E)."""
+    from etl_parser.ai_analysis import AnalysisConfig
+
+    class Configured(AnalysisConfig):
+        """Configuration extended with the WP-E confidence threshold."""
+
+        min_ai_confidence: float = 0.0
+
+    monkeypatch.setattr("etl_parser.ai_analysis.AnalysisConfig", Configured)
+
+
+def test_min_ai_confidence_reaches_the_analysis_configuration(
+    captured_config, monkeypatch, tmp_path
+):
+    with_confidence_field(monkeypatch)
+    result = CliRunner().invoke(
+        app,
+        ["run", str(tmp_path), "--out-dir", str(tmp_path / "out"), "--min-ai-confidence", "0.75"],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured_config[0].min_ai_confidence == 0.75
+
+
+def test_min_ai_confidence_is_a_no_op_when_unset(captured_config, tmp_path):
+    result = CliRunner().invoke(app, ["run", str(tmp_path), "--out-dir", str(tmp_path / "out")])
+    assert result.exit_code == 0, result.output
+    assert not hasattr(captured_config[0], "min_ai_confidence")
+
+
+def test_min_ai_confidence_reports_a_clear_error_when_unsupported(captured_config, tmp_path):
+    result = CliRunner().invoke(
+        app,
+        ["run", str(tmp_path), "--out-dir", str(tmp_path / "out"), "--min-ai-confidence", "0.5"],
+    )
+    assert result.exit_code == 2, result.output
+    assert "min-ai-confidence" in result.output and "Traceback" not in result.output
+
+
+def test_min_ai_confidence_rejects_values_outside_zero_to_one(tmp_path):
+    result = CliRunner().invoke(
+        app, ["run", str(tmp_path), "--out-dir", str(tmp_path / "out"), "--min-ai-confidence", "2"]
+    )
+    assert result.exit_code == 2, result.output
