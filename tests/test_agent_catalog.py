@@ -389,6 +389,16 @@ def test_code_only_tables_and_columns_are_not_added_by_default():
     assert all(Unresolved(**u) for u in missing)
 
 
+def test_without_a_prior_no_databases_are_emitted_by_default():
+    # Documents the consequence for AI/description callers that export with no prior or
+    # schema source: there is nothing to describe until they pass include_code_schema=True
+    # or supply the source-of-truth schema. See the WP-A hand-back note for WP-E.
+    doc = drift_document()
+    assert export_agent_catalog(doc)["databases"] == []
+    assert export_agent_catalog(doc)["schema_drift"]["code_only"]["databases"]
+    assert export_agent_catalog(doc, include_code_schema=True)["databases"]
+
+
 def test_include_code_schema_adds_tables_marked_from_code():
     catalog = export_agent_catalog(drift_document(), drift_prior(), include_code_schema=True)
     databases = {d["db_name"]: d for d in catalog["databases"]}
