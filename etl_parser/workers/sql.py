@@ -195,11 +195,89 @@ class _Statement:
         expression: The parsed sqlglot expression for the statement.
         line_start: 1-based line number where the statement starts.
         line_end: 1-based line number where the statement ends.
+        holes: Names of the ``{{ ... }}``/``${...}`` template placeholders found in the
+            statement that were kept as literal values (design section 8.2 step 3). A
+            non-empty list downgrades every edge of the statement to ``partial``.
+        hole_line: Line of the first placeholder, where the ``dynamic_sql`` note is
+            reported.
+        text: The statement's original source text (before placeholder substitution).
     """
 
     expression: exp.Expression
     line_start: int
     line_end: int
+    holes: list[str] = field(default_factory=list)
+    hole_line: int | None = None
+    text: str = ""
+
+
+_HOLE = re.compile(r"\{\{\s*(.*?)\s*\}\}|\$\{([^}]*)\}", re.S)
+_HOLE_MARKER = "__etl_hole_"
+_HOLE_TOKEN = re.compile(rf"{_HOLE_MARKER}(\d+)__")
+
+
+def _substitute_holes(text: str) -> tuple[str, list[tuple[str, str, int]]]:
+    """Replace template placeholders in one statement with parseable marker identifiers.
+
+    Args:
+        text: The statement's source text, possibly containing ``{{ name }}`` (Jinja) or
+            ``${NAME}`` (shell) placeholders.
+
+    Returns:
+        The substituted text and one ``(marker, name, offset)`` tuple per placeholder,
+        where ``marker`` is the identifier that replaced it, ``name`` the placeholder's
+        inner text (``"?"`` when empty) and ``offset`` its character offset in ``text``.
+    """
+    holes: list[tuple[str, str, int]] = []
+
+    def replace(match: re.Match) -> str:
+        marker = f"{_HOLE_MARKER}{len(holes)}__"
+        name = (match.group(1) if match.group(1) is not None else match.group(2)) or "?"
+        holes.append((marker, name.strip() or "?", match.start()))
+        return marker
+
+    return _HOLE.sub(replace, text), holes
+
+
+def _place_holes(expression: exp.Expression, holes: list[tuple[str, str, int]]) -> bool:
+    """Decide whether a statement's placeholders sit in identity or value positions.
+
+    A marker inside a string literal or standing alone as a bare value in a predicate
+    (``WHERE amount > {{ threshold }}``) does not affect which tables or columns the
+    statement touches: the marker is rewritten back to a string literal of the original
+    placeholder text so the statement can be analysed with ``partial`` confidence. A
+    marker that names a table part, appears in a projection, or acts as an alias would
+    change identity, so the statement must stay ``dynamic_sql``.
+
+    Args:
+        expression: The parsed statement whose identifiers/literals carry markers. It is
+            modified in place when every marker is in a value position.
+        holes: The ``(marker, name, offset)`` tuples from ``_substitute_holes``.
+
+    Returns:
+        ``True`` when at least one marker sits in an identity position (the statement
+        must not be analysed), ``False`` when all markers were rewritten to literals.
+    """
+    names = {marker: f"{{{{ {name} }}}}" for marker, name, _ in holes}
+
+    def restore(text: str) -> str:
+        return _HOLE_TOKEN.sub(lambda m: names.get(m.group(0), m.group(0)), text)
+
+    rewrites: list[tuple[exp.Expression, exp.Expression]] = []
+    for node in expression.walk():
+        if isinstance(node, exp.Literal) and node.is_string and _HOLE_TOKEN.search(node.this):
+            rewrites.append((node, exp.Literal.string(restore(node.this))))
+        elif isinstance(node, exp.Identifier) and _HOLE_TOKEN.search(node.this):
+            parent = node.parent
+            if not isinstance(parent, exp.Column) or parent.args.get("table") is not None:
+                return True
+            select = parent.find_ancestor(exp.Select)
+            if select is None or any(parent is n for p in select.expressions for n in p.walk()):
+                return True
+            rewrites.append((parent, exp.Literal.string(restore(node.this))))
+    for old, new in rewrites:
+        old.replace(new)
+    return False
 
 
 class SqlWorker:
@@ -224,6 +302,8 @@ class SqlWorker:
         """
         self.schema = schema
         self._temp_tables: dict[str, dict[str, ColumnEdge]] = {}
+        # Temp dataset id -> physical datasets it was built from (for table edges/inputs).
+        self._temp_sources: dict[str, set[str]] = {}
 
     # ------------------------------------------------------------------ public
     def analyze_file(
@@ -336,29 +416,42 @@ class SqlWorker:
         """
         result = WorkerResult()
         analysis = SqlAnalysis(result=result)
-        holes = re.findall(r"\{\{\s*(.*?)\s*\}\}|\$\{([^}]+)\}", sql)
-        if holes:
+        if "{%" in sql:
             result.unresolved.append(
                 Unresolved(
                     kind="dynamic_sql",
                     source_file=source_file,
                     line=line_offset + 1,
-                    reason="Unrendered SQL template requires explicit values",
+                    reason="Template control flow ({% ... %}) requires rendering first",
                     job_id=job_id,
                     partial_text=sql[:1000],
-                    symbols=sorted({a or b for a, b in holes}),
                     remediation="Render SQL using explicit scan bindings before analysis.",
                 )
             )
             return analysis
         # An analyze call is one SQL session; files must never inherit temp mappings.
         self._temp_tables = {}
+        self._temp_sources = {}
         statements = self._parse(sql, dialect, source_file, line_offset, result, job_id)
         for stmt in statements:
             try:
                 if isinstance(stmt.expression, exp.Use):
                     default_db = stmt.expression.this.name
                     continue
+                if stmt.holes:
+                    result.unresolved.append(
+                        Unresolved(
+                            kind="dynamic_sql",
+                            source_file=source_file,
+                            line=stmt.hole_line,
+                            reason="Template placeholder treated as a literal value; "
+                            "statement analysed with partial confidence",
+                            job_id=job_id,
+                            partial_text=stmt.text[:1000],
+                            symbols=list(stmt.holes),
+                            remediation="Render SQL using explicit scan bindings before analysis.",
+                        )
+                    )
                 self._analyze_statement(
                     stmt,
                     analysis,
@@ -448,8 +541,10 @@ class SqlWorker:
             ls = sql.count("\n", 0, start) + 1
             le = sql.count("\n", 0, end) + 1
             text = sql[start:end]
+            substituted, holes = _substitute_holes(text)
+            hole_line = line_offset + ls + text.count("\n", 0, holes[0][2]) if holes else None
             try:
-                parsed = sqlglot.parse(text, read=dialect)
+                parsed = sqlglot.parse(substituted, read=dialect)
             except SqlglotError as e:
                 result.unresolved.append(
                     Unresolved(
@@ -463,8 +558,32 @@ class SqlWorker:
                 )
                 continue
             for expression in parsed:
-                if expression is not None:
-                    statements.append(_Statement(expression, line_offset + ls, line_offset + le))
+                if expression is None:
+                    continue
+                if holes and _place_holes(expression, holes):
+                    result.unresolved.append(
+                        Unresolved(
+                            kind="dynamic_sql",
+                            source_file=source_file,
+                            line=hole_line,
+                            reason="Template placeholder names a table, column or alias",
+                            job_id=job_id,
+                            partial_text=text[:1000],
+                            symbols=sorted({name for _, name, _ in holes}),
+                            remediation="Render SQL using explicit scan bindings before analysis.",
+                        )
+                    )
+                    continue
+                statements.append(
+                    _Statement(
+                        expression,
+                        line_offset + ls,
+                        line_offset + le,
+                        holes=sorted({name for _, name, _ in holes}),
+                        hole_line=hole_line,
+                        text=text,
+                    )
+                )
         return statements
 
     # -------------------------------------------------------------- analysis
@@ -649,7 +768,9 @@ class SqlWorker:
                 (cols)``, used to rename and validate output projections.
         """
         result = analysis.result
-        prov = Provenance(parser="sqlglot", dialect=dialect)
+        prov = Provenance(
+            parser="sqlglot", dialect=dialect, confidence="partial" if stmt.holes else "exact"
+        )
 
         # Real tables referenced (CTE names excluded).
         source_tables: dict[str, str] = {}  # sqlglot table sql -> dataset id
