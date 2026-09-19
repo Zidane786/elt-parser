@@ -630,6 +630,7 @@ class SqlWorker:
         if isinstance(e, exp.Drop):
             if isinstance(e.this, exp.Table):
                 self._temp_tables.pop(norm(_table_name(e.this)), None)
+                self._temp_sources.pop(norm(_table_name(e.this)), None)
             return
         if isinstance(e, (exp.Alter, exp.Set, exp.Pragma)):
             return
@@ -655,6 +656,10 @@ class SqlWorker:
                 if body is None and isinstance(e.this, exp.Schema):
                     # Plain DDL: register columns, no lineage.
                     cols = [c.name for c in e.this.expressions if isinstance(c, exp.ColumnDef)]
+                    if is_temp:
+                        self._temp_tables.setdefault(target, {})
+                        self._temp_sources.setdefault(target, set())
+                        return
                     result.datasets.append(
                         DatasetRef(
                             id=target,
@@ -779,8 +784,11 @@ class SqlWorker:
                 if isinstance(t, exp.Table) and t.name:
                     ds = norm(_table_name(t))
                     source_tables[_table_name(t)] = ds
-                    analysis.inputs.add(ds)
-        if target:
+        # Session temp tables are not datasets: reads route through to their sources.
+        is_temp = is_temp or (target in self._temp_tables if target else False)
+        physical_sources = self._physical(source_tables.values())
+        analysis.inputs.update(physical_sources)
+        if target and not is_temp:
             analysis.outputs.add(target)
 
         schema_map = self._schema_map(source_tables, norm)
@@ -885,11 +893,15 @@ class SqlWorker:
                 result.column_edges.append(edge)
                 edges_for_target[output_name] = edge
 
-        if target:
+        if target and is_temp:
+            analysis.output_columns[target] = out_cols
+            self._temp_tables[target] = {**self._temp_tables.get(target, {}), **edges_for_target}
+            self._temp_sources[target] = self._temp_sources.get(target, set()) | physical_sources
+        elif target:
             analysis.output_columns[target] = out_cols
             ds_ref = dataset_ref_from_id(target)
             result.datasets.append(ds_ref.model_copy(update={"columns": out_cols}))
-            for ds in sorted(set(source_tables.values())):
+            for ds in sorted(physical_sources):
                 result.table_edges.append(
                     TableEdge(
                         source=ds,
@@ -906,8 +918,6 @@ class SqlWorker:
                         ),
                     )
                 )
-            if is_temp:
-                self._temp_tables[target] = edges_for_target
         else:
             analysis.output_columns["__select__"] = out_cols
 
@@ -1233,6 +1243,26 @@ class SqlWorker:
         )
 
     # --------------------------------------------------------------- helpers
+    def _physical(self, dataset_ids: Iterable[str]) -> set[str]:
+        """Replace session temp table ids with the physical datasets they were built from.
+
+        Args:
+            dataset_ids: Dataset ids read by a statement, possibly including temp tables
+                created earlier in the same ``analyze`` call.
+
+        Returns:
+            The set of physical dataset ids: non-temp ids unchanged, temp ids replaced by
+            their recorded upstream sources (finding 14: temp tables never reach
+            ``inputs``, ``outputs``, ``datasets`` or ``table_edges``).
+        """
+        out: set[str] = set()
+        for ds in dataset_ids:
+            if ds in self._temp_tables:
+                out |= self._temp_sources.get(ds, set())
+            else:
+                out.add(ds)
+        return out
+
     def _schema_map(self, source_tables: Mapping[str, str], norm) -> dict:
         """Build the nested ``{db: {table: {col: type}}}`` schema sqlglot expects.
 
