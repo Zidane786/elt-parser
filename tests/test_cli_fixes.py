@@ -420,6 +420,55 @@ def test_min_ai_confidence_rejects_values_outside_zero_to_one(tmp_path):
     assert result.exit_code == 2, result.output
 
 
+def project():
+    """Parse ``pyproject.toml``.
+
+    Returns:
+        dict: The parsed project table.
+    """
+    import tomllib
+
+    return tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+
+
+def test_unused_dependencies_are_not_declared():
+    declared = {name.split(">")[0].split("[")[0].strip() for name in project()["dependencies"]}
+    assert "astroid" not in declared
+    assert "anthropic" not in declared
+
+
+def test_runtime_dependencies_are_the_ones_actually_imported():
+    declared = {name.split(">")[0].split("[")[0].strip() for name in project()["dependencies"]}
+    assert declared == {
+        "pydantic",
+        "sqlglot",
+        "networkx",
+        "pyyaml",
+        "typer",
+        "openlineage-python",
+    }
+
+
+def test_optional_extras_cover_every_schema_source():
+    extras = project()["optional-dependencies"]
+    assert set(extras) == {"glue", "postgres", "redshift"}
+    assert any(name.startswith("boto3") for name in extras["glue"])
+    assert any(name.startswith("psycopg") for name in extras["postgres"])
+    assert any(name.startswith("redshift_connector") for name in extras["redshift"])
+
+
+def test_optional_drivers_are_never_imported_at_module_level():
+    import re
+
+    pattern = re.compile(r"^(?:import|from)\s+(?:boto3|psycopg|redshift_connector)\b", re.M)
+    offenders = [
+        str(path.relative_to(ROOT))
+        for path in (ROOT / "etl_parser").rglob("*.py")
+        if pattern.search(path.read_text())
+    ]
+    assert not offenders, f"Optional drivers imported at module level: {offenders}"
+
+
 @pytest.fixture
 def exporter(monkeypatch):
     """Replace the catalog exporter with one that records its keyword arguments.
