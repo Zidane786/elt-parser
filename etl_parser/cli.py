@@ -18,6 +18,7 @@ from pathlib import Path
 
 import typer
 
+from etl_parser.cli_schema import schema_app
 from etl_parser.describe.client import RunnerConfig, close_runner, configured_runner
 from etl_parser.describe.engine import DescriptionEngine
 from etl_parser.export.agent_catalog import export_agent_catalog
@@ -29,7 +30,9 @@ from etl_parser.graph.products import orchestration_drift, product_dependencies
 from etl_parser.observability import current_observer, digest, observed
 from etl_parser.pipeline import ParserRegistry
 from etl_parser.pipeline import scan as scan_repository
-from etl_parser.workers.sql import DictSchemaProvider, GlueSchemaProvider
+from etl_parser.schema.glue import GlueSchemaSource
+from etl_parser.sdk import apply_export_options
+from etl_parser.workers.sql import DictSchemaProvider
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -41,6 +44,7 @@ export_app = typer.Typer(
     no_args_is_help=True, help="Export saved native lineage to catalog or OpenLineage."
 )
 app.add_typer(export_app, name="export")
+app.add_typer(schema_app, name="schema")
 
 
 @app.command("run")
@@ -57,6 +61,11 @@ def analysis_run(
     dry_run: bool | None = typer.Option(None, "--dry-run/--no-dry-run"),
     schema: Path | None = typer.Option(None, exists=True),
     glue: bool = typer.Option(False, help="Fetch input schemas from AWS Glue"),
+    schema_from_code: bool = typer.Option(
+        False,
+        "--schema-from-code",
+        help="Also add tables/columns seen only in code to the catalog (schema_source: code)",
+    ),
     plugin: list[str] | None = typer.Option(None, help="Explicitly trusted module:factory plugins"),
     bindings: Path | None = typer.Option(None, exists=True),
     products: Path | None = typer.Option(None, exists=True),
@@ -118,7 +127,10 @@ def analysis_run(
         background_comparison: Whether to run a background AI-vs-static comparison.
         dry_run: Whether to validate configuration without making AI calls.
         schema: JSON schema file for qualifying SQL and expanding stars.
-        glue: Fetch input schemas from AWS Glue instead of ``--schema``.
+        glue: Fetch input schemas from AWS Glue instead of ``--schema`` (uses
+            ``aws_profile``/``region``).
+        schema_from_code: Also add tables/columns discovered only in code to the catalog
+            (``schema_source: code``); by default the source schema is the truth.
         plugin: Explicitly trusted ``module:factory`` parser plugins to register.
         bindings: JSON file of string substitutions for SQL placeholders.
         products: Path to a ``product.yaml`` file or directory of them.
@@ -211,15 +223,20 @@ def analysis_run(
         isinstance(k, str) and isinstance(v, str) for k, v in values.items()
     ):
         raise typer.BadParameter("Bindings must map string names to string values")
+    prior_catalog = _json(prior) if prior else None
+    schema_source = (
+        DictSchemaProvider(schema)
+        if schema
+        else GlueSchemaSource(profile=aws_profile, region=region)
+        if glue
+        else None
+    )
     result = analyze(
         source,
         config=options,
-        prior=_json(prior) if prior else None,
-        schema=DictSchemaProvider(schema)
-        if schema
-        else GlueSchemaProvider(region=region)
-        if glue
-        else None,
+        prior=prior_catalog,
+        schema=schema_source,
+        include_code_schema=schema_from_code,
         parsers=registry,
         bindings=values,
         products=products,
@@ -228,6 +245,9 @@ def analysis_run(
         default_db=default_db,
         ref=ref,
         source_path=source_path,
+    )
+    apply_export_options(
+        result, prior=prior_catalog, schema=schema_source, include_code_schema=schema_from_code
     )
     folder = write_analysis(result, out_dir)
     typer.echo(
@@ -340,7 +360,15 @@ def scan(
     out: Path = typer.Option(Path("lineage.json")),
     schema: Path | None = typer.Option(None, exists=True),
     glue: bool = typer.Option(False, help="Fetch input schemas from AWS Glue"),
-    region: str | None = None,
+    schema_from_code: bool = typer.Option(
+        False,
+        "--schema-from-code",
+        help="Also add tables/columns seen only in code to the catalog (schema_source: code)",
+    ),
+    region: str | None = typer.Option(None, envvar="AWS_REGION", help="AWS region for Glue"),
+    aws_profile: str | None = typer.Option(
+        None, envvar="AWS_PROFILE", help="AWS profile for the Glue schema lookup"
+    ),
     products: Path | None = typer.Option(None, exists=True),
     bindings: Path | None = typer.Option(None, exists=True),
     default_db: str | None = None,
@@ -361,7 +389,10 @@ def scan(
         out: Destination for the native ``lineage.json`` output.
         schema: JSON schema file for qualifying SQL and expanding stars.
         glue: Fetch input schemas from AWS Glue instead of ``--schema``.
+        schema_from_code: Record that code-only tables/columns may be added to the catalog
+            (``schema_source: code``) when this scan is exported.
         region: AWS region for the Glue schema provider.
+        aws_profile: Named AWS profile for the Glue schema provider.
         products: Path to a ``product.yaml`` file or directory of them.
         bindings: JSON file of string substitutions for SQL placeholders.
         default_db: Database to assume for one-part table names.
@@ -394,9 +425,10 @@ def scan(
         repo,
         schema=DictSchemaProvider(schema)
         if schema
-        else GlueSchemaProvider(region=region)
+        else GlueSchemaSource(profile=aws_profile, region=region)
         if glue
         else None,
+        include_code_schema=schema_from_code,
         bindings=values,
         products=products,
         default_db=default_db,

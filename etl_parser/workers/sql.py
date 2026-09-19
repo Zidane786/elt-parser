@@ -122,47 +122,11 @@ class DictSchemaProvider:
         return self._cols.get(f"{ns}.{name}".lower())
 
 
-class GlueSchemaProvider:
-    """Optional cached Glue lookup, enabled only by an explicit caller choice."""
+# ``GlueSchemaProvider`` now lives in ``etl_parser.schema.glue``; re-exported for callers
+# that import it from here.
+from etl_parser.schema.glue import GlueSchemaProvider  # noqa: E402
 
-    def __init__(self, client=None, *, region: str | None = None):
-        """Create a Glue-backed schema provider.
-
-        Args:
-            client: A boto3 Glue client, or ``None`` to create one with ``boto3.client
-                ("glue", region_name=region)``.
-            region: AWS region for the default client. Ignored when ``client`` is given.
-        """
-        if client is None:
-            import boto3
-
-            client = boto3.client("glue", region_name=region)
-        self.client = client
-        self._cache: dict[str, list[str] | None] = {}
-
-    def columns(self, dataset_id: str) -> list[str] | None:
-        """Return a Glue table's columns (storage columns plus partition keys), cached.
-
-        Args:
-            dataset_id: Canonical dataset id; only ``glue://`` ids are looked up.
-
-        Returns:
-            Deduplicated column names in Glue's reported order, or ``None`` when
-            ``dataset_id`` is not a ``glue`` scheme dataset or Glue has no such table.
-        """
-        scheme, database, table = split_dataset_id(dataset_id)
-        if scheme != "glue":
-            return None
-        if dataset_id not in self._cache:
-            try:
-                metadata = self.client.get_table(DatabaseName=database, Name=table)["Table"]
-            except self.client.exceptions.EntityNotFoundException:
-                self._cache[dataset_id] = None
-            else:
-                fields = metadata.get("StorageDescriptor", {}).get("Columns", [])
-                fields += metadata.get("PartitionKeys", [])
-                self._cache[dataset_id] = list(dict.fromkeys(f["Name"] for f in fields))
-        return self._cache[dataset_id]
+__all__ = ["DictSchemaProvider", "GlueSchemaProvider", "SchemaProvider", "SqlAnalysis", "SqlWorker"]
 
 
 @dataclass
