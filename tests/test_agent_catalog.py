@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from etl_parser.export.agent_catalog import export_agent_catalog
-from etl_parser.models import DatasetRef, LineageDocument
+from etl_parser.models import DatasetRef, Job, LineageDocument
 from etl_parser.pipeline import scan
 from etl_parser.workers.sql import DictSchemaProvider
 
@@ -81,3 +81,45 @@ def test_glue_database_names_match_prior_case_insensitively():
     catalog = export_agent_catalog(doc, prior)
     assert len(catalog["databases"]) == 1
     assert catalog["databases"][0]["tables"][0]["dataset_id"] == "glue://db/t"
+
+
+def test_prior_scripts_match_by_path_suffix_and_keep_descriptions(prior, fixture_document):
+    catalog = export_agent_catalog(fixture_document, prior)
+    expected = {s["script_name"]: s["description"] for s in prior["scripts"]}
+    actual = {s["script_name"]: s["description"] for s in catalog["scripts"]}
+    assert actual == expected
+    assert all(s["script_path"] == f"{s['script_name']}.py" for s in catalog["scripts"])
+
+
+def script_document():
+    return LineageDocument(
+        jobs=[
+            Job(id="alpha", name="alpha", source_file="jobs/alpha.py", language="python"),
+            Job(id="beta", name="beta_job", source_file="jobs/beta.py", language="python"),
+            Job(id="gamma", name="gamma", source_file="deep/gamma.sql", language="sql"),
+            Job(id="delta", name="delta", source_file="delta.sql", language="sql"),
+        ]
+    )
+
+
+def test_prior_scripts_match_in_priority_order_and_unmatched_are_kept_last():
+    prior = {
+        "scripts": [
+            {"job_id": "alpha", "script_name": "a", "script_path": "x/a.py", "description": "id"},
+            {"script_name": "old_beta", "script_path": "jobs/beta.py", "description": "exact"},
+            {"script_name": "gamma", "script_path": "elsewhere/g.sql", "description": "name"},
+            {"script_name": "d", "script_path": "repo/delta.sql", "description": "suffix"},
+            {"script_name": "legacy", "script_path": "legacy.py", "description": "kept"},
+        ]
+    }
+    catalog = export_agent_catalog(script_document(), prior)
+    descriptions = [(s["script_name"], s.get("description")) for s in catalog["scripts"]]
+    assert descriptions == [
+        ("alpha", "id"),
+        ("beta_job", "exact"),
+        ("delta", "suffix"),
+        ("gamma", "name"),
+        ("legacy", "kept"),
+    ]
+    assert catalog["scripts"][-1] == prior["scripts"][-1]
+    assert [s["job_id"] for s in catalog["scripts"][:4]] == ["alpha", "beta", "delta", "gamma"]

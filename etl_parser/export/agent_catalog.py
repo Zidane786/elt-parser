@@ -86,6 +86,65 @@ def _find_database(databases, namespace, scheme):
     return None
 
 
+def _path_suffix_match(prior_path, source_file):
+    """Tell whether two script paths denote the same file up to a directory prefix.
+
+    Args:
+        prior_path: ``script_path`` recorded in the prior catalog (e.g. ``etl/job.py``).
+        source_file: Path of the scanned job relative to the scan root (e.g. ``job.py``).
+
+    Returns:
+        bool: True when one path ends with the other at a ``/`` boundary.
+    """
+    if not prior_path or not source_file:
+        return False
+    return prior_path.endswith("/" + source_file) or source_file.endswith("/" + prior_path)
+
+
+def _match_prior_scripts(prior_scripts, jobs):
+    """Pair scanned jobs with prior ``scripts[]`` entries.
+
+    Matching runs in passes so the strongest evidence wins: ``job_id``, then exact
+    ``script_path``, then ``script_name``, then a path-suffix match (the catalog was
+    built from a different root than the scan). Every prior entry is claimed at most once.
+
+    Args:
+        prior_scripts: The prior catalog's ``scripts`` list, in its original order.
+        jobs: Scanned :class:`~etl_parser.models.Job` objects.
+
+    Returns:
+        tuple[dict[str, dict], list[dict]]: ``(matched, unmatched)`` where ``matched`` maps
+        a job id to its prior entry and ``unmatched`` lists the prior entries no job
+        claimed, in prior order.
+    """
+    claimed: set[int] = set()
+    matched: dict[str, dict] = {}
+
+    def rule_job_id(job, script):
+        return script.get("job_id") == job.id
+
+    def rule_path(job, script):
+        return script.get("script_path") == job.source_file
+
+    def rule_name(job, script):
+        return script.get("script_name") == job.name
+
+    def rule_suffix(job, script):
+        return _path_suffix_match(script.get("script_path"), job.source_file)
+
+    for rule in (rule_job_id, rule_path, rule_name, rule_suffix):
+        for job in sorted(jobs, key=lambda j: j.id):
+            if job.id in matched:
+                continue
+            for index, script in enumerate(prior_scripts):
+                if index not in claimed and rule(job, script):
+                    matched[job.id] = script
+                    claimed.add(index)
+                    break
+    unmatched = [s for i, s in enumerate(prior_scripts) if i not in claimed]
+    return matched, unmatched
+
+
 def export_agent_catalog(doc, prior=None):
     """Build (or update) an agent ``catalog.json`` dict from a lineage document.
 
@@ -105,8 +164,7 @@ def export_agent_catalog(doc, prior=None):
     """
     catalog = copy.deepcopy(prior) if prior is not None else {"databases": [], "relations": []}
     databases = catalog.setdefault("databases", [])
-    prior_scripts = {s["script_path"]: s for s in catalog.get("scripts", [])}
-    prior_jobs = {s["job_id"]: s for s in catalog.get("scripts", []) if s.get("job_id")}
+    prior_scripts, unmatched_scripts = _match_prior_scripts(catalog.get("scripts", []), doc.jobs)
 
     for dataset in doc.datasets:
         if dataset.kind != "table" or dataset.id.startswith("frame://"):
@@ -159,7 +217,7 @@ def export_agent_catalog(doc, prior=None):
     jobs = {j.id: j for j in doc.jobs}
     scripts = []
     for job in sorted(doc.jobs, key=lambda j: j.id):
-        old = prior_jobs.get(job.id, prior_scripts.get(job.source_file, {}))
+        old = prior_scripts.get(job.id, {})
         schedule = doc.schedules.get(job.schedule_id)
         deps = doc.job_dependencies.get(job.id, [])
         scripts.append(
@@ -177,7 +235,7 @@ def export_agent_catalog(doc, prior=None):
                 "job_id": job.id,
             }
         )
-    catalog["scripts"] = scripts
+    catalog["scripts"] = scripts + unmatched_scripts
     catalog["schedules"] = {k: v.model_dump(mode="json") for k, v in sorted(doc.schedules.items())}
     catalog["lineage"] = {
         "column_edges": [e.model_dump(mode="json") for e in doc.column_edges],
