@@ -392,9 +392,20 @@
   },
   {
     "depends_on": [
+      "dim_customer_scd2",
       "fact_orders"
     ],
     "depends_on_detail": [
+      {
+        "in_place_writer": true,
+        "job_id": "dim_customer_scd2",
+        "sources": [
+          "data"
+        ],
+        "via_datasets": [
+          "glue://analytics_warehouse/dim_customer"
+        ]
+      },
       {
         "in_place_writer": false,
         "job_id": "fact_orders",
@@ -431,10 +442,21 @@
   },
   {
     "depends_on": [
+      "dim_customer_scd2",
       "fact_orders",
       "fact_refunds"
     ],
     "depends_on_detail": [
+      {
+        "in_place_writer": true,
+        "job_id": "dim_customer_scd2",
+        "sources": [
+          "data"
+        ],
+        "via_datasets": [
+          "glue://analytics_warehouse/dim_customer"
+        ]
+      },
       {
         "in_place_writer": false,
         "job_id": "fact_orders",

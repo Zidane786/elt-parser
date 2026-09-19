@@ -4,6 +4,7 @@ from pathlib import Path
 
 import yaml
 
+from etl_parser.identity import scheme_for_engine
 from etl_parser.models import DeclaredDependency, Product, ProductDatabase, Schedule
 from etl_parser.workers.base import normalize_cron
 
@@ -90,12 +91,22 @@ class ProductRegistry:
                 raise ValueError(f"Database has multiple product owners: {database.name}")
         self.products.append(product)
         for database in product.databases:
-            self._databases[database.name] = (product, database.layer)
+            # One name can be declared for several engines (the same warehouse reached
+            # through Athena and through a Postgres driver), so entries are kept per name.
+            self._databases.setdefault(database.name, []).append(
+                (product, database.layer, scheme_for_engine(database.type))
+            )
         schedules = data.get("schedules", {})
-        steps = schedules.get("steps", {})
-        values = (
-            {s["step"]: s["schedule"] for s in steps} if isinstance(steps, list) else dict(steps)
-        )
+        values: dict[str, object] = {}
+        # Products spell per-script schedules either way; the meter fixture uses "scripts"
+        # and its schedules were silently ignored while only "steps" was read (finding 31).
+        for key in ("steps", "scripts"):
+            entries = schedules.get(key) or {}
+            values.update(
+                {s["step"]: s["schedule"] for s in entries}
+                if isinstance(entries, list)
+                else dict(entries)
+            )
         if schedules.get("primary") is not None:
             values["__primary__"] = schedules["primary"]
         for name, value in values.items():
@@ -110,30 +121,79 @@ class ProductRegistry:
             )
         return product
 
-    def product_for_database(self, db):
+    def _owner(self, db, scheme=None):
+        """Return the best ownership entry for a database name (finding 30).
+
+        The declared engine *prefers* an entry, it does not veto ownership: a name match
+        alone still owns the database, because losing true attribution (a warehouse reached
+        through another driver) is worse than the mis-attribution strict matching avoids.
+        Callers report the disagreement with :meth:`engine_matches`.
+
+        Args:
+            db: Database name (matches ``ProductDatabase.name``).
+            scheme: Dataset id scheme the name was seen under (e.g. ``"glue"``), or
+                ``None`` to take the first entry.
+
+        Returns:
+            tuple | None: The best ``(product, layer, scheme)`` entry: one declaring this
+            exact scheme, else one declaring no engine at all, else the first entry
+            declared for the name. ``None`` only when the name is unknown.
+        """
+        entries = self._databases.get(db)
+        if not entries:
+            return None
+        if scheme is not None:
+            for wanted in (scheme, None):
+                for entry in entries:
+                    if entry[2] == wanted:
+                        return entry
+        return entries[0]
+
+    def engine_matches(self, db, scheme):
+        """Report whether a database's declared engine agrees with an observed scheme.
+
+        Args:
+            db: Database name (matches ``ProductDatabase.name``).
+            scheme: Dataset id scheme the name was seen under (e.g. ``"postgres"``).
+
+        Returns:
+            bool: True when the name is unknown, when it declares no engine, or when some
+            declaration matches ``scheme``; False only when every declaration for this name
+            names a different engine.
+        """
+        entries = self._databases.get(db)
+        if not entries:
+            return True
+        return any(entry[2] is None or entry[2] == scheme for entry in entries)
+
+    def product_for_database(self, db, scheme=None):
         """Return the product that owns a database, if any.
 
         Args:
             db: Database name (matches ``ProductDatabase.name``).
+            scheme: Dataset id scheme the name was seen under, used to pick between
+                several declarations of the same name.
 
         Returns:
             Product | None: The owning product, or ``None`` if no registered product
             declares this database.
         """
-        value = self._databases.get(db)
+        value = self._owner(db, scheme)
         return value[0] if value else None
 
-    def layer_for_database(self, db):
+    def layer_for_database(self, db, scheme=None):
         """Return the declared layer for a database, if any.
 
         Args:
             db: Database name (matches ``ProductDatabase.name``).
+            scheme: Dataset id scheme the name was seen under, used to pick between
+                several declarations of the same name.
 
         Returns:
             str | None: The declared layer (e.g. ``"raw"``), or ``None`` if the database
             is not owned by a registered product or declares no layer.
         """
-        value = self._databases.get(db)
+        value = self._owner(db, scheme)
         return value[1] if value else None
 
     def schedules(self):

@@ -27,6 +27,65 @@ URI_SCHEMES = {"s3", "s3a", "s3n", "gs", "hdfs", "file", "kafka", "kinesis", "ht
 
 _QUOTED = re.compile(r'^\s*(["`\[])(.*)(["`\]])\s*$')
 
+UNRESOLVED_SCHEME = "unknown"
+UNRESOLVED_NAMESPACE = "unresolved"
+UNRESOLVED_PREFIX = f"{UNRESOLVED_SCHEME}://{UNRESOLVED_NAMESPACE}/"
+"""Prefix of the sentinel id used when a reference cannot be named at all (finding 27).
+
+Identity helpers never raise on degenerate input: an empty or punctuation-only name, or an
+id with no scheme, resolves to a sentinel so the caller can record an ``Unresolved`` item
+instead of aborting a whole scan.
+"""
+
+_UNSAFE = re.compile(r"[^A-Za-z0-9_.\-]")
+
+
+def unresolved_dataset_id(text: str) -> str:
+    """Return the sentinel id standing in for a reference that could not be named.
+
+    Args:
+        text: The original text, used only to make the sentinel readable; characters
+            outside ``[A-Za-z0-9_.-]`` are replaced and leading/trailing dots removed.
+
+    Returns:
+        str: ``"unknown://unresolved/<sanitised>"``, or ``"unknown://unresolved/empty"``
+        when nothing usable remains. The result is deterministic for a given input.
+    """
+    sanitised = _UNSAFE.sub("_", text.strip()).strip(".") or "empty"
+    return f"{UNRESOLVED_PREFIX}{sanitised}"
+
+
+def is_unresolved_dataset_id(dataset_id: str) -> bool:
+    """Report whether an id is the sentinel produced for an unnameable reference.
+
+    Args:
+        dataset_id: Any dataset id.
+
+    Returns:
+        bool: True when the id was produced by :func:`unresolved_dataset_id`.
+    """
+    return dataset_id.startswith(UNRESOLVED_PREFIX)
+
+
+def scheme_for_engine(engine: str | None) -> str | None:
+    """Return the dataset id scheme an engine's tables are addressed under.
+
+    Args:
+        engine: Engine name as declared by a product or a call site (e.g. ``"athena"``,
+            ``"postgresql"``), or ``None``.
+
+    Returns:
+        str | None: ``"glue"`` for the Glue-catalog family (Athena, Spark, Glue, Trino,
+        Presto, Hive), the mapped scheme for other known engines, the engine name itself
+        for unknown engines, and ``None`` when ``engine`` is ``None`` or empty.
+    """
+    if not engine:
+        return None
+    engine = engine.lower()
+    if engine in GLUE_ENGINES:
+        return "glue"
+    return ENGINE_SCHEME.get(engine, engine)
+
 
 def _split_identifier(name: str) -> list[tuple[str, bool]]:
     """Split a dotted identifier into its parts, honoring quoted segments.
@@ -78,9 +137,13 @@ def normalize_dataset_id(
         default_db: Database to use when ``name`` has no database part.
 
     Returns:
-        str: The canonical ``scheme://namespace/name`` id.
+        str: The canonical ``scheme://namespace/name`` id, or the
+        ``unknown://unresolved/...`` sentinel when ``name`` holds no usable identifier
+        (finding 27); this function never raises on degenerate input.
     """
     name = name.strip()
+    if not name:
+        return unresolved_dataset_id(name)
     if "://" in name:
         parsed = urlparse(name)
         scheme = parsed.scheme.lower()
@@ -92,6 +155,8 @@ def normalize_dataset_id(
         return f"file://{name}"
 
     parts = _split_identifier(name)
+    if not [p for p, _ in parts if p]:
+        return unresolved_dataset_id(name)
     engine_l = engine.lower()
     if engine_l in GLUE_ENGINES:
         scheme = "glue"
@@ -120,8 +185,12 @@ def split_dataset_id(dataset_id: str) -> tuple[str, str, str]:
     Returns:
         tuple[str, str, str]: ``(scheme, namespace, name)``. For URI-style schemes (e.g.
         ``s3``, ``file``) the namespace is the bucket/host and the name is the remaining
-        path.
+        path. An id with no scheme yields ``("unknown", "unresolved", dataset_id)`` rather
+        than raising (finding 27), so a malformed id reported by a worker cannot abort a
+        caller mid-scan.
     """
+    if "://" not in dataset_id:
+        return UNRESOLVED_SCHEME, UNRESOLVED_NAMESPACE, dataset_id
     scheme, rest = dataset_id.split("://", 1)
     if scheme in URI_SCHEMES or scheme in {"s3", "file"}:
         bucket, _, path = rest.partition("/")

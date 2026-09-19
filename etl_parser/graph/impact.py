@@ -13,6 +13,10 @@ from etl_parser.graph.builder import LineageGraph
 def _walk(graph: LineageGraph, node_id: str, max_depth: int | None, reverse: bool):
     """Compute the impact closure of a node in one traversal direction.
 
+    Column ids are mapped back to their dataset before any dataset-level comparison, so a
+    column walk flags cross-product edges too; conversely a dataset walk lists the columns
+    of every dataset it reaches that has column lineage (review finding 11).
+
     Args:
         graph: The lineage graph to traverse.
         node_id: A dataset id or ``"{dataset_id}#{column}"`` column id to start from.
@@ -24,7 +28,7 @@ def _walk(graph: LineageGraph, node_id: str, max_depth: int | None, reverse: boo
         dict: ``{"node", "direction", "by_hop", "cross_product_edges"}`` where ``by_hop``
         is a list of ``{"hop", "datasets", "columns", "jobs", "products"}`` entries ordered
         by increasing distance, and ``cross_product_edges`` lists table edges within the
-        reached node set whose source and target belong to different products.
+        reached dataset set whose source and target belong to different products.
 
     Raises:
         ValueError: If ``max_depth`` is negative, or ``node_id`` is not a node in the graph.
@@ -38,10 +42,19 @@ def _walk(graph: LineageGraph, node_id: str, max_depth: int | None, reverse: boo
     by_hop = []
     doc = graph.document
     products = {d.id: d.product for d in doc.datasets}
+    columns_by_dataset: dict[str, set[str]] = {}
+    for node, data in net.nodes(data=True):
+        if data.get("kind") == "column":
+            columns_by_dataset.setdefault(data.get("dataset", node), set()).add(node)
+    reached_datasets = {net.nodes[n].get("dataset", n) for n in distances}
     for distance in sorted(set(distances.values()) - {0}):
         nodes = sorted(n for n, depth in distances.items() if depth == distance)
-        columns = [n for n in nodes if net.nodes[n].get("kind") == "column"]
         datasets = sorted({net.nodes[n].get("dataset", n) for n in nodes})
+        columns = {n for n in nodes if net.nodes[n].get("kind") == "column"}
+        for node in nodes:
+            if net.nodes[node].get("kind") != "column":
+                columns |= columns_by_dataset.get(node, set())
+        columns = sorted(columns)
         jobs = set()
         for n in nodes:
             for parent, _, data in net.in_edges(n, data=True):
@@ -59,7 +72,13 @@ def _walk(graph: LineageGraph, node_id: str, max_depth: int | None, reverse: boo
     crossed = []
     for edge in doc.table_edges:
         a, b = products.get(edge.source), products.get(edge.target)
-        if a and b and a != b and edge.source in distances and edge.target in distances:
+        if (
+            a
+            and b
+            and a != b
+            and edge.source in reached_datasets
+            and edge.target in reached_datasets
+        ):
             crossed.append(
                 {"source": edge.source, "target": edge.target, "from_product": a, "to_product": b}
             )
