@@ -283,6 +283,19 @@ def test_sqlalchemy_text_is_matched_through_its_import(tmp_path):
     assert doc.jobs[0].outputs == ["table://shop/target"]
 
 
+def test_callee_resolution_is_shared_with_the_references_pass(tmp_path):
+    from etl_parser.scanner.references import inspect_references
+
+    path = tmp_path / "job.py"
+    path.write_text(
+        'import pandas as frames\ndf = frames.read_csv("in.csv")\ndf[["x"]].to_csv("out.csv")\n'
+    )
+    doc = scan(path).document
+    assert doc.jobs[0].inputs == ["file://in.csv"]
+    report = inspect_references(path, root=tmp_path)
+    assert "pd.read_csv" in [r.callee for r in report.references]
+
+
 def test_conservative_control_flow_is_an_analysis_note_not_a_syntax_failure(tmp_path):
     doc = run(
         tmp_path,

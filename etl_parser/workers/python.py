@@ -34,6 +34,8 @@ from etl_parser.models import (
     Unresolved,
     WorkerResult,
 )
+from etl_parser.scanner.imports import resolve_import
+from etl_parser.scanner.references import qualified_callee
 from etl_parser.scanner.repo import ScanIndex, SourceFile, imports_package
 from etl_parser.scanner.sinks import ENGINE_DIALECT, URL_ENGINE_HINTS, match_sink
 from etl_parser.scanner.strings import Folded, fold_string
@@ -527,19 +529,12 @@ class PythonWorker:
                 node: The ``Call.func`` expression to render.
 
             Returns:
-                str: The dotted callee text with the leading name resolved through
-                ``state.imports`` and, for ``pandas``/``polars``/``awswrangler`` targets,
-                rewritten to the ``pd.``/``pl.``/``wr.`` shorthand used by the sink table.
+                str: The dotted callee text, as resolved by
+                :func:`~etl_parser.scanner.references.qualified_callee` against this
+                module's imports, so a call site resolves to the same sink table entry
+                here and in the standalone references pass.
             """
-            text = unparse(node)
-            first, dot, rest = text.partition(".")
-            imported = state.imports.get(first)
-            if imported:
-                text = imported[0] + (dot + rest if dot else "")
-            for package, alias in (("pandas", "pd"), ("polars", "pl"), ("awswrangler", "wr")):
-                if text.startswith(package + "."):
-                    return alias + text[len(package) :]
-            return text
+            return qualified_callee(node, {k: v[0] for k, v in state.imports.items()})
 
         def is_udf(func):
             """Whether a call target is a user-defined function applied to columns.
@@ -1122,7 +1117,7 @@ class PythonWorker:
             """
             if not self.index:
                 return None
-            helper = self.index.resolve_module(module, state.source, level)
+            helper = resolve_import(module, level, state.source, self.index)
             if helper is None:
                 return None
             if helper.path in loading_modules or state.depth >= self.max_import_depth:
