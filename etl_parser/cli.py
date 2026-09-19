@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import json
+from enum import StrEnum
 from pathlib import Path
 
 import typer
@@ -30,6 +32,21 @@ from etl_parser.observability import current_observer, digest, observed
 from etl_parser.pipeline import ParserRegistry, exit_code
 from etl_parser.pipeline import scan as scan_repository
 from etl_parser.workers.sql import DictSchemaProvider, GlueSchemaProvider
+
+
+class CatalogSection(StrEnum):
+    """A top-level section of the agent ``catalog.json`` that an export can generate.
+
+    Selecting sections narrows what a command rebuilds; unselected sections are passed
+    through unchanged from ``--prior`` when one is supplied.
+    """
+
+    databases = "databases"
+    scripts = "scripts"
+    relations = "relations"
+    lineage = "lineage"
+    schedules = "schedules"
+
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -148,6 +165,12 @@ def analysis_run(
     exclude: list[str] | None = typer.Option(
         None, help="Glob excluding files from AI work; repeatable, wins over --include"
     ),
+    generate: list[CatalogSection] | None = typer.Option(
+        None, help="Catalog section to generate; repeatable, defaults to every section"
+    ),
+    database: list[str] | None = typer.Option(
+        None, help="Database name to generate for; repeatable, defaults to every database"
+    ),
     min_ai_confidence: float | None = typer.Option(
         None,
         min=0.0,
@@ -179,6 +202,9 @@ def analysis_run(
         bindings: JSON file of string substitutions for SQL placeholders.
         products: Path to a ``product.yaml`` file or directory of them.
         prior: Prior catalog JSON to preserve descriptions and flags from.
+        generate: Catalog sections to generate; every section when omitted. Sections that
+            are not selected are passed through unchanged from ``prior``.
+        database: Database names to generate for; every database when omitted.
         engine: Default execution engine for standalone ``.sql`` files.
         dialect: Default sqlglot dialect for standalone ``.sql`` files.
         default_db: Database to assume for one-part table names.
@@ -283,6 +309,7 @@ def analysis_run(
     result = analyze(
         source,
         config=options,
+        **_selection(generate, database, analyze),
         prior=_json(prior) if prior else None,
         schema=DictSchemaProvider(schema)
         if schema
@@ -322,6 +349,37 @@ def analysis_run(
     )
     if code:
         raise typer.Exit(code)
+
+
+def _selection(generate, databases, target=None):
+    """Build the catalog-selection keyword arguments ``target`` accepts.
+
+    ``generate``/``databases`` are keywords of
+    :func:`~etl_parser.export.agent_catalog.export_agent_catalog`. A callable that does
+    not name both of them gets neither, so the flags stay inert rather than raising on a
+    build whose exporter, analysis or scan entry point has not learned them yet.
+
+    Args:
+        generate: Selected :class:`CatalogSection` values, or ``None`` for every section.
+        databases: Selected database names, or ``None`` for every database.
+        target: The callable the keywords would be passed to; defaults to
+            :func:`~etl_parser.export.agent_catalog.export_agent_catalog`.
+
+    Returns:
+        dict: ``{"generate": [...], "databases": [...]}`` when ``target`` names both
+        parameters, otherwise an empty mapping. ``None`` values mean "everything".
+    """
+    named = {
+        name
+        for name, parameter in inspect.signature(target or export_agent_catalog).parameters.items()
+        if parameter.kind is not parameter.VAR_KEYWORD
+    }
+    if not {"generate", "databases"} <= named:
+        return {}
+    return {
+        "generate": [section.value for section in generate] if generate else None,
+        "databases": list(databases) if databases else None,
+    }
 
 
 def _json(path):
@@ -435,6 +493,12 @@ def scan(
         None, help="Default sqlglot dialect for standalone .sql files"
     ),
     plugin: list[str] | None = typer.Option(None, help="Explicitly trusted module:factory plugins"),
+    generate: list[CatalogSection] | None = typer.Option(
+        None, help="Catalog section to generate; repeatable, defaults to every section"
+    ),
+    database: list[str] | None = typer.Option(
+        None, help="Database name to generate for; repeatable, defaults to every database"
+    ),
     log_dir: Path | None = typer.Option(None, help="Persist run events and metrics in this folder"),
     log_level: str = typer.Option("INFO", help="Console level; file logs retain DEBUG events"),
     log_max_bytes: int = typer.Option(
@@ -458,6 +522,10 @@ def scan(
         engine: Default execution engine for standalone ``.sql`` files.
         dialect: Default sqlglot dialect for standalone ``.sql`` files.
         plugin: Explicitly trusted ``module:factory`` parser plugins to register.
+        generate: Catalog sections a later export should generate; every section when
+            omitted. Recorded for the export step, which owns the catalog sections.
+        database: Database names a later export should generate for; every database when
+            omitted.
         log_dir: Directory to persist run events and metrics in.
         log_level: Console log level; file logs always retain DEBUG events.
         log_max_bytes: Maximum size of a single log file before rotation.
@@ -482,6 +550,7 @@ def scan(
         raise typer.BadParameter("Bindings must be a JSON object of string keys and values")
     graph = scan_repository(
         repo,
+        **_selection(generate, database, scan_repository),
         schema=DictSchemaProvider(schema)
         if schema
         else GlueSchemaProvider(region=region)
@@ -527,6 +596,12 @@ def catalog_export(
         dir_okay=False,
         help="Prior catalog.json whose descriptions and metadata are preserved",
     ),
+    generate: list[CatalogSection] | None = typer.Option(
+        None, help="Catalog section to generate; repeatable, defaults to every section"
+    ),
+    database: list[str] | None = typer.Option(
+        None, help="Database name to generate for; repeatable, defaults to every database"
+    ),
     log_dir: Path | None = typer.Option(None, help="Persist run events and metrics in this folder"),
     log_level: str = typer.Option("INFO", help="Console level; file logs retain DEBUG events"),
 ):
@@ -536,6 +611,9 @@ def catalog_export(
         lineage: Path to a native ``lineage.json`` file.
         out: Destination for the generated ``catalog.json``.
         prior: Prior ``catalog.json`` to merge into, preserving human-only fields.
+        generate: Catalog sections to generate; every section when omitted. Sections that
+            are not selected are passed through unchanged from ``prior``.
+        database: Database names to generate for; every database when omitted.
         log_dir: Directory to persist run events and metrics in.
         log_level: Console log level; file logs always retain DEBUG events.
 
@@ -543,7 +621,14 @@ def catalog_export(
         typer.BadParameter: If ``lineage`` or ``prior`` does not exist; the message names
             the missing path.
     """
-    _write(export_agent_catalog(read_native(lineage), _json(prior) if prior else None), out)
+    _write(
+        export_agent_catalog(
+            read_native(lineage),
+            _json(prior) if prior else None,
+            **_selection(generate, database),
+        ),
+        out,
+    )
 
 
 @export_app.command("openlineage")

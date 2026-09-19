@@ -155,6 +155,47 @@ etl-parser impact lineage.json 'glue://analytics/order_totals#double_amount' --u
 etl-parser products lineage.json
 ```
 
+### Choosing what to generate
+
+`scan`, `run` and `export catalog` accept two repeatable selection flags. Both default
+to "everything", so omitting them keeps the previous behaviour.
+
+| Flag | Meaning |
+| --- | --- |
+| `--generate SECTION` | Catalog section to rebuild: `databases`, `scripts`, `relations`, `lineage` or `schedules`. Repeat for several; omitted means every section |
+| `--database NAME` | Restrict generation to this database; repeat for several; omitted means every database |
+
+An unknown section name is a usage error (exit code 2). Sections you do not select are
+**passed through unchanged from `--prior`**, so a partial regeneration never drops the
+descriptions, flags or relations an earlier catalog already carried. Without `--prior`
+an unselected section is simply left empty.
+
+```sh
+# Everything, the default.
+etl-parser export catalog lineage.json --prior catalog.json --out catalog.updated.json
+
+# Only the scripts section, and only for one database.
+etl-parser export catalog lineage.json --prior catalog.json --out catalog.updated.json \
+  --generate scripts --database analytics
+
+# Only relations (for example after adding foreign keys in the source database).
+etl-parser export catalog lineage.json --prior catalog.json --out catalog.updated.json \
+  --generate relations
+
+# Databases and scripts for two databases; schedules/lineage/relations come from --prior.
+etl-parser export catalog lineage.json --prior catalog.json --out catalog.updated.json \
+  --generate databases --generate scripts --database analytics --database marketing
+
+# The same selection while scanning or running.
+etl-parser scan ./etl --generate scripts --database analytics --out lineage.json
+etl-parser run ./etl --prior catalog.json --generate scripts --database analytics
+```
+
+The source-side equivalent is `etl-parser schema fetch --database NAME`, which limits
+which databases are read **from** Glue, Postgres or Redshift; `--database` here limits
+which databases are written **into** the catalog. Use both when a large estate should be
+refreshed one database at a time.
+
 ### Source and schema options (`run`, `scan`)
 
 | Option | Default / behavior |

@@ -418,3 +418,144 @@ def test_min_ai_confidence_rejects_values_outside_zero_to_one(tmp_path):
         app, ["run", str(tmp_path), "--out-dir", str(tmp_path / "out"), "--min-ai-confidence", "2"]
     )
     assert result.exit_code == 2, result.output
+
+
+@pytest.fixture
+def exporter(monkeypatch):
+    """Replace the catalog exporter with one that records its keyword arguments.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+
+    Returns:
+        Callable[..., list]: Installs an exporter that either accepts the selection
+        keywords or has the older two-argument signature, and returns its call records.
+    """
+
+    def install(selective=True):
+        """Install the exporter and return the list its calls are recorded in."""
+        calls = []
+
+        if selective:
+
+            def export(doc, prior=None, *, generate=None, databases=None):
+                """Record a selective export."""
+                calls.append({"generate": generate, "databases": databases})
+                return {"databases": [], "relations": []}
+
+        else:
+
+            def export(doc, prior=None):
+                """Record an export that predates the selection keywords."""
+                calls.append({})
+                return {"databases": [], "relations": []}
+
+        monkeypatch.setattr("etl_parser.cli.export_agent_catalog", export)
+        return calls
+
+    return install
+
+
+def export_arguments(lineage, out, *extra):
+    """Build an ``export catalog`` argument list.
+
+    Args:
+        lineage: Saved lineage file.
+        out: Destination catalog path.
+        *extra: Extra command-line arguments.
+
+    Returns:
+        list[str]: The full argument list.
+    """
+    return ["export", "catalog", str(lineage), "--out", str(out), *extra]
+
+
+def test_export_catalog_passes_selected_sections_and_databases(exporter, lineage_file, tmp_path):
+    calls = exporter()
+    result = CliRunner().invoke(
+        app,
+        export_arguments(
+            lineage_file,
+            tmp_path / "c.json",
+            "--generate",
+            "scripts",
+            "--generate",
+            "databases",
+            "--database",
+            "analytics",
+        ),
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [{"generate": ["scripts", "databases"], "databases": ["analytics"]}]
+
+
+def test_export_catalog_generates_everything_by_default(exporter, lineage_file, tmp_path):
+    calls = exporter()
+    result = CliRunner().invoke(app, export_arguments(lineage_file, tmp_path / "c.json"))
+    assert result.exit_code == 0, result.output
+    assert calls == [{"generate": None, "databases": None}]
+
+
+def test_export_catalog_works_with_an_exporter_without_selection_support(
+    exporter, lineage_file, tmp_path
+):
+    calls = exporter(selective=False)
+    result = CliRunner().invoke(
+        app, export_arguments(lineage_file, tmp_path / "c.json", "--generate", "scripts")
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [{}]
+
+
+@pytest.mark.parametrize("command", [["export", "catalog"], ["run"], ["scan"]])
+def test_generate_rejects_unknown_section_names(command, lineage_file, tmp_path):
+    target = str(lineage_file) if command[0] == "export" else str(tmp_path)
+    result = CliRunner().invoke(app, [*command, target, "--generate", "bogus"])
+    assert result.exit_code == 2, result.output
+    assert "bogus" in result.output
+
+
+@pytest.mark.parametrize("section", ["databases", "scripts", "relations", "lineage", "schedules"])
+def test_every_documented_section_name_is_accepted(section, exporter, lineage_file, tmp_path):
+    calls = exporter()
+    result = CliRunner().invoke(
+        app, export_arguments(lineage_file, tmp_path / "c.json", "--generate", section)
+    )
+    assert result.exit_code == 0, result.output
+    assert calls[0]["generate"] == [section]
+
+
+def test_run_accepts_the_selection_flags(analyzed, tmp_path):
+    analyzed(document())
+    result = CliRunner().invoke(
+        app,
+        [
+            "run",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--generate",
+            "scripts",
+            "--database",
+            "analytics",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_scan_accepts_the_selection_flags(scanned, tmp_path):
+    scanned(document())
+    result = CliRunner().invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "--out",
+            str(tmp_path / "lineage.json"),
+            "--generate",
+            "scripts",
+            "--database",
+            "analytics",
+        ],
+    )
+    assert result.exit_code == 0, result.output
