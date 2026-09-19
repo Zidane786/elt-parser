@@ -138,6 +138,46 @@ def _script_description(old, job):
     return {"description": ""}
 
 
+def _relations_inferred(join_conditions):
+    """Turn observed equality joins into ``relations_inferred`` entries.
+
+    A join has no direction, so the two sides are ordered lexicographically by
+    ``(table, column)`` and both orientations collapse into one entry that lists every
+    job in which the join was seen. The result is kept apart from ``relations``:
+    referential integrity is a data-model fact the source system owns, this is only
+    evidence from code.
+
+    Args:
+        join_conditions: :class:`~etl_parser.models.JoinCondition` items from the document.
+
+    Returns:
+        list[dict]: Sorted entries ``{from_table, from_column, to_table, to_column,
+        relation_type: "join", source: "inferred", jobs: [...]}``.
+    """
+    grouped: dict[tuple[str, str, str, str], set[str]] = {}
+    for condition in join_conditions:
+        sides = sorted(
+            (
+                (agent_table_name(condition.left.dataset_id), condition.left.name),
+                (agent_table_name(condition.right.dataset_id), condition.right.name),
+            )
+        )
+        key = (sides[0][0], sides[0][1], sides[1][0], sides[1][1])
+        grouped.setdefault(key, set()).add(condition.job_id)
+    return [
+        {
+            "from_table": from_table,
+            "from_column": from_column,
+            "to_table": to_table,
+            "to_column": to_column,
+            "relation_type": "join",
+            "source": "inferred",
+            "jobs": sorted(jobs),
+        }
+        for (from_table, from_column, to_table, to_column), jobs in sorted(grouped.items())
+    ]
+
+
 def _path_suffix_match(prior_path, source_file):
     """Tell whether two script paths denote the same file up to a directory prefix.
 
@@ -290,6 +330,8 @@ def export_agent_catalog(doc, prior=None):
             }
         )
     catalog["scripts"] = scripts + unmatched_scripts
+    catalog.setdefault("relations", [])
+    catalog["relations_inferred"] = _relations_inferred(doc.join_conditions)
     catalog["schedules"] = {k: v.model_dump(mode="json") for k, v in sorted(doc.schedules.items())}
     catalog["lineage"] = {
         "column_edges": [e.model_dump(mode="json") for e in doc.column_edges],

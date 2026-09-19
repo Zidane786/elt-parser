@@ -6,7 +6,14 @@ from pathlib import Path
 import pytest
 
 from etl_parser.export.agent_catalog import export_agent_catalog
-from etl_parser.models import DatasetRef, Job, LineageDocument
+from etl_parser.models import (
+    ColumnRef,
+    DatasetRef,
+    Job,
+    JoinCondition,
+    LineageDocument,
+    Provenance,
+)
 from etl_parser.pipeline import scan
 from etl_parser.workers.sql import DictSchemaProvider
 
@@ -199,3 +206,58 @@ def test_ai_description_keys_on_prior_columns_are_preserved():
     exported = export_agent_catalog(doc, prior)["databases"][0]["tables"][0]["schema"][0]
     assert exported == column
     assert "description_source" not in export_agent_catalog(doc, prior)["databases"][0]
+
+
+def join(left, right, job_id):
+    return JoinCondition(
+        left=ColumnRef(dataset_id=left[0], name=left[1]),
+        right=ColumnRef(dataset_id=right[0], name=right[1]),
+        job_id=job_id,
+        provenance=Provenance(parser="sqlglot"),
+    )
+
+
+def test_relations_inferred_from_join_conditions_never_merge_into_relations():
+    doc = LineageDocument(
+        join_conditions=[
+            join(("glue://db/orders", "customer_id"), ("glue://db/customers", "id"), "j2"),
+            join(("glue://db/customers", "id"), ("glue://db/orders", "customer_id"), "j1"),
+            join(("glue://db/orders", "product_id"), ("glue://db/products", "id"), "j1"),
+        ]
+    )
+    prior = {
+        "relations": [
+            {
+                "from_table": "db.orders",
+                "from_column": "customer_id",
+                "to_table": "db.customers",
+                "to_column": "id",
+                "relation_type": "many_to_one",
+                "source": "database",
+            }
+        ]
+    }
+    catalog = export_agent_catalog(doc, prior)
+    assert catalog["relations"] == prior["relations"]
+    assert catalog["relations_inferred"] == [
+        {
+            "from_table": "db.customers",
+            "from_column": "id",
+            "to_table": "db.orders",
+            "to_column": "customer_id",
+            "relation_type": "join",
+            "source": "inferred",
+            "jobs": ["j1", "j2"],
+        },
+        {
+            "from_table": "db.orders",
+            "from_column": "product_id",
+            "to_table": "db.products",
+            "to_column": "id",
+            "relation_type": "join",
+            "source": "inferred",
+            "jobs": ["j1"],
+        },
+    ]
+    empty = export_agent_catalog(LineageDocument())
+    assert empty["relations"] == [] and empty["relations_inferred"] == []
