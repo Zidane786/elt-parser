@@ -200,6 +200,104 @@ def test_glue_session_and_client_are_built_lazily(monkeypatch):
     }
 
 
+class StaticSource:
+    """In-memory SchemaSource used to test merging and the SDK surface."""
+
+    def __init__(self, databases, relations=(), aliases=(), columns=None):
+        self._databases = databases
+        self._relations = list(relations)
+        self._aliases = list(aliases)
+        self._columns = columns or {}
+        self.calls = 0
+
+    def columns(self, dataset_id):
+        return self._columns.get(dataset_id)
+
+    def catalog(self):
+        self.calls += 1
+        return {"databases": json.loads(json.dumps(self._databases))}
+
+    def relations(self):
+        return list(self._relations)
+
+    def aliases(self):
+        return list(self._aliases)
+
+
+def table(name, *columns, description=""):
+    return {
+        "table_name": name,
+        "description": description,
+        "schema": [{"field_name": c, "datatype": "text", "description": ""} for c in columns],
+    }
+
+
+def relation(parent, child, column, kind="one_to_many", **extra):
+    return {
+        "from_table": parent,
+        "to_table": child,
+        "from_column": column,
+        "to_column": column,
+        "relation_type": kind,
+        **extra,
+    }
+
+
+# ---------------------------------------------------------------- catalog merge
+
+
+def test_write_schema_catalog_merges_sorts_and_is_readable_by_dict_provider(tmp_path):
+    from etl_parser.schema import write_schema_catalog
+    from etl_parser.workers.sql import DictSchemaProvider
+
+    first = StaticSource(
+        [
+            {
+                "db_name": "z",
+                "db_type": "postgresql",
+                "description": "",
+                "tables": [table("b", "x")],
+            },
+            {"db_name": "a", "db_type": "athena", "description": "", "tables": [table("t2", "c")]},
+        ],
+        relations=[relation("z.a", "z.b", "x")],
+    )
+    second = StaticSource(
+        [
+            {
+                "db_name": "z",
+                "db_type": "postgresql",
+                "description": "described",
+                "tables": [table("a", "x", "y"), table("b", "IGNORED_DUPLICATE")],
+            }
+        ],
+        relations=[relation("z.a", "z.b", "x"), relation("a.t2", "z.b", "c", "one_to_one")],
+    )
+    out = tmp_path / "nested" / "catalog.json"
+    catalog = write_schema_catalog([first, second], out)
+    assert list(catalog) == ["databases", "relations"]
+    assert [(d["db_name"], d["db_type"]) for d in catalog["databases"]] == [
+        ("a", "athena"),
+        ("z", "postgresql"),
+    ]
+    merged = catalog["databases"][1]
+    assert merged["description"] == "described"
+    assert [t["table_name"] for t in merged["tables"]] == ["a", "b"]
+    assert merged["tables"][1]["schema"][0]["field_name"] == "x"  # first source wins
+    assert catalog["relations"] == [
+        relation("a.t2", "z.b", "c", "one_to_one", source="database"),
+        relation("z.a", "z.b", "x", source="database"),
+    ]
+    assert json.loads(out.read_text()) == catalog
+    assert out.read_text().endswith("}\n")
+    assert first.calls == 1
+    provider = DictSchemaProvider(out)
+    assert provider.columns("postgres://z/a") == ["x", "y"]
+    assert provider.columns("glue://a/t2") == ["c"]
+    # Byte-identical on a second run.
+    assert write_schema_catalog([first, second]) == catalog
+
+
 def test_glue_schema_provider_alias_keeps_old_signature(glue_client):
     from etl_parser.workers import sql
 
