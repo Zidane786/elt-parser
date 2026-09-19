@@ -7,3 +7,6 @@ dist/
 build/
 *.egg-info/
 .DS_Store
+
+# Agent worktrees (local only)
+.claude/worktrees/

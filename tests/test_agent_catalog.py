@@ -389,14 +389,37 @@ def test_code_only_tables_and_columns_are_not_added_by_default():
     assert all(Unresolved(**u) for u in missing)
 
 
-def test_without_a_prior_no_databases_are_emitted_by_default():
-    # Documents the consequence for AI/description callers that export with no prior or
-    # schema source: there is nothing to describe until they pass include_code_schema=True
-    # or supply the source-of-truth schema. See the WP-A hand-back note for WP-E.
+def test_with_no_source_of_truth_the_code_schema_is_used_and_announced():
+    # The source system is authoritative whenever one is supplied. When neither a schema nor
+    # a prior catalog is given there is nothing authoritative to merge into, so the export
+    # falls back to the code-derived schema rather than returning an unusable empty section,
+    # and records a non-gating note saying so.
     doc = drift_document()
-    assert export_agent_catalog(doc)["databases"] == []
-    assert export_agent_catalog(doc)["schema_drift"]["code_only"]["databases"]
-    assert export_agent_catalog(doc, include_code_schema=True)["databases"]
+    catalog = export_agent_catalog(doc)
+    assert catalog["databases"], "a catalog with no source of truth must still be usable"
+    assert catalog["schema_drift"]["code_only"]["databases"]
+    notes = [
+        u
+        for u in catalog["lineage"]["unresolved"]
+        if u["kind"] == "analysis_note" and "No schema or prior catalog" in u["reason"]
+    ]
+    assert len(notes) == 1, "the fallback must be announced exactly once"
+
+
+def test_a_supplied_schema_is_authoritative_and_code_adds_nothing():
+    # With a source of truth present, code-only tables stay out of databases and are
+    # reported as drift instead. This is the rule that matters in normal use.
+    schema = {"databases": [{"db_name": "db", "db_type": "athena", "tables": []}]}
+    catalog = export_agent_catalog(drift_document(), schema=schema)
+    names = {t["table_name"] for d in catalog["databases"] for t in d.get("tables", [])}
+    assert names == set(), "code must not add tables on top of a supplied schema"
+    assert catalog["schema_drift"]["code_only"]["databases"]
+    assert not [
+        u for u in catalog["lineage"]["unresolved"] if "No schema or prior catalog" in u["reason"]
+    ]
+    assert export_agent_catalog(drift_document(), schema=schema, include_code_schema=True)[
+        "databases"
+    ][0]["tables"], "the flag still opts code-derived tables back in"
 
 
 def test_include_code_schema_adds_tables_marked_from_code():
@@ -411,7 +434,15 @@ def test_include_code_schema_adds_tables_marked_from_code():
     assert "schema_source" not in columns["x"]
     assert catalog["schema_drift"]["unused_in_code"] == [{"db_name": "db", "table_name": "unused"}]
     assert len(catalog["schema_drift"]["code_only"]["databases"]) == 2
-    assert export_agent_catalog(drift_document())["databases"] == []
+    plain = export_agent_catalog(drift_document(), drift_prior())
+    tagged = [
+        entry
+        for database in plain["databases"]
+        for entry in [database, *database.get("tables", [])]
+        + [c for t in database.get("tables", []) for c in t.get("schema", [])]
+        if entry.get("schema_source") == "code"
+    ]
+    assert tagged == [], "without the flag a prior catalog gains nothing code-derived"
 
 
 def test_schema_drift_is_logged_once_with_counts(monkeypatch):

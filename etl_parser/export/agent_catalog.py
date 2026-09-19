@@ -8,6 +8,8 @@ prior catalog when supplied so human/AI descriptions and catalog flags (``to_tok
 """
 
 import copy
+import json
+from pathlib import Path
 
 from etl_parser.identity import ENGINE_SCHEME, GLUE_ENGINES, agent_table_name, split_dataset_id
 from etl_parser.models import Unresolved
@@ -496,7 +498,7 @@ def _match_prior_scripts(prior_scripts, jobs):
 
 
 def export_agent_catalog(
-    doc, prior=None, *, include_code_schema=False, generate=None, databases=None
+    doc, prior=None, *, schema=None, include_code_schema=False, generate=None, databases=None
 ):
     """Build (or update) an agent ``catalog.json`` dict from a lineage document.
 
@@ -542,8 +544,24 @@ def export_agent_catalog(
     scope = _Scope(databases) if databases is not None else None
     catalog = copy.deepcopy(prior) if prior is not None else {}
     missing: list[Unresolved] = []
+    notes: list[Unresolved] = []
     if "databases" in sections:
-        missing = _export_databases(doc, catalog, scope, include_code_schema)
+        no_source_of_truth = not _seed_from_schema(catalog, schema)
+        if no_source_of_truth and not include_code_schema:
+            # Nothing authoritative to merge into: fall back to the code-derived schema so
+            # the catalog is still usable, and say so instead of returning an empty section.
+            include_code_schema = True
+            notes.append(
+                Unresolved(
+                    kind="analysis_note",
+                    reason=(
+                        "No schema or prior catalog was supplied, so databases, tables and "
+                        "columns come from code. Supply a schema or prior catalog for a "
+                        "source-of-truth export."
+                    ),
+                )
+            )
+        missing = notes + _export_databases(doc, catalog, scope, include_code_schema)
     if "scripts" in sections:
         _export_scripts(doc, catalog, scope)
     if "relations" in sections:
@@ -553,6 +571,59 @@ def export_agent_catalog(
     if "lineage" in sections:
         _export_lineage(doc, catalog, scope, missing)
     return catalog
+
+
+def _seed_from_schema(catalog, schema):
+    """Seed the catalog's ``databases`` from a source-of-truth schema, if one is supplied.
+
+    The source system is authoritative for databases, tables and columns. A schema may be a
+    :class:`~etl_parser.schema.base.SchemaSource`, an already-loaded catalog dict, or a path
+    to a catalog JSON file. Entries already present from a prior catalog are kept; schema
+    entries only fill in what the prior does not have.
+
+    Args:
+        catalog: The catalog being built; its ``databases`` list is extended in place.
+        schema: A schema source, catalog dict, or path, or ``None``.
+
+    Returns:
+        bool: True when the catalog now has at least one authoritative database entry,
+        meaning a prior catalog or schema supplied it; False when there is no source of
+        truth and the caller should fall back to the code-derived schema.
+    """
+    supplied = _schema_databases(schema)
+    databases = catalog.setdefault("databases", [])
+    known = {d.get("db_name") for d in databases}
+    for database in supplied:
+        if database.get("db_name") not in known:
+            databases.append(copy.deepcopy(database))
+    return bool(databases)
+
+
+def _schema_databases(schema):
+    """Return the ``databases`` list from any accepted schema form.
+
+    Args:
+        schema: A schema source exposing ``catalog()``, a catalog dict, a path to a catalog
+            JSON file, or ``None``.
+
+    Returns:
+        list[dict]: The schema's databases, empty when nothing usable was supplied.
+    """
+    if schema is None:
+        return []
+    if hasattr(schema, "catalog"):
+        try:
+            return schema.catalog().get("databases", [])
+        except Exception:  # pragma: no cover - a failing source must not break the export.
+            return []
+    if isinstance(schema, dict):
+        return schema.get("databases", [])
+    if isinstance(schema, (str, Path)):
+        try:
+            return json.loads(Path(schema).read_text()).get("databases", [])
+        except (OSError, ValueError):
+            return []
+    return []
 
 
 def _export_databases(doc, catalog, scope, include_code_schema):
