@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from etl_parser.graph.builder import build_graph
+from etl_parser.graph.impact import downstream
 from etl_parser.models import Job, Provenance, TableEdge, WorkerResult
 from etl_parser.pipeline import scan
 
@@ -87,3 +88,79 @@ def test_in_place_writer_flag_is_per_linking_dataset():
     assert dep.job_id == "upstream"
     assert dep.via_datasets == ["glue://db/handoff"]
     assert dep.in_place_writer is False
+
+
+def test_job_io_edges_make_declared_reads_visible_to_impact(etl_graph):
+    """Finding 12: a declared read with no column lineage still reaches impact."""
+    doc = etl_graph.document
+    edge = next(
+        e
+        for e in doc.table_edges
+        if e.source == "glue://analytics_warehouse/fact_sessions"
+        and e.target == "glue://analytics_warehouse/mart_funnel_conversion"
+    )
+    assert edge.provenance.parser == "job_io"
+    assert edge.provenance.confidence == "partial"
+    assert edge.job_id == "mart_funnel_conversion"
+    report = downstream(etl_graph, "glue://analytics_warehouse/fact_sessions", 1)
+    assert "mart_funnel_conversion" in report["by_hop"][0]["jobs"]
+    assert "glue://analytics_warehouse/mart_funnel_conversion" in report["by_hop"][0]["datasets"]
+
+
+def test_job_io_edges_never_duplicate_a_parsed_edge(tmp_path):
+    """The fallback only fires for input/output pairs no parser already linked."""
+    (tmp_path / "job.sql").write_text("CREATE TABLE db.t AS SELECT x FROM db.s")
+    edges = scan(tmp_path).document.table_edges
+    assert [(e.source, e.target, e.provenance.parser) for e in edges] == [
+        ("glue://db/s", "glue://db/t", "sqlglot")
+    ]
+
+
+def test_job_io_edges_cover_every_unlinked_pair_without_changing_dependencies():
+    """Fallback edges are informational: depends_on still comes from inputs/outputs."""
+    result = WorkerResult(
+        jobs=[
+            Job(
+                id="reader",
+                name="reader",
+                source_file="reader.py",
+                inputs=["glue://db/a", "glue://db/b"],
+                outputs=["glue://db/out"],
+            ),
+            Job(
+                id="writer",
+                name="writer",
+                source_file="writer.sql",
+                inputs=["glue://db/seed"],
+                outputs=["glue://db/a"],
+            ),
+        ],
+        table_edges=[
+            TableEdge(
+                source="glue://db/a",
+                target="glue://db/out",
+                job_id="reader",
+                provenance=Provenance(parser="python_ast"),
+            )
+        ],
+    )
+    doc = build_graph([result]).document
+    fallback = {(e.source, e.target) for e in doc.table_edges if e.provenance.parser == "job_io"}
+    assert fallback == {("glue://db/b", "glue://db/out"), ("glue://db/seed", "glue://db/a")}
+    assert [d.job_id for d in doc.job_dependencies["reader"]] == ["writer"]
+
+
+def test_job_io_edges_skip_self_loops():
+    """An in-place writer's own dataset never becomes a source-equals-target edge."""
+    result = WorkerResult(
+        jobs=[
+            Job(
+                id="purge",
+                name="purge",
+                source_file="purge.sql",
+                inputs=["glue://db/t"],
+                outputs=["glue://db/t"],
+            )
+        ]
+    )
+    assert build_graph([result]).document.table_edges == []

@@ -15,8 +15,23 @@ from collections import defaultdict
 import networkx as nx
 
 from etl_parser.identity import DatasetRegistry, split_dataset_id
-from etl_parser.models import JobDependency, LineageDocument, Unresolved, WorkerResult
+from etl_parser.models import (
+    JobDependency,
+    LineageDocument,
+    Provenance,
+    TableEdge,
+    Unresolved,
+    WorkerResult,
+)
 from etl_parser.registry import ProductRegistry
+
+JOB_IO_PARSER = "job_io"
+"""Provenance parser name for input-by-output fallback table edges (finding 12).
+
+These edges record that a job declared a read and a write, not that a parser traced data
+from one to the other, so they carry ``confidence="partial"`` and are excluded from
+column-level exports such as the OpenLineage column lineage facet.
+"""
 
 
 class LineageGraph:
@@ -305,6 +320,30 @@ def build_graph(
             parent = combined.task_jobs.get(ancestor)
             if parent:
                 add(job, parent, "dag")
+
+    # Declared reads with no parsed edge would otherwise be invisible to impact analysis
+    # (finding 12), so every unlinked input/output pair gets a partial-confidence fallback.
+    # These run after dependency derivation, which reads inputs/outputs and never edges.
+    linked = {(edge.source, edge.target) for edge in combined.table_edges}
+    for job in sorted(jobs.values(), key=lambda j: j.id):
+        for source in sorted(set(job.inputs)):
+            for target in sorted(set(job.outputs)):
+                if source == target or (source, target) in linked:
+                    continue
+                linked.add((source, target))
+                combined.table_edges.append(
+                    TableEdge(
+                        source=source,
+                        target=target,
+                        job_id=job.id,
+                        source_file=job.source_file,
+                        provenance=Provenance(
+                            parser=JOB_IO_PARSER,
+                            confidence="partial",
+                            scan_commit=scan_commit,
+                        ),
+                    )
+                )
 
     # Stable deduplication includes full edge metadata, preserving distinct transformations.
     def unique(items):
