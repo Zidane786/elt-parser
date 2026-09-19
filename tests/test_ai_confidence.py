@@ -102,6 +102,58 @@ def test_accepted_edge_and_description_carry_model_confidence(tmp_path):
     assert column["ai_model"] == "test-model"
 
 
+def test_ai_dataset_and_job_additions_are_marked_and_recorded(tmp_path):
+    source = tmp_path / "job.py"
+    source.write_text('spark.table("db.s").select("x").custom().write.saveAsTable("db.t")')
+
+    def new_dataset(*args):
+        payload = json.loads(proposal_response(*args).content[0]["text"])
+        payload["columns"][0]["sources"] = [{"dataset_id": "glue://db/extra", "name": "x"}]
+        payload["columns"][0]["expression"] = "x from db.extra"
+        return text_response(json.dumps(payload))
+
+    # db.extra is grounded in the text but never read deterministically, so the merged
+    # graph gains that dataset only because the proposal was accepted.
+    source.write_text(
+        "# joins db.extra when the flag is on\n"
+        'spark.table("db.s").select("x").custom().write.saveAsTable("db.t")'
+    )
+    result = analyze(
+        source,
+        runner=FakeLLMRunner([new_dataset]),
+        config=AnalysisConfig(ai_lineage="fallback", model="test"),
+    )
+    dataset = next(d for d in result.document.datasets if d.id == "glue://db/extra")
+    assert dataset.origin == "ai"
+    assert dataset.provenance is not None
+    assert dataset.provenance.parser == "agent_sdk_ai"
+    assert dataset.provenance.ai_confidence == 0.9
+    job = next(j for j in result.document.jobs if j.id == "job")
+    assert "glue://db/extra" in job.ai_inputs
+    assert "glue://db/extra" not in job.inputs
+    assert job.origin == "parser"
+    additions = {c["kind"] for c in result.changes}
+    assert "dataset" in additions
+    added = next(c for c in result.changes if c["kind"] == "dataset")
+    assert added["status"] == "accepted"
+    assert added["after"]["id"] == "glue://db/extra"
+
+
+def test_ai_only_document_marks_every_job_and_dataset_as_ai(tmp_path):
+    source = tmp_path / "job.py"
+    source.write_text('spark.table("db.s").select("x").custom().write.saveAsTable("db.t")')
+    result = analyze(
+        source,
+        runner=FakeLLMRunner([proposal_response]),
+        config=AnalysisConfig(ai_lineage="fallback", model="test"),
+    )
+    # lineage.ai.json exists only because of the proposals, so nothing in it is parser work.
+    assert result.ai_document.jobs
+    assert all(j.origin == "ai" for j in result.ai_document.jobs)
+    assert all(j.ai_outputs and not j.outputs for j in result.ai_document.jobs)
+    assert all(d.origin == "ai" and d.provenance for d in result.ai_document.datasets)
+
+
 def test_below_threshold_proposal_is_deferred_but_visible(tmp_path):
     source = tmp_path / "job.py"
     source.write_text('spark.table("db.s").select("x").custom().write.saveAsTable("db.t")')

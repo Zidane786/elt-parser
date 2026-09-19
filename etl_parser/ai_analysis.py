@@ -824,6 +824,7 @@ def _rebuild(baseline, columns, tables):
         LineageDocument: The rebuilt, sorted lineage document.
     """
     tables = list(tables) + _implied_tables(columns, baseline.table_edges + tables)
+    known_jobs = {j.id for j in baseline.jobs}
     jobs = {j.id: j.model_copy(deep=True) for j in baseline.jobs}
     for edge in columns:
         job = jobs.setdefault(
@@ -832,19 +833,34 @@ def _rebuild(baseline, columns, tables):
                 id=edge.job_id,
                 name=edge.job_id.rsplit("/", 1)[-1],
                 source_file=edge.transformation.source_file or "unknown",
+                origin="ai" if _is_ai(edge) else "parser",
             ),
         )
-        job.inputs = sorted(
-            set(job.inputs) | {r.dataset_id for r in edge.sources + edge.indirect_sources}
-        )
-        job.outputs = sorted(set(job.outputs) | {edge.target.dataset_id})
+        reads = {r.dataset_id for r in edge.sources + edge.indirect_sources}
+        if _is_ai(edge):
+            # Inferred reads/writes stay separate: impact analysis must be able to tell
+            # a proposed dependency from one the parser actually read out of the code.
+            job.ai_inputs = sorted(set(job.ai_inputs) | reads)
+            job.ai_outputs = sorted(set(job.ai_outputs) | {edge.target.dataset_id})
+        else:
+            job.inputs = sorted(set(job.inputs) | reads)
+            job.outputs = sorted(set(job.outputs) | {edge.target.dataset_id})
     for edge in tables:
         job = jobs.setdefault(
             edge.job_id,
-            Job(id=edge.job_id, name=edge.job_id, source_file=edge.source_file or "unknown"),
+            Job(
+                id=edge.job_id,
+                name=edge.job_id,
+                source_file=edge.source_file or "unknown",
+                origin="ai" if _is_ai(edge) else "parser",
+            ),
         )
-        job.inputs = sorted(set(job.inputs) | {edge.source})
-        job.outputs = sorted(set(job.outputs) | {edge.target})
+        if _is_ai(edge):
+            job.ai_inputs = sorted(set(job.ai_inputs) | {edge.source})
+            job.ai_outputs = sorted(set(job.ai_outputs) | {edge.target})
+        else:
+            job.inputs = sorted(set(job.inputs) | {edge.source})
+            job.outputs = sorted(set(job.outputs) | {edge.target})
     combined = WorkerResult(
         datasets=baseline.datasets,
         jobs=list(jobs.values()),
@@ -856,7 +872,118 @@ def _rebuild(baseline, columns, tables):
     )
     graph = build_graph([combined], scan_commit=baseline.scan_commit)
     graph.document.products = copy.deepcopy(baseline.products)
+    _mark_ai_origin(graph.document, baseline, columns, tables, known_jobs)
     return graph.document.sorted()
+
+
+def _is_ai(edge):
+    """Report whether an edge came from an accepted AI proposal.
+
+    Args:
+        edge: A :class:`~etl_parser.models.ColumnEdge` or
+            :class:`~etl_parser.models.TableEdge`.
+
+    Returns:
+        bool: True when the edge's provenance names the AI parser.
+    """
+    return edge.provenance.parser == "agent_sdk_ai"
+
+
+def _mark_ai_origin(document, baseline, columns, tables, known_jobs):
+    """Stamp ``origin="ai"`` and provenance on datasets and jobs the AI introduced.
+
+    The graph builder mints dataset nodes for every edge endpoint without knowing who
+    proposed them, so ownership is recorded here: anything absent from ``baseline`` that
+    only an AI edge references is marked, and everything the deterministic parser found
+    is left untouched.
+
+    Args:
+        document: The rebuilt lineage document to annotate in place.
+        baseline: The document rebuilt from, whose datasets/jobs are deterministic.
+        columns: The column edges merged in.
+        tables: The table edges merged in.
+        known_jobs: Ids of jobs that existed before the merge.
+    """
+    introduced = {}
+    for edge in columns:
+        if _is_ai(edge):
+            for ref in [edge.target, *edge.sources, *edge.indirect_sources]:
+                introduced.setdefault(ref.dataset_id, edge.provenance)
+    for edge in tables:
+        if _is_ai(edge):
+            introduced.setdefault(edge.source, edge.provenance)
+            introduced.setdefault(edge.target, edge.provenance)
+    known_datasets = {d.id for d in baseline.datasets} | {
+        alias for d in baseline.datasets for alias in d.aliases
+    }
+    for dataset in document.datasets:
+        provenance = introduced.get(dataset.id)
+        if provenance is not None and dataset.id not in known_datasets:
+            dataset.origin = "ai"
+            dataset.provenance = provenance.model_copy(deep=True)
+    for job in document.jobs:
+        if job.id not in known_jobs and (job.ai_inputs or job.ai_outputs):
+            job.origin = "ai"
+
+
+def _record_additions(result, baseline, observer):
+    """Add ledger entries for datasets and jobs that only exist because of AI proposals.
+
+    Edge-level decisions are recorded as each file is processed, but a merged edge can
+    also bring a whole dataset or job into the graph. Those additions are recorded here,
+    after the rebuild, so ``changes.json`` shows every node the AI introduced.
+
+    Args:
+        result: The run whose ``changes`` and ``document`` are being finalized.
+        baseline: The deterministic document the merge started from.
+        observer: Run observer used to count and log the additions.
+    """
+    known_datasets = {d.id for d in baseline.datasets}
+    known_jobs = {j.id for j in baseline.jobs}
+    for dataset in result.document.datasets:
+        if dataset.id in known_datasets or dataset.origin != "ai":
+            continue
+        result.changes.append(
+            {
+                "status": "accepted",
+                "kind": "dataset",
+                "request_id": dataset.provenance.request_id if dataset.provenance else None,
+                "before": None,
+                "after": dataset.model_dump(mode="json"),
+                "reason": "introduced_by_accepted_ai_edge",
+            }
+        )
+        observer.count("ai.changes.datasets_added")
+        observer.event(
+            "ai.change_decided",
+            actor="merge_policy",
+            status="accepted",
+            kind="dataset",
+            target=dataset.id,
+            reason="introduced_by_accepted_ai_edge",
+        )
+    for job in result.document.jobs:
+        if job.id in known_jobs or job.origin != "ai":
+            continue
+        result.changes.append(
+            {
+                "status": "accepted",
+                "kind": "job",
+                "request_id": None,
+                "before": None,
+                "after": job.model_dump(mode="json"),
+                "reason": "introduced_by_accepted_ai_edge",
+            }
+        )
+        observer.count("ai.changes.jobs_added")
+        observer.event(
+            "ai.change_decided",
+            actor="merge_policy",
+            status="accepted",
+            kind="job",
+            target=job.id,
+            reason="introduced_by_accepted_ai_edge",
+        )
 
 
 def analyze(
@@ -1714,6 +1841,7 @@ async def analyze_async(
                     runner = None
     if applied_columns or applied_tables:
         result.document = _rebuild(doc, applied_columns, applied_tables)
+        _record_additions(result, doc, observer)
         result.catalog = export_agent_catalog(result.document, result.catalog)
         final_columns = _catalog_columns(result.catalog)
         for key, (text, proposal) in new_descriptions.items():
