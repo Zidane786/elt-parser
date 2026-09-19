@@ -30,11 +30,16 @@ def test_empty_lambda_is_rejected_before_loading_sdk():
 
 
 def test_cli_uses_lambda_sdk_options_only():
-    result = CliRunner().invoke(app, ["describe", "--help"])
-    assert result.exit_code == 0
-    assert "lambda-arn" in result.output
-    assert "web-adapter" in result.output
-    assert "--client" not in result.output
+    # Assert on the registered parameters rather than rendered help: help output is wrapped
+    # and truncated by the installed console width and rich version, which differ per machine.
+    import typer
+
+    command = typer.main.get_command(app)
+    describe = command.commands["describe"]
+    options = {name for parameter in describe.params for name in parameter.opts}
+    assert {"--lambda-arn", "--web-adapter"} <= options
+    assert not [name for name in options if "client" in name]
+    assert CliRunner().invoke(app, ["describe", "--help"]).exit_code == 0
 
 
 def test_scanning_never_imports_sdk_or_aws(tmp_path):
