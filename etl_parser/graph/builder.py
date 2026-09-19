@@ -34,6 +34,27 @@ column-level exports such as the OpenLineage column lineage facet.
 """
 
 
+def dependency_names(document: LineageDocument) -> dict[str, str]:
+    """Return the display name to use for each job in a dependency listing.
+
+    Script names are not unique across a multi-product repository: the products fixture has
+    a ``gen_data`` and a ``load_to_athena`` in every product, so a ``depends_on`` list of
+    bare script names is ambiguous about which job it means (review finding 28). A job whose
+    script name is shared with another job is named by its unique ``job_id`` instead.
+
+    Args:
+        document: The lineage document whose jobs are being listed.
+
+    Returns:
+        dict[str, str]: Job id to the name a consumer should display for it. The values are
+        unique within the document.
+    """
+    counts: dict[str, int] = defaultdict(int)
+    for job in document.jobs:
+        counts[job.name] += 1
+    return {job.id: (job.name if counts[job.name] == 1 else job.id) for job in document.jobs}
+
+
 class LineageGraph:
     """A lineage document plus the ``networkx.MultiDiGraph`` built from it.
 
@@ -405,5 +426,18 @@ def build_graph(
         table_edges=unique(combined.table_edges),
         column_edges=unique(combined.column_edges),
         unresolved=unique(combined.unresolved),
+        # LineageDocument.sorted() has no ordering for join conditions, so they are sorted
+        # here to keep the document byte-identical across runs (spec section 13).
+        join_conditions=sorted(
+            unique(combined.join_conditions),
+            key=lambda c: (
+                c.job_id,
+                c.left.dataset_id,
+                c.left.name,
+                c.right.dataset_id,
+                c.right.name,
+                c.model_dump_json(),
+            ),
+        ),
     )
     return LineageGraph(document)

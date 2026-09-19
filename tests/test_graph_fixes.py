@@ -10,8 +10,9 @@ import pytest
 from openlineage.client.facet_v2 import column_lineage_dataset as cl
 from openlineage.client.serde import Serde
 
+from etl_parser.export.native import write_native
 from etl_parser.export.openlineage_out import PRODUCER, export_openlineage
-from etl_parser.graph.builder import LineageGraph, build_graph
+from etl_parser.graph.builder import LineageGraph, build_graph, dependency_names
 from etl_parser.graph.impact import downstream
 from etl_parser.identity import (
     agent_table_name,
@@ -25,6 +26,7 @@ from etl_parser.models import (
     ColumnRef,
     DatasetRef,
     Job,
+    JoinCondition,
     LineageDocument,
     Provenance,
     Schedule,
@@ -389,6 +391,54 @@ def test_orchestrator_cycles_are_a_note_not_unsupported_syntax():
     note = next(u for u in doc.unresolved if "cycle" in u.reason)
     assert note.kind == "analysis_note"
     assert not [u for u in doc.unresolved if u.kind == "unsupported_syntax"]
+
+
+def test_join_conditions_are_carried_through_deduped_and_sorted():
+    """WP-D feeds join conditions in; the document must carry them deterministically."""
+    provenance = Provenance(parser="sqlglot")
+
+    def condition(left, right):
+        return JoinCondition(
+            left=ColumnRef(dataset_id="glue://db/a", name=left),
+            right=ColumnRef(dataset_id="glue://db/b", name=right),
+            job_id="job",
+            provenance=provenance,
+        )
+
+    first = WorkerResult(join_conditions=[condition("z", "z"), condition("a", "a")])
+    second = WorkerResult(join_conditions=[condition("a", "a"), condition("m", "m")])
+    carried = build_graph([first, second]).document.join_conditions
+    assert [c.left.name for c in carried] == ["a", "m", "z"]
+
+
+def test_dependency_names_fall_back_to_job_id_when_script_names_collide(products_graph):
+    """Finding 28: three products each have a gen_data and a load_to_athena script."""
+    names = dependency_names(products_graph.document)
+    assert names["bill/gen_data"] == "bill/gen_data"
+    assert names["meter/gen_data"] == "meter/gen_data"
+    assert names["reg/load_to_athena"] == "reg/load_to_athena"
+    assert names["bill/jobs/rate_invoices"] == "rate_invoices"
+
+
+def test_dependency_names_are_unique_per_document():
+    """A display name never silently stands for two different jobs."""
+    jobs = [
+        Job(id="one/shared", name="shared", source_file="one/shared.py"),
+        Job(id="two/shared", name="shared", source_file="two/shared.py"),
+        Job(id="solo", name="solo", source_file="solo.py"),
+    ]
+    names = dependency_names(LineageDocument(jobs=jobs))
+    assert names == {"one/shared": "one/shared", "two/shared": "two/shared", "solo": "solo"}
+    assert len(set(names.values())) == len(names)
+
+
+@pytest.mark.parametrize("fixture", ["etl", "products"])
+def test_scan_output_is_byte_identical_across_runs(fixture, tmp_path):
+    """Spec 13: two scans of the same tree serialize to the same bytes."""
+    first, second = tmp_path / "first.json", tmp_path / "second.json"
+    write_native(scan(FIXTURES / fixture).document, first)
+    write_native(scan(FIXTURES / fixture).document, second)
+    assert first.read_bytes() == second.read_bytes()
 
 
 def _cross_product_document():
