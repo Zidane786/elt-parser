@@ -84,6 +84,54 @@ def test_response_schema_requires_confidence_and_rationale():
         )
 
 
+@pytest.mark.parametrize(
+    "quote,reason",
+    [
+        ("x", "too_short"),
+        ("SELECT 1 FROM dual", "evidence_quote_unrelated_to_proposal"),
+    ],
+)
+def test_weak_evidence_quotes_are_rejected(tmp_path, quote, reason):
+    source = tmp_path / "job.sql"
+    source.write_text("CREATE TABLE db.t AS SELECT x FROM db.s\n-- SELECT 1 FROM dual\n")
+
+    def weak(*args):
+        payload = json.loads(proposal_response(*args).content[0]["text"])
+        payload["columns"][0]["evidence"]["quote"] = quote
+        payload["columns"][0]["evidence"]["line_end"] = 2
+        return text_response(json.dumps(payload))
+
+    result = analyze(
+        source,
+        runner=FakeLLMRunner([weak]),
+        config=AnalysisConfig(ai_lineage="improve", model="test"),
+    )
+    if reason == "too_short":
+        # A one-character quote cannot even enter the schema.
+        assert result.decisions[0]["reason"] == "response_schema_invalid"
+    else:
+        assert result.changes[0]["reason"] == reason
+    assert result.document == result.baseline
+
+
+def test_dataset_grounding_requires_a_whole_token_match(tmp_path):
+    source = tmp_path / "job.sql"
+    source.write_text("CREATE TABLE db.transactions AS SELECT x FROM db.s")
+
+    def prefix_dataset(*args):
+        payload = json.loads(proposal_response(*args).content[0]["text"])
+        payload["columns"][0]["target"]["dataset_id"] = "glue://db/trans"
+        return text_response(json.dumps(payload))
+
+    result = analyze(
+        source,
+        runner=FakeLLMRunner([prefix_dataset]),
+        config=AnalysisConfig(ai_lineage="improve", model="test"),
+    )
+    assert result.changes[0]["reason"] == "new_dataset_not_supported_by_literal_source"
+    assert result.document == result.baseline
+
+
 def test_accepted_edge_and_description_carry_model_confidence(tmp_path):
     source = tmp_path / "job.py"
     source.write_text('spark.table("db.s").select("x").custom().write.saveAsTable("db.t")')
