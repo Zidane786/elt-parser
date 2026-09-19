@@ -69,9 +69,10 @@ def apply_export_options(
             "descriptions"
         )
         # After AI stages the current catalog carries their descriptions; keep them.
-        base = result.catalog if ai_ran else prior
+        base = getattr(result, "catalog", None) if ai_ran else prior
         result.catalog = export_agent_catalog(result.document, base, **supported)
-    result.schema_drift = (result.catalog or {}).get("schema_drift")
+    # A result need not carry a catalog: a scan-only run has none to read drift from.
+    result.schema_drift = (getattr(result, "catalog", None) or {}).get("schema_drift")
     return sorted(set(requested) - set(supported))
 
 
