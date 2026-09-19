@@ -1,8 +1,11 @@
 """Regression tests for the Python/Spark worker fixes of the 2026-09-19 review (WP-C)."""
 
+import zipfile
+
 import pytest
 
 from etl_parser.pipeline import scan
+from etl_parser.scanner.repo import RepoScanner
 from etl_parser.workers.sql import DictSchemaProvider
 
 
@@ -60,7 +63,6 @@ def test_deeply_nested_expression_is_reported_not_raised(tmp_path):
 
 
 def test_analyze_file_outside_index_root_is_not_an_error(tmp_path):
-    from etl_parser.scanner.repo import RepoScanner
     from etl_parser.workers.python import PythonWorker
 
     (tmp_path / "repo").mkdir()
@@ -279,6 +281,43 @@ def test_sqlalchemy_text_is_matched_through_its_import(tmp_path):
         'statement = text("INSERT INTO shop.target SELECT id FROM shop.source")\n',
     )
     assert doc.jobs[0].outputs == ["table://shop/target"]
+
+
+def test_one_bad_zip_member_does_not_abort_the_rest(tmp_path):
+    with zipfile.ZipFile(tmp_path / "a.zip", "w") as archive:
+        archive.writestr("bad.py", b"\xff\xfe not utf-8 at all")
+        archive.writestr("good.py", "x = 1\n")
+    index = RepoScanner(tmp_path).scan()
+    assert [s.path for s in index.files] == ["a.zip!/good.py"]
+    assert [u.source_file for u in index.unresolved] == ["a.zip!/bad.py"]
+
+
+def test_zip_member_with_a_lying_size_header_is_read_within_the_limit(tmp_path, monkeypatch):
+    with zipfile.ZipFile(tmp_path / "a.zip", "w") as archive:
+        archive.writestr("big.py", "x = 1\n" * 500)
+        archive.writestr("small.py", "y = 2\n")
+    listing = zipfile.ZipFile.infolist
+
+    def understated(self):
+        """Report the large member as one byte, however large it really is."""
+        members = listing(self)
+        for member in members:
+            if member.filename == "big.py":
+                member.file_size = 1
+        return members
+
+    monkeypatch.setattr(zipfile.ZipFile, "infolist", understated)
+    index = RepoScanner(tmp_path, max_file_bytes=100).scan()
+    assert [s.path for s in index.files] == ["a.zip!/small.py"]
+    assert [u.source_file for u in index.unresolved] == ["a.zip!/big.py"]
+
+
+def test_local_zip_respects_the_archive_size_limit(tmp_path):
+    with zipfile.ZipFile(tmp_path / "a.zip", "w") as archive:
+        archive.writestr("m.py", "x = 1\n")
+    index = RepoScanner(tmp_path, max_archive_bytes=10).scan()
+    assert index.files == []
+    assert [u.source_file for u in index.unresolved] == ["a.zip"]
 
 
 def test_spark_static_worker_stamps_spark_without_an_import(tmp_path):
