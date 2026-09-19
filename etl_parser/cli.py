@@ -190,6 +190,11 @@ def analysis_run(
         max=1.0,
         help="Defer AI proposals whose reported confidence is below this threshold (0-1)",
     ),
+    override_existing: bool = typer.Option(
+        False,
+        "--override-existing/--no-override-existing",
+        help="Regenerate descriptions this tool wrote; human and verified text is kept",
+    ),
     strict: bool = typer.Option(False, help="Fail if any unresolved/AI-incomplete work remains"),
     log_dir: Path | None = typer.Option(None, help="Persist run events and metrics in this folder"),
     log_level: str = typer.Option("INFO", help="Console level; file logs retain DEBUG events"),
@@ -299,13 +304,9 @@ def analysis_run(
         }
     )
     if min_ai_confidence is not None:
-        if "min_ai_confidence" not in AnalysisConfig.model_fields:
-            raise typer.BadParameter(
-                "This build's AnalysisConfig has no min_ai_confidence field; "
-                "upgrade etl-parser to filter AI proposals by confidence",
-                param_hint="--min-ai-confidence",
-            )
         settings["min_ai_confidence"] = min_ai_confidence
+    if override_existing:
+        settings["override_existing"] = True
     try:
         options = AnalysisConfig.model_validate(settings)
     except ValueError as exc:
@@ -815,6 +816,11 @@ def describe(
     max_tokens: int = typer.Option(
         16000, min=1, help="Maximum output tokens per description request"
     ),
+    override_existing: bool = typer.Option(
+        False,
+        "--override-existing/--no-override-existing",
+        help="Regenerate descriptions this tool wrote; human and verified text is kept",
+    ),
     log_dir: Path | None = typer.Option(None, help="Persist run events and metrics in this folder"),
     log_level: str = typer.Option("INFO", help="Console level; file logs retain DEBUG events"),
     log_max_bytes: int = typer.Option(
@@ -893,16 +899,27 @@ def describe(
         """Construct the configured runner, run the description engine, and close it."""
         selected = configured_runner(options)
         try:
-            engine = DescriptionEngine(selected, model=model, max_tokens=max_tokens)
-            return await engine.arun(doc, existing), engine.warnings
+            engine = DescriptionEngine(
+                selected,
+                model=model,
+                max_tokens=max_tokens,
+                override_existing=override_existing,
+            )
+            enriched = await engine.arun(doc, existing)
+            return enriched, engine.warnings, dict(engine.summary)
         finally:
             await close_runner(selected)
 
     try:
-        enriched, warnings = asyncio.run(generate())
+        enriched, warnings, summary = asyncio.run(generate())
     except (RuntimeError, ValueError, ImportError):
         raise typer.BadParameter(
             "Runner initialization failed; check SDK and selected provider settings"
         ) from None
     _write(enriched, out)
+    # Without this the command is silent on success and a caller cannot tell whether any
+    # description was produced.
+    typer.echo(
+        json.dumps({**summary, "warnings": len(warnings), "output": str(out)}, sort_keys=True)
+    )
     current_observer().event("description.completed", warning_count=len(warnings))
