@@ -12,6 +12,80 @@ import copy
 from etl_parser.identity import ENGINE_SCHEME, GLUE_ENGINES, agent_table_name, split_dataset_id
 
 
+def _database_scheme(database):
+    """Return the identity scheme (e.g. ``glue``) implied by a catalog database's type.
+
+    Args:
+        database: A catalog ``databases[]`` entry; its ``db_type`` is inspected.
+
+    Returns:
+        str: ``glue`` for Athena/Spark/Glue engines, ``""`` when no type is recorded,
+        else the engine scheme or the raw lower-cased type.
+    """
+    kind = (database.get("db_type") or "").lower()
+    return "glue" if kind in GLUE_ENGINES else ENGINE_SCHEME.get(kind, kind)
+
+
+def _db_type(scheme):
+    """Return the ``db_type`` to write for a database created from a dataset scheme.
+
+    Glue-scheme datasets are recorded as ``athena`` because ``glue`` is an identity
+    scheme, not an engine the agent knows.
+
+    Args:
+        scheme: The dataset id scheme (``glue``, ``postgres``, ...).
+
+    Returns:
+        str: The engine name to store in ``db_type``.
+    """
+    return "athena" if scheme == "glue" else scheme
+
+
+def _same_db_name(prior_name, namespace, scheme):
+    """Tell whether a prior database name denotes the dataset namespace.
+
+    Glue identifiers are case-insensitive, so glue datasets match prior names ignoring
+    case; every other scheme compares exactly.
+
+    Args:
+        prior_name: ``db_name`` of a prior catalog database.
+        namespace: Namespace part of the dataset id.
+        scheme: Scheme part of the dataset id.
+
+    Returns:
+        bool: True when the names denote the same database.
+    """
+    if scheme == "glue":
+        return (prior_name or "").lower() == namespace.lower()
+    return prior_name == namespace
+
+
+def _find_database(databases, namespace, scheme):
+    """Pick the catalog database a dataset belongs to, matching by name first.
+
+    A single database with the dataset's name is the target regardless of its
+    ``db_type`` (the source system, not the code, decides the engine). When several
+    share the name, the one whose type maps to the dataset scheme wins, then one with no
+    type; otherwise there is no match.
+
+    Args:
+        databases: The catalog ``databases`` list.
+        namespace: Namespace part of the dataset id.
+        scheme: Scheme part of the dataset id.
+
+    Returns:
+        dict | None: The matching database entry, or ``None`` when a new one is needed.
+    """
+    candidates = [d for d in databases if _same_db_name(d.get("db_name"), namespace, scheme)]
+    if len(candidates) == 1:
+        return candidates[0]
+    for wanted in (scheme, ""):
+        for database in candidates:
+            if _database_scheme(database) == wanted:
+                return database
+    return None
+
+
 def export_agent_catalog(doc, prior=None):
     """Build (or update) an agent ``catalog.json`` dict from a lineage document.
 
@@ -34,35 +108,21 @@ def export_agent_catalog(doc, prior=None):
     prior_scripts = {s["script_path"]: s for s in catalog.get("scripts", [])}
     prior_jobs = {s["job_id"]: s for s in catalog.get("scripts", []) if s.get("job_id")}
 
-    def database_scheme(database):
-        """Return the identity scheme (e.g. ``glue``) implied by a catalog database's type.
-
-        Args:
-            database: A catalog ``databases[]`` entry; its ``db_type`` is inspected.
-
-        Returns:
-            str: ``glue`` for Athena/Spark/Glue engines, else the engine scheme or the raw type.
-        """
-        kind = database.get("db_type", "").lower()
-        return "glue" if kind in GLUE_ENGINES else ENGINE_SCHEME.get(kind, kind)
-
     for dataset in doc.datasets:
         if dataset.kind != "table" or dataset.id.startswith("frame://"):
             continue
         scheme, namespace, name = split_dataset_id(dataset.id)
-        database = next(
-            (
-                d
-                for d in databases
-                if d["db_name"] == namespace and database_scheme(d) in {"", scheme}
-            ),
-            None,
-        )
+        database = _find_database(databases, namespace, scheme)
         if database is None:
-            database = {"db_name": namespace, "db_type": scheme, "description": "", "tables": []}
+            database = {
+                "db_name": namespace,
+                "db_type": _db_type(scheme),
+                "description": "",
+                "tables": [],
+            }
             databases.append(database)
         elif not database.get("db_type"):
-            database["db_type"] = scheme
+            database["db_type"] = _db_type(scheme)
         if dataset.product:
             database["product"] = dataset.product
         if dataset.layer:
