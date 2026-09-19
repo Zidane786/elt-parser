@@ -659,6 +659,7 @@ class SqlWorker:
         target: str | None = target_override
         body: exp.Expression | None = None
         is_temp = False
+        location: str | None = None
         if isinstance(e, exp.Create):
             table = e.this.this if isinstance(e.this, exp.Schema) else e.this
             if isinstance(table, exp.Table) and e.kind in {"TABLE", "VIEW"}:
@@ -668,6 +669,22 @@ class SqlWorker:
                     isinstance(p, exp.TemporaryProperty)
                     for p in (e.args.get("properties") or exp.Properties()).expressions
                 ) or bool(e.args.get("temporary"))
+                location = _storage_location(e, norm)
+                like = e.find(exp.LikeProperty)
+                if body is None and like is not None and isinstance(like.this, exp.Table):
+                    # ``CREATE TABLE b.t LIKE a.s``: structure copied, a table-level edge.
+                    self._table_only(
+                        norm(_table_name(like.this)),
+                        target,
+                        stmt,
+                        analysis,
+                        Provenance(parser="sqlglot", dialect=dialect),
+                        job_id,
+                        source_file,
+                        e.sql(dialect=dialect),
+                    )
+                    self._locate(target, location, result)
+                    return
                 if body is None and isinstance(e.this, exp.Schema):
                     # Plain DDL: register columns, no lineage.
                     cols = [c.name for c in e.this.expressions if isinstance(c, exp.ColumnDef)]
@@ -684,16 +701,27 @@ class SqlWorker:
                         )
                     )
                     analysis.outputs.add(target)
+                    self._locate(target, location, result)
                     return
         elif isinstance(e, exp.Insert):
             table = e.this.this if isinstance(e.this, exp.Schema) else e.this
             if isinstance(table, exp.Table):
                 target = target or norm(_table_name(table))
+            elif isinstance(table, exp.Directory) and isinstance(table.this, exp.Literal):
+                # ``INSERT OVERWRITE DIRECTORY 's3://...'``: the path is the output dataset.
+                target = target or norm(table.this.this)
             body = e.expression
             if isinstance(body, exp.Values):
                 if target:
                     analysis.outputs.add(target)
                 return
+        elif isinstance(e, exp.Select) and isinstance(e.args.get("into"), exp.Into):
+            # ``SELECT ... INTO b.t FROM ...`` creates ``b.t`` from the projection.
+            into = e.args["into"]
+            if isinstance(into.this, exp.Table):
+                target = target or norm(_table_name(into.this))
+            body = e.copy()
+            body.set("into", None)
         elif isinstance(e, (exp.Select, exp.SetOperation, exp.Subquery)):
             body = e
         elif isinstance(e, exp.Delete):
@@ -702,6 +730,11 @@ class SqlWorker:
                 ds = norm(_table_name(table))
                 analysis.inputs.add(ds)
                 analysis.outputs.add(ds)
+            # ``DELETE ... WHERE id IN (SELECT ... FROM a.s)`` reads ``a.s``.
+            ctes = {c.alias for c in e.find_all(exp.CTE)}
+            for t in e.find_all(exp.Table):
+                if t is not table and t.name and t.name not in ctes:
+                    analysis.inputs.add(norm(_table_name(t)))
             return
         else:
             result.unresolved.append(
@@ -742,6 +775,64 @@ class SqlWorker:
             source_file,
             is_temp,
             target_columns,
+        )
+        if target and not is_temp:
+            self._locate(target, location, result)
+
+    def _locate(self, target: str, location: str | None, result: WorkerResult) -> None:
+        """Attach a declared storage location to the target dataset as alias evidence.
+
+        Args:
+            target: Dataset id the ``CREATE`` statement wrote.
+            location: Normalised storage path from ``LOCATION`` or ``external_location``,
+                or ``None`` when the statement declared none.
+            result: Worker result whose ``datasets`` entry for ``target`` is updated in
+                place (``DatasetRef.aliases`` and ``physical_location``).
+        """
+        if not location:
+            return
+        for ds in result.datasets:
+            if ds.id == target:
+                if location not in ds.aliases:
+                    ds.aliases.append(location)
+                ds.physical_location = ds.physical_location or location
+
+    def _table_only(
+        self, source: str, target: str, stmt, analysis, prov, job_id, source_file, expression
+    ) -> None:
+        """Record a table-level read/write with no column lineage.
+
+        Used for statements whose column mapping is unknown by construction
+        (``CREATE TABLE ... LIKE``, ``MERGE ... DELETE``, ``UPDATE SET *`` without a
+        schema).
+
+        Args:
+            source: Dataset id read.
+            target: Dataset id written.
+            stmt: Enclosing statement, for line numbers.
+            analysis: Accumulator receiving inputs, outputs and the edge.
+            prov: Provenance for the edge.
+            job_id: Job the edge belongs to.
+            source_file: File the statement was read from.
+            expression: SQL text recorded on the edge's transformation.
+        """
+        analysis.inputs.add(source)
+        analysis.outputs.add(target)
+        analysis.result.table_edges.append(
+            TableEdge(
+                source=source,
+                target=target,
+                provenance=prov,
+                job_id=job_id,
+                source_file=source_file,
+                line=stmt.line_start,
+                transformation=Transformation(
+                    expression=expression,
+                    source_file=source_file,
+                    line_start=stmt.line_start,
+                    line_end=stmt.line_end,
+                ),
+            )
         )
 
     def _analyze_select(
@@ -1175,11 +1266,37 @@ class SqlWorker:
         target = norm(_table_name(e.this))
         analysis.inputs.add(target)
         analysis.outputs.add(target)
+        using = e.args.get("using")
+        using_alias = using.alias_or_name if isinstance(using, exp.Expression) else None
         merged: dict[str, ColumnEdge] = {}
+        star_unresolved = False
         for when in e.args["whens"].expressions:
             action = when.args.get("then")
             pairs = []
-            if isinstance(action, exp.Update):
+            star = (
+                isinstance(action, exp.Update)
+                and any(isinstance(x, exp.Star) for x in action.expressions)
+            ) or (isinstance(action, exp.Insert) and isinstance(action.this, exp.Star))
+            if star:
+                # ``UPDATE SET *`` / ``INSERT *``: every target column comes from the
+                # like-named column of the USING source; needs the target's schema.
+                known = self.schema.columns(target) if self.schema else None
+                if not known or not using_alias:
+                    if star_unresolved:
+                        continue
+                    star_unresolved = True
+                    analysis.result.unresolved.append(
+                        Unresolved(
+                            kind="missing_schema",
+                            source_file=source_file,
+                            line=stmt.line_start,
+                            reason="MERGE SET */INSERT * needs the target schema to map columns",
+                            job_id=job_id,
+                        )
+                    )
+                    continue
+                pairs = [(c, exp.column(c, table=using_alias)) for c in known]
+            elif isinstance(action, exp.Update):
                 pairs = [
                     (eq.this.name, eq.expression)
                     for eq in action.expressions
@@ -1237,6 +1354,53 @@ class SqlWorker:
                     merged[edge.target.name] = edge
             branch.result.column_edges = []
             analysis.result.extend(branch.result)
+        if not merged and using is not None:
+            # ``WHEN MATCHED THEN DELETE`` only, or ``SET *`` without a schema: the USING
+            # source still drives the write, so keep it as an input with a table edge and
+            # record the ON equalities as join conditions.
+            prov = Provenance(
+                parser="sqlglot",
+                dialect=dialect,
+                confidence="partial" if star_unresolved or stmt.holes else "exact",
+            )
+            ctes = {c.alias for c in e.find_all(exp.CTE)}
+            sources = {
+                norm(_table_name(t))
+                for t in using.find_all(exp.Table)
+                if t.name and t.name not in ctes
+            }
+            for source in sorted(self._physical(sources)):
+                self._table_only(
+                    source,
+                    target,
+                    stmt,
+                    analysis,
+                    prov,
+                    job_id,
+                    source_file,
+                    e.sql(dialect=dialect),
+                )
+            probe = exp.select(exp.alias_(exp.Literal.number(1), "__merge__", quoted=True))
+            probe = probe.from_(e.this.copy()).join(using.copy(), on=e.args["on"].copy())
+            if e.args.get("with_"):
+                probe.set("with_", e.args["with_"].copy())
+            try:
+                qualified = qualify(
+                    probe,
+                    schema=self._schema_map(
+                        {_table_name(t): norm(_table_name(t)) for t in probe.find_all(exp.Table)},
+                        norm,
+                    )
+                    or None,
+                    dialect=dialect,
+                    validate_qualify_columns=False,
+                    infer_schema=True,
+                    allow_partial_qualification=True,
+                )
+                pairs = self._indirect_sources(qualified, norm, dialect)["pairs"]
+            except SqlglotError:
+                pairs = []
+            self._emit_join_conditions(pairs, prov, job_id, analysis.result)
         analysis.result.column_edges.extend(merged.values())
         analysis.output_columns[target] = list(merged)
 
@@ -1472,6 +1636,33 @@ def _dedup(refs: Iterable[ColumnRef]) -> list[ColumnRef]:
             seen.add((r.dataset_id, r.name))
             out.append(r)
     return out
+
+
+def _storage_location(create: exp.Create, norm) -> str | None:
+    """Return the normalised storage path declared on a ``CREATE`` statement, if any.
+
+    Recognises Hive/Spark ``LOCATION 's3://...'`` and Trino/Athena
+    ``WITH (external_location = 's3://...')``. The path is alias evidence linking the
+    catalog table to its physical files (``DatasetRef.aliases``/``physical_location``).
+
+    Args:
+        create: The parsed ``CREATE`` expression.
+        norm: Callable normalising a raw dataset name or path to a canonical id.
+
+    Returns:
+        The normalised path, or ``None`` when no location is declared or it is not a
+        string literal.
+    """
+    for prop in create.find_all(exp.LocationProperty, exp.Property):
+        if isinstance(prop, exp.LocationProperty):
+            value = prop.this
+        elif type(prop) is exp.Property and prop.name.lower() == "external_location":
+            value = prop.args.get("value")
+        else:
+            continue
+        if isinstance(value, exp.Literal) and value.is_string and value.this:
+            return norm(value.this)
+    return None
 
 
 def _table_name(t: exp.Table) -> str:
