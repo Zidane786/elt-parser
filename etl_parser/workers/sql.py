@@ -885,6 +885,21 @@ class SqlWorker:
             if not name or proj.is_star:
                 continue
             output_name = target_columns[position] if target_columns else name
+            if output_name in out_cols:
+                # Two projections with one name (``SELECT x, x`` or a star over a join):
+                # keep the first edge and report the ambiguity instead of a duplicate edge.
+                result.unresolved.append(
+                    Unresolved(
+                        kind="unknown_column",
+                        source_file=source_file,
+                        line=stmt.line_start,
+                        reason=f"Duplicate output column name {output_name!r} at projection "
+                        f"{position + 1}; only the first projection is tracked",
+                        job_id=job_id,
+                        expression=proj.sql(dialect=dialect)[:200],
+                    )
+                )
+                continue
             out_cols.append(output_name)
             if not target:
                 continue
