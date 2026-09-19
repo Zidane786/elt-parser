@@ -203,22 +203,22 @@ def build_graph(
         schedules.update(registry.schedules())
         for ds in refs:
             scheme, namespace, _ = split_dataset_id(ds.id)
-            # The engine is part of ownership: a product's Athena warehouse does not own a
-            # same-named Postgres database (finding 30).
+            # The declared engine picks between declarations of one name; it never vetoes
+            # ownership, because losing a true owner is worse than the mis-attribution
+            # strict matching avoids (finding 30). A disagreement is reported instead.
             product = registry.product_for_database(namespace, scheme)
-            if product:
-                ds.product = product.code
-                ds.layer = registry.layer_for_database(namespace, scheme)
+            if not product:
                 continue
-            declared = registry.product_for_database(namespace)
-            if declared:
+            ds.product = product.code
+            ds.layer = registry.layer_for_database(namespace, scheme)
+            if not registry.engine_matches(namespace, scheme):
                 combined.unresolved.append(
                     Unresolved(
                         kind="analysis_note",
                         reason=(
                             f"Database {namespace!r} is declared by product "
-                            f"{declared.code!r} for another engine, so {ds.id} is left "
-                            "unattributed"
+                            f"{product.code!r} for another engine, but {ds.id} was "
+                            f"observed on {scheme!r}; ownership was kept"
                         ),
                         remediation=(
                             "Declare this engine in the product's databases, or correct "

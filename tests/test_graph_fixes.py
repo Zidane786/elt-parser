@@ -14,6 +14,7 @@ from etl_parser.export.native import write_native
 from etl_parser.export.openlineage_out import PRODUCER, export_openlineage
 from etl_parser.graph.builder import LineageGraph, build_graph, dependency_names
 from etl_parser.graph.impact import downstream
+from etl_parser.graph.products import product_dependencies
 from etl_parser.identity import (
     agent_table_name,
     dataset_ref_from_id,
@@ -332,25 +333,44 @@ def test_registry_merges_steps_and_scripts(tmp_path):
     assert schedules["product.p.two"].cron == "0 2 * * *"
 
 
-def test_product_attach_honours_the_declared_database_engine(products_graph):
-    """Finding 30: a Postgres table is not owned by a database declared as Athena."""
+def test_product_attach_prefers_the_declared_engine_but_keeps_attribution(products_graph):
+    """Finding 30, refined: the engine picks the best match, it does not veto ownership.
+
+    Dropping ownership when the engine disagrees loses true attribution (the billing jobs
+    reach an Athena-backed warehouse through a Postgres driver) to avoid a false one. The
+    mismatch is surfaced as a note instead, so nothing is silently wrong either way.
+    """
     products = {d.id: d.product for d in products_graph.document.datasets}
     assert products["glue://meter_cur/fact_consumption"] == "meter"
-    assert products["postgres://meter_cur/fact_consumption"] is None
+    assert products["postgres://meter_cur/fact_consumption"] == "meter"
     assert products["postgres://billing_pg/invoices"] == "bill"
+    assert products["postgres://bill_cur/fact_invoice"] == "bill"
+    layers = {d.id: d.layer for d in products_graph.document.datasets}
+    assert layers["postgres://bill_cur/fact_invoice"] == "curated"
 
 
-def test_engine_mismatch_is_reported_rather_than_silently_unattributed(products_graph):
-    """A declared database seen on another engine leaves a non-gating note behind.
+def test_cross_product_dependencies_stay_confirmed_across_engines(products_graph):
+    """Keeping attribution keeps the observed product graph intact."""
+    statuses = {
+        (d["from_product"], d["to_product"]): d["status"]
+        for d in product_dependencies(products_graph)
+    }
+    assert statuses[("bill", "meter")] == "confirmed"
+    assert statuses[("reg", "bill")] == "confirmed"
+    assert statuses[("reg", "meter")] == "confirmed"
+
+
+def test_engine_mismatch_is_reported_as_a_note(products_graph):
+    """A declared database seen on another engine keeps its owner and leaves a note.
 
     The bill product declares bill_raw/bill_stg/bill_cur as Athena while its jobs run them
-    over Postgres, so those datasets are no longer attributed to it. That is drift worth
-    seeing, not something to swallow.
+    over Postgres. That is real drift in the user's own product.yaml: worth seeing, not
+    worth dropping attribution over.
     """
     reasons = [
         u.reason
         for u in products_graph.document.unresolved
-        if u.kind == "analysis_note" and "another engine" in u.reason
+        if u.kind == "analysis_note" and "engine" in u.reason
     ]
     for dataset_id in ("postgres://bill_cur/fact_invoice", "postgres://meter_cur/fact_consumption"):
         assert any(dataset_id in reason for reason in reasons), dataset_id
@@ -367,14 +387,34 @@ def test_registry_matches_engine_families_to_schemes(tmp_path):
         "  - name: anything\n    layer: raw\n"
     )
     registry = ProductRegistry.load(tmp_path)
-    assert registry.product_for_database("warehouse", "glue").code == "p"
-    assert registry.product_for_database("warehouse", "postgres") is None
-    assert registry.product_for_database("ledger", "postgres").code == "p"
+    assert registry.engine_matches("warehouse", "glue") is True
+    assert registry.engine_matches("ledger", "postgres") is True
+    assert registry.engine_matches("warehouse", "postgres") is False
+    # A name match without an engine match still owns the database: attribution is more
+    # useful than silence, and the caller reports the mismatch.
+    assert registry.product_for_database("warehouse", "postgres").code == "p"
+    assert registry.layer_for_database("warehouse", "postgres") == "curated"
     assert registry.layer_for_database("ledger", "postgres") == "source"
-    assert registry.layer_for_database("ledger", "glue") is None
-    # An undeclared engine still matches any scheme, so existing product.yaml keeps working.
-    assert registry.product_for_database("anything", "glue").code == "p"
+    # An undeclared engine matches any scheme, so existing product.yaml keeps working.
+    assert registry.engine_matches("anything", "glue") is True
     assert registry.product_for_database("anything", "s3").code == "p"
+    assert registry.engine_matches("unknown_database", "glue") is True
+    assert registry.product_for_database("unknown_database", "glue") is None
+
+
+def test_registry_picks_the_declared_engine_when_a_database_serves_two(tmp_path):
+    """Declaring both engines for one name is the fix for an engine-mismatch note."""
+    (tmp_path / "product.yaml").write_text(
+        "code: p\nname: product\n"
+        "databases:\n"
+        "  - name: warehouse\n    type: athena\n    layer: curated\n"
+        "  - name: warehouse\n    type: postgres\n    layer: serving\n"
+    )
+    registry = ProductRegistry.load(tmp_path)
+    assert registry.layer_for_database("warehouse", "glue") == "curated"
+    assert registry.layer_for_database("warehouse", "postgres") == "serving"
+    assert registry.engine_matches("warehouse", "postgres") is True
+    assert registry.engine_matches("warehouse", "mysql") is False
 
 
 def test_empty_and_schemeless_dataset_ids_never_raise():
