@@ -46,3 +46,28 @@ def test_spark_read_accepts_keyword_path(tmp_path):
     )
     assert doc.jobs[0].inputs == ["s3://b/in/"]
     assert not [u for u in doc.unresolved if u.kind == "dynamic_path"]
+
+
+def test_deeply_nested_expression_is_reported_not_raised(tmp_path):
+    chain = " + ".join(f"F.col('c{i}')" for i in range(400))
+    doc = run(
+        tmp_path,
+        'from pyspark.sql import functions as F\ndf = spark.table("a.b")\n'
+        f'df.withColumn("total", {chain}).write.saveAsTable("a.t")\n',
+    )
+    assert [j.id for j in doc.jobs] == ["job"]
+    assert any(u.kind == "unsupported_syntax" for u in doc.unresolved)
+
+
+def test_analyze_file_outside_index_root_is_not_an_error(tmp_path):
+    from etl_parser.scanner.repo import RepoScanner
+    from etl_parser.workers.python import PythonWorker
+
+    (tmp_path / "repo").mkdir()
+    (tmp_path / "repo" / "kept.py").write_text("x = 1\n")
+    outside = tmp_path / "outside.py"
+    outside.write_text('spark.table("a.b").write.saveAsTable("a.t")\n')
+    index = RepoScanner(tmp_path / "repo").scan()
+    result = PythonWorker(index=index).analyze_file(outside)
+    assert [j.source_file for j in result.jobs] == [str(outside)]
+    assert result.jobs[0].inputs == ["glue://a/b"]

@@ -40,6 +40,37 @@ from etl_parser.scanner.strings import Folded, fold_string
 from etl_parser.workers.base import comment_schedule, first_docstring_line, parse_header
 from etl_parser.workers.sql import SqlWorker
 
+MAX_EXPRESSION_DEPTH = 200
+"""Deepest expression the analyzer renders as source text (design spec section 13).
+
+``ast.unparse`` recurses once per nesting level, so an expression nested deeper than this
+would raise ``RecursionError`` inside the very diagnostic that reports it. Real code stays
+an order of magnitude below this limit; generated code does not.
+"""
+
+
+def unparse(node) -> str:
+    """Render an AST node as source text without risking ``RecursionError``.
+
+    Measures the node's nesting depth iteratively first, so a pathologically deep
+    expression (a machine-generated 400-term chain, say) yields a placeholder instead of
+    exhausting the interpreter stack. Workers never raise on user code.
+
+    Args:
+        node: The AST node to render.
+
+    Returns:
+        str: ``ast.unparse(node)``, or a short placeholder naming the node type when the
+        expression nests deeper than :data:`MAX_EXPRESSION_DEPTH`.
+    """
+    stack = [(node, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > MAX_EXPRESSION_DEPTH:
+            return f"<{type(node).__name__} nested deeper than {MAX_EXPRESSION_DEPTH} levels>"
+        stack.extend((child, depth + 1) for child in ast.iter_child_nodes(current))
+    return ast.unparse(node)
+
 
 @dataclass
 class Column:
@@ -247,7 +278,12 @@ class PythonWorker:
         """
         root = self.index.root if self.index else path.parent
         try:
-            source = SourceFile(path.relative_to(root).as_posix(), path.read_text(), ".py")
+            # A file outside the index root has no repository-relative name; use its path.
+            try:
+                relative = path.relative_to(root).as_posix()
+            except ValueError:
+                relative = str(path)
+            source = SourceFile(relative, path.read_text(), ".py")
         except (OSError, UnicodeError) as exc:
             return WorkerResult(
                 unresolved=[
@@ -317,7 +353,7 @@ class PythonWorker:
                     line=getattr(node, "lineno", None),
                     reason=reason,
                     job_id=job_id,
-                    expression=ast.unparse(node),
+                    expression=unparse(node),
                     partial_text=folded.text if folded else None,
                     symbols=folded.placeholders if folded else [],
                     assumptions=folded.assumptions if folded else {},
@@ -417,7 +453,7 @@ class PythonWorker:
                 ``state.imports`` and, for ``pandas``/``polars``/``awswrangler`` targets,
                 rewritten to the ``pd.``/``pl.``/``wr.`` shorthand used by the sink table.
             """
-            text = ast.unparse(node)
+            text = unparse(node)
             first, dot, rest = text.partition(".")
             imported = state.imports.get(first)
             if imported:
@@ -493,22 +529,20 @@ class PythonWorker:
                     return owner.column(node.attr)
             if isinstance(node, ast.Call):
                 method = (
-                    node.func.attr
-                    if isinstance(node.func, ast.Attribute)
-                    else ast.unparse(node.func)
+                    node.func.attr if isinstance(node.func, ast.Attribute) else unparse(node.func)
                 )
                 if method in {"col", "column"} and node.args:
                     name = folded(node.args[0])
                     return frame.column(name.text) if name.complete else Column(partial=True)
                 if method in {"lit", "literal"}:
-                    return Column(text=ast.unparse(node), kind="expression")
+                    return Column(text=unparse(node), kind="expression")
                 if method in {"cast", "astype"}:
                     value = col_expr(node.func.value, frame)
-                    value.text = ast.unparse(node)
+                    value.text = unparse(node)
                     return value
                 if method == "over":
                     value = col_expr(node.func.value, frame)
-                    value.kind, value.text = "window", ast.unparse(node)
+                    value.kind, value.text = "window", unparse(node)
                     for arg in node.args:
                         window = col_expr(arg, frame)
                         value.indirect |= window.sources | window.indirect
@@ -688,7 +722,7 @@ class PythonWorker:
                 )
                 return Column(
                     set().union(*(v.sources for v in values)),
-                    ast.unparse(node),
+                    unparse(node),
                     "window" if method == "over" else "aggregation" if aggregate else "expression",
                     not known or any(v.partial for v in values),
                     next((v.name for v in values if v.name), None),
@@ -699,7 +733,7 @@ class PythonWorker:
             ]
             return Column(
                 set().union(*(v.sources for v in children)),
-                ast.unparse(node),
+                unparse(node),
                 "expression",
                 any(v.partial for v in children),
                 indirect=set().union(*(v.indirect for v in children)),
@@ -833,7 +867,7 @@ class PythonWorker:
                         source_file=state.source.path,
                         line=node.lineno,
                         transformation=Transformation(
-                            expression=ast.unparse(node),
+                            expression=unparse(node),
                             source_file=state.source.path,
                             line_start=node.lineno,
                             line_end=getattr(node, "end_lineno", node.lineno),
@@ -1022,7 +1056,7 @@ class PythonWorker:
                     return out
                 return folded(node)
             if isinstance(node, ast.Attribute):
-                if node.attr == "read" and ast.unparse(node.value) in {"spark", "sqlContext"}:
+                if node.attr == "read" and unparse(node.value) in {"spark", "sqlContext"}:
                     return Reader()
                 base = evaluate(node.value)
                 if isinstance(base, State):
@@ -1043,7 +1077,7 @@ class PythonWorker:
                     {k: evaluate(v) for k, v in keywords.items()},
                     state,
                 )
-            first = ast.unparse(node.func).split(".")[0]
+            first = unparse(node.func).split(".")[0]
             imported = state.imports.get(first)
             if imported and self.index:
                 module_name, level = imported
@@ -1272,7 +1306,7 @@ class PythonWorker:
                     for key, value in keywords.items():
                         if isinstance(value, ast.Tuple) and len(value.elts) == 2:
                             col = receiver.column(folded(value.elts[0]).text)
-                            col.kind, col.text = "aggregation", ast.unparse(value)
+                            col.kind, col.text = "aggregation", unparse(value)
                             out.columns[key] = col
                 elif method in {"sum", "mean", "min", "max", "count"}:
                     if receiver.group:
@@ -1282,7 +1316,7 @@ class PythonWorker:
                                 col.text = f"{method}({col.text})"
                         out.open_columns = False
                     else:
-                        return Column(text=ast.unparse(node), kind="aggregation")
+                        return Column(text=unparse(node), kind="aggregation")
                 elif method in {"union", "unionByName", "vstack"}:
                     right = evaluate(node.args[0])
                     if isinstance(right, Frame):
@@ -1573,7 +1607,7 @@ class PythonWorker:
                     elif isinstance(node, ast.Return):
                         return evaluate(node.value)
                     elif isinstance(node, ast.If):
-                        if "__name__" in ast.unparse(node.test):
+                        if "__name__" in unparse(node.test):
                             statements(node.body)
                         else:
                             original = copy.deepcopy(state.env)
