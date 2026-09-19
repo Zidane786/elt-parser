@@ -639,21 +639,8 @@
     ]
   },
   {
-    "depends_on": [
-      "purge_pii_after_retention"
-    ],
-    "depends_on_detail": [
-      {
-        "in_place_writer": true,
-        "job_id": "purge_pii_after_retention",
-        "sources": [
-          "data"
-        ],
-        "via_datasets": [
-          "glue://ecommerce/raw_customers"
-        ]
-      }
-    ],
+    "depends_on": [],
+    "depends_on_detail": [],
     "description": "",
     "job_id": "stage_customers",
     "language": "pyspark",

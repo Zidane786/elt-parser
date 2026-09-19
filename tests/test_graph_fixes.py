@@ -63,6 +63,49 @@ def test_sole_in_place_writer_becomes_a_flagged_dependency(tmp_path):
     assert deps[0].via_datasets == ["glue://db/dim"]
 
 
+def test_pure_mutator_is_not_a_dependency_of_other_readers(tmp_path):
+    """A job with no external input produces nothing, so readers do not depend on it."""
+    (tmp_path / "purge.sql").write_text("UPDATE db.t SET x = NULL WHERE x < 0")
+    (tmp_path / "reader.sql").write_text("CREATE TABLE db.out AS SELECT x FROM db.t")
+    doc = scan(tmp_path).document
+    assert doc.job_dependencies["reader"] == []
+    note = next(u for u in doc.unresolved if "rewrites" in u.reason)
+    assert note.kind == "analysis_note"
+    assert note.job_id == "purge"
+    assert "glue://db/t" in note.reason
+    assert "reader" in note.reason
+
+
+def test_mutator_note_is_omitted_when_nothing_else_reads_the_dataset(tmp_path):
+    """The note exists to record a suppressed dependency, so it needs a reader."""
+    (tmp_path / "purge.sql").write_text("UPDATE db.t SET x = NULL WHERE x < 0")
+    doc = scan(tmp_path).document
+    assert not [u for u in doc.unresolved if "rewrites" in u.reason]
+
+
+def test_incremental_producer_reading_its_own_target_stays_a_dependency(tmp_path):
+    """Reading one dataset it does not write makes a job a producer, not a mutator."""
+    (tmp_path / "scd.sql").write_text(
+        "INSERT INTO db.dim SELECT c FROM db.staging UNION ALL SELECT c FROM db.dim"
+    )
+    (tmp_path / "mart.sql").write_text("CREATE TABLE db.mart AS SELECT c FROM db.dim")
+    doc = scan(tmp_path).document
+    assert [d.job_id for d in doc.job_dependencies["mart"]] == ["scd"]
+    assert not [u for u in doc.unresolved if "rewrites" in u.reason]
+
+
+def test_fixture_separates_the_mutator_from_the_incremental_producer(etl_graph):
+    """The etl fixture holds one of each; only the producer becomes a dependency."""
+    doc = etl_graph.document
+    assert [d.job_id for d in doc.job_dependencies["stage_customers"]] == []
+    cohort = doc.job_dependencies["mart_cohort_retention"]
+    scd = next(d for d in cohort if d.job_id == "dim_customer_scd2")
+    assert scd.in_place_writer is True
+    note = next(u for u in doc.unresolved if "rewrites" in u.reason)
+    assert note.job_id == "purge_pii_after_retention"
+    assert "glue://ecommerce/raw_customers" in note.reason
+
+
 def test_in_place_writer_still_skipped_when_another_writer_exists(tmp_path):
     """Finding 3: an in-place writer stays excluded while a real producer exists."""
     (tmp_path / "a.sql").write_text("CREATE TABLE db.t AS SELECT x FROM db.source")

@@ -244,9 +244,41 @@ def build_graph(
         if job_id in jobs:
             jobs[job_id].schedule_id = schedule_id
     writers = defaultdict(set)
+    readers = defaultdict(set)
     for job in jobs.values():
         for dataset in job.outputs:
             writers[dataset].add(job.id)
+        for dataset in job.inputs:
+            readers[dataset].add(job.id)
+    # A job whose every input is also one of its outputs has no external source, so it can
+    # only rewrite what is already there: a purge or backfill, not a producer. Other readers
+    # get no dependency on it. A job that reads even one dataset it does not write brings new
+    # data in and stays a producer, even when it also reads its own target (an SCD merge).
+    mutated = {
+        job.id: sorted(set(job.inputs) & set(job.outputs))
+        for job in jobs.values()
+        if job.inputs and set(job.inputs) <= set(job.outputs)
+    }
+    for job_id, datasets_mutated in sorted(mutated.items()):
+        for dataset in datasets_mutated:
+            others = sorted(readers[dataset] - {job_id})
+            if not others:
+                continue
+            combined.unresolved.append(
+                Unresolved(
+                    kind="analysis_note",
+                    job_id=job_id,
+                    source_file=jobs[job_id].source_file,
+                    reason=(
+                        f"Job {job_id!r} rewrites {dataset} in place without reading any "
+                        f"other dataset, so readers {others} get no data dependency on it"
+                    ),
+                    remediation=(
+                        "Order this job against those readers in the orchestrator if it "
+                        "must run before them."
+                    ),
+                )
+            )
     dependencies: dict[str, dict[str, JobDependency]] = {job: {} for job in jobs}
 
     def add(job, upstream, evidence, dataset=None):
@@ -272,14 +304,15 @@ def build_graph(
             if dataset in parent.inputs and dataset in parent.outputs:
                 dep.in_place_writer = True
 
-    # An in-place writer is only excluded while some other job also writes the dataset, in
-    # which case that other job is the producer and ordering is unknowable (finding 3). A
-    # sole writer is always the producer, flagged so consumers can see it rewrites in place.
+    # An in-place writer is excluded when some other job also writes the dataset (that job
+    # is the producer and the ordering is unknowable, finding 3) or when it is a pure
+    # mutator. Otherwise it is the dataset's only producer, flagged so consumers can see it
+    # rewrites in place.
     for job in jobs.values():
         for dataset in job.inputs:
             for upstream in writers[dataset]:
                 in_place = dataset in jobs[upstream].inputs
-                if in_place and writers[dataset] - {upstream}:
+                if in_place and (writers[dataset] - {upstream} or upstream in mutated):
                     continue
                 add(job.id, upstream, "data", dataset)
     # Task-only nodes (e.g. EmptyOperator) still carry ordering between linked jobs.
