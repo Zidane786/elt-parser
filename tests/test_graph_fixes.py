@@ -8,9 +8,18 @@ from pathlib import Path
 
 import pytest
 
-from etl_parser.graph.builder import build_graph
+from etl_parser.graph.builder import LineageGraph, build_graph
 from etl_parser.graph.impact import downstream
-from etl_parser.models import Job, Provenance, TableEdge, WorkerResult
+from etl_parser.models import (
+    ColumnEdge,
+    ColumnRef,
+    DatasetRef,
+    Job,
+    LineageDocument,
+    Provenance,
+    TableEdge,
+    WorkerResult,
+)
 from etl_parser.pipeline import scan
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -148,6 +157,77 @@ def test_job_io_edges_cover_every_unlinked_pair_without_changing_dependencies():
     fallback = {(e.source, e.target) for e in doc.table_edges if e.provenance.parser == "job_io"}
     assert fallback == {("glue://db/b", "glue://db/out"), ("glue://db/seed", "glue://db/a")}
     assert [d.job_id for d in doc.job_dependencies["reader"]] == ["writer"]
+
+
+def _cross_product_document():
+    """Build a two-product document with one table edge and one column edge across it."""
+    provenance = Provenance(parser="sqlglot")
+    return LineageDocument(
+        datasets=[
+            DatasetRef(
+                id="glue://left/src",
+                namespace="glue://left",
+                name="src",
+                product="left",
+                columns=["x"],
+            ),
+            DatasetRef(
+                id="glue://right/dst",
+                namespace="glue://right",
+                name="dst",
+                product="right",
+                columns=["y"],
+            ),
+        ],
+        jobs=[
+            Job(
+                id="move",
+                name="move",
+                source_file="move.sql",
+                inputs=["glue://left/src"],
+                outputs=["glue://right/dst"],
+            )
+        ],
+        table_edges=[
+            TableEdge(
+                source="glue://left/src",
+                target="glue://right/dst",
+                job_id="move",
+                provenance=provenance,
+            )
+        ],
+        column_edges=[
+            ColumnEdge(
+                target=ColumnRef(dataset_id="glue://right/dst", name="y"),
+                sources=[ColumnRef(dataset_id="glue://left/src", name="x")],
+                provenance=provenance,
+                job_id="move",
+            )
+        ],
+    )
+
+
+def test_column_walk_reports_cross_product_edges():
+    """Finding 11: column ids map back to datasets before the cross-product check."""
+    graph = LineageGraph(_cross_product_document())
+    report = downstream(graph, "glue://left/src#x")
+    assert report["by_hop"][0]["columns"] == ["glue://right/dst#y"]
+    assert report["cross_product_edges"] == [
+        {
+            "source": "glue://left/src",
+            "target": "glue://right/dst",
+            "from_product": "left",
+            "to_product": "right",
+        }
+    ]
+
+
+def test_dataset_walk_populates_columns():
+    """Finding 11: a dataset walk lists the columns of the datasets it reaches."""
+    graph = LineageGraph(_cross_product_document())
+    hop = downstream(graph, "glue://left/src")["by_hop"][0]
+    assert hop["datasets"] == ["glue://right/dst"]
+    assert hop["columns"] == ["glue://right/dst#y"]
 
 
 def test_job_io_edges_skip_self_loops():
