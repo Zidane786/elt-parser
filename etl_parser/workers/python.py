@@ -34,7 +34,7 @@ from etl_parser.models import (
     Unresolved,
     WorkerResult,
 )
-from etl_parser.scanner.repo import ScanIndex, SourceFile
+from etl_parser.scanner.repo import ScanIndex, SourceFile, imports_package
 from etl_parser.scanner.sinks import ENGINE_DIALECT, URL_ENGINE_HINTS, match_sink
 from etl_parser.scanner.strings import Folded, fold_string
 from etl_parser.workers.base import comment_schedule, first_docstring_line, parse_header
@@ -71,6 +71,9 @@ def unparse(node) -> str:
         stack.extend((child, depth + 1) for child in ast.iter_child_nodes(current))
     return ast.unparse(node)
 
+
+SPARK_PACKAGES = ("pyspark", "awsglue")
+"""Imports that make a file a Spark job: PySpark itself and the Glue runtime built on it."""
 
 NO_RETURN = object()
 """Sentinel for "no ``return`` was reached", distinct from a ``return None``."""
@@ -305,7 +308,11 @@ class PythonWorker:
         default_db (str | None): Default database used to qualify one-part dataset/table
             names.
         max_import_depth (int): Maximum depth of helper-module calls to follow.
+        language (str | None): Language every file analyzed by this worker is written in,
+            or ``None`` (the default) to detect it from each file's imports.
     """
+
+    language: str | None = None
 
     def __init__(
         self,
@@ -397,7 +404,9 @@ class PythonWorker:
         outputs: set[str] = set()
         job_id = job_id_override or source.job_id
         root_source = source
-        language = "pyspark" if "pyspark" in source.text else "python"
+        language = self.language or (
+            "pyspark" if imports_package(source, *SPARK_PACKAGES) else "python"
+        )
         default_engine = "spark" if language == "pyspark" else "unknown"
         invoked: set[tuple[str, str]] = set()
         active: set[tuple[str, str]] = set()

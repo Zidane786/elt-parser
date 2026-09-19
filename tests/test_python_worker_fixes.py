@@ -213,3 +213,43 @@ def test_union_by_name_merges_kind_and_column_indirect_sources(tmp_path):
     assert origin(edge) == {("glue://x/a", "amount"), ("glue://x/b", "amount")}
     assert ("glue://x/b", "region") in {(r.dataset_id, r.name) for r in edge.indirect_sources}
     assert edge.transformation.kind == "window"
+
+
+def test_language_comes_from_imports_not_from_a_comment(tmp_path):
+    doc = run(
+        tmp_path,
+        "import pandas as pd\n# TODO: port this to pyspark next quarter\n"
+        'df = pd.read_csv("in.csv")\ndf[["x"]].to_csv("out.csv")\n',
+    )
+    assert doc.jobs[0].language == "python"
+    assert {e.provenance.parser for e in doc.column_edges} == {"pandas_chain"}
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "from pyspark.sql import SparkSession\n",
+        "import pyspark\n",
+        "from awsglue.context import GlueContext\n",
+    ],
+)
+def test_spark_imports_set_language_engine_and_parser(tmp_path, header):
+    doc = run(
+        tmp_path,
+        header + 'spark.table("a.b").select("id").write.saveAsTable("a.t")\n',
+    )
+    job = doc.jobs[0]
+    assert (job.language, job.engine) == ("pyspark", "spark")
+    assert {e.provenance.parser for e in doc.column_edges} == {"spark_static"}
+
+
+def test_spark_static_worker_stamps_spark_without_an_import(tmp_path):
+    from etl_parser.scanner.repo import SourceFile
+    from etl_parser.workers.spark_static import SparkStaticWorker
+
+    source = SourceFile(
+        "job.py", 'spark.table("a.b").select("id").write.saveAsTable("a.t")\n', ".py"
+    )
+    result = SparkStaticWorker().analyze_source(source)
+    assert (result.jobs[0].language, result.jobs[0].engine) == ("pyspark", "spark")
+    assert {e.provenance.parser for e in result.column_edges} == {"spark_static"}

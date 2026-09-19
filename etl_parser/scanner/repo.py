@@ -437,6 +437,34 @@ class RepoScanner:
                     )
 
 
+def imports_package(source: SourceFile, *packages: str) -> bool:
+    """Detect whether a Python source file imports any of ``packages``.
+
+    Import statements are the only reliable statement of what a file runs on: a package
+    name in a comment or a string is not a dependency (review finding 33). The file is
+    parsed, never imported or executed.
+
+    Args:
+        source (SourceFile): The Python file to inspect.
+        *packages (str): Top-level package names to look for, for example ``"pyspark"``.
+
+    Returns:
+        bool: ``True`` if any top-level or nested ``import <pkg>...`` or
+        ``from <pkg>... import ...`` statement is present; ``False`` if none is found or
+        the file fails to parse as Python.
+    """
+    try:
+        tree = ast.parse(source.text)
+    except SyntaxError:
+        return False
+    roots = tuple(packages)
+    return any(
+        (isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] in roots)
+        or (isinstance(n, ast.Import) and any(a.name.split(".")[0] in roots for a in n.names))
+        for n in ast.walk(tree)
+    )
+
+
 def imports_airflow(source: SourceFile) -> bool:
     """Detect whether a Python source file imports the ``airflow`` package.
 
@@ -447,16 +475,7 @@ def imports_airflow(source: SourceFile) -> bool:
         source (SourceFile): The Python file to inspect.
 
     Returns:
-        bool: ``True`` if any top-level or nested ``import airflow...`` or
-        ``from airflow... import ...`` statement is present; ``False`` if none is found or
-        the file fails to parse as Python.
+        bool: ``True`` if the file imports ``airflow``; ``False`` if it does not or the
+        file fails to parse as Python.
     """
-    try:
-        tree = ast.parse(source.text)
-    except SyntaxError:
-        return False
-    return any(
-        (isinstance(n, ast.ImportFrom) and (n.module or "").startswith("airflow"))
-        or (isinstance(n, ast.Import) and any(a.name.startswith("airflow") for a in n.names))
-        for n in ast.walk(tree)
-    )
+    return imports_package(source, "airflow")
