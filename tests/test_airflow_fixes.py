@@ -297,15 +297,18 @@ def test_analyze_file_outside_root_does_not_raise(tmp_path):
         "with DAG():\n    pass\n",
         "with DAG(dag_id=x):\n    BashOperator()\n",
         "dag = DAG()\nBashOperator(task_id=1, dag=dag)\n",
-        "with DAG('d'):\n    a = BashOperator(task_id='a', bash_command=1)\n    a >> a >> [a, [a]]\n",
+        "with DAG('d'):\n    a = BashOperator(task_id='a', bash_command=1)\n"
+        "    a >> a >> [a, [a]]\n",
         "with DAG('d'):\n    for a, b in x:\n        BashOperator(task_id=a)\n",
         "with DAG('d'):\n    for (a, b) in [(1, 2), 3]:\n        BashOperator(task_id=f'{a}')\n",
         "with DAG('d'):\n    [BashOperator(task_id=n) for n in None]\n",
         "with DAG('d'):\n    BashOperator.partial().expand()\n",
         "with DAG('d'):\n    with TaskGroup() as g:\n        g >> g\n",
         "with DAG('d'):\n    chain()\n    chain([], [1])\n    cross_downstream(x, y)\n",
-        "with DAG('d'):\n    a = EmptyOperator(task_id='a')\n    a.set_upstream()\n    a.set_downstream(b)\n",
-        "with DAG('d', schedule=timedelta()):\n    AthenaOperator(task_id='q', query=['x', 1, None])\n",
+        "with DAG('d'):\n    a = EmptyOperator(task_id='a')\n    a.set_upstream()\n"
+        "    a.set_downstream(b)\n",
+        "with DAG('d', schedule=timedelta()):\n"
+        "    AthenaOperator(task_id='q', query=['x', 1, None])\n",
         "with DAG('d'):\n    AthenaOperator(task_id='q', query=f'{x}')\n",
         "with DAG('d'):\n    AthenaOperator(task_id='q', query='.sql')\n",
         "with DAG('d'):\n    SQLExecuteQueryOperator(task_id='q', sql='SELECT 1')\n",

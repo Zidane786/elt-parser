@@ -46,7 +46,10 @@ def test_jinja_literal_hole_keeps_clean_statement_and_analyses_partial():
 
 
 def test_jinja_hole_in_table_identity_is_dynamic_for_that_statement_only():
-    sql = "CREATE TABLE b.first AS SELECT x FROM a.s;\nCREATE TABLE b.second AS SELECT y FROM {{ table }}"
+    sql = (
+        "CREATE TABLE b.first AS SELECT x FROM a.s;\n"
+        "CREATE TABLE b.second AS SELECT y FROM {{ table }}"
+    )
     a = SqlWorker().analyze(sql, dialect="trino", job_id="j")
     assert a.outputs == {"glue://b/first"}
     assert [(u.kind, u.line) for u in a.result.unresolved] == [("dynamic_sql", 2)]
