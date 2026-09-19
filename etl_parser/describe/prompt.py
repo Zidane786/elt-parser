@@ -9,6 +9,25 @@ lineage engine found rather than inferring lineage itself.
 import json
 from dataclasses import dataclass
 
+DESCRIPTION_STYLE_RULES = (
+    "Describe what the data means to the business and what its values typically look "
+    "like. For an id column, say whether it identifies the row or points at another "
+    "table, and name that table when the supplied evidence shows it. For a date or "
+    "timestamp column, give the format and time zone when they can be inferred. For a "
+    "partition column, say it partitions the table and at what granularity. For a "
+    "boolean or flag column, say what true and false mean. For a status or enum column, "
+    "list the values the evidence shows. Write one to three sentences, specific to this "
+    "column, never a restatement of its name. Use the transformation code to explain "
+    "derivations and business rules the name does not already make obvious. Never "
+    "mention parsers, confidence, provenance, lineage, models, jobs or file paths in "
+    "the description text itself."
+)
+"""Writing rules shared by both description paths, so output style does not drift.
+
+The prohibition in the last sentence matters: a prompt that serialises internal
+provenance invites the model to echo it back as if it were business meaning.
+"""
+
 
 @dataclass(frozen=True)
 class Prompt:

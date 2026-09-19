@@ -73,6 +73,8 @@ def test_real_anthropic_sdk_headers_model_and_analysis(monkeypatch, tmp_path, mo
         proposal.update(
             expression=edge["transformation"]["expression"],
             kind=edge["transformation"]["kind"],
+            confidence=0.75,
+            rationale="Echoes the deterministic edge in the cited line",
             evidence={
                 "source_file": context["source_file"],
                 "source_digest": context["source_digest"],
@@ -86,7 +88,14 @@ def test_real_anthropic_sdk_headers_model_and_analysis(monkeypatch, tmp_path, mo
                 {
                     "complete": True,
                     "columns": [proposal],
-                    "descriptions": [{"target": edge["target"], "description": "Source value"}]
+                    "descriptions": [
+                        {
+                            "target": edge["target"],
+                            "description": "Source value",
+                            "confidence": 0.75,
+                            "rationale": "Taken from the cited expression",
+                        }
+                    ]
                     if descriptions
                     else [],
                 }
