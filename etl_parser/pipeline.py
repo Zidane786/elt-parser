@@ -17,11 +17,13 @@ from pathlib import Path
 from typing import Protocol
 
 from etl_parser.graph.builder import build_graph
+from etl_parser.identity import dataset_ref_from_id
 from etl_parser.models import Job, Unresolved, WorkerResult
 from etl_parser.observability import current_observer, digest, observed
 from etl_parser.registry import ProductRegistry
 from etl_parser.scanner.repo import ScanIndex, SourceFile, imports_airflow
 from etl_parser.scanner.sinks import ENGINE_DIALECT
+from etl_parser.schema.base import SchemaSource, as_schema_provider, is_schema_source
 from etl_parser.sources import GitHubSource, LocalSource, SourceProvider
 from etl_parser.workers.airflow import AirflowWorker
 from etl_parser.workers.base import comment_schedule, parse_header
@@ -249,11 +251,43 @@ class ParserRegistry:
         self.parsers.append(parser)
 
 
+def _alias_hints(schema: SchemaSource, results: list[WorkerResult]) -> list:
+    """Turn a schema source's alias hints into dataset refs for identity merging.
+
+    Only hints touching a dataset some worker referenced are used, so the graph gains no
+    datasets the code never reads or writes.
+
+    Args:
+        schema: The scan's schema source (``aliases()`` is consulted).
+        results: Worker results collected so far.
+
+    Returns:
+        list[DatasetRef]: One ref per applicable hint, carrying the physical id as an
+        alias and ``physical_location``; sorted by logical id.
+    """
+    referenced = set()
+    for result in results:
+        referenced.update(d.id for d in result.datasets)
+        referenced.update(e.source for e in result.table_edges)
+        referenced.update(e.target for e in result.table_edges)
+    hints = []
+    for logical, physical in sorted(schema.aliases()):
+        if logical in referenced or physical in referenced:
+            ref = dataset_ref_from_id(logical)
+            hints.append(
+                ref.model_copy(update={"aliases": [physical], "physical_location": physical})
+            )
+    return hints
+
+
 @observed("scan")
 def scan(
     path: Path | str,
     *,
-    schema: SchemaProvider | None = None,
+    schema: SchemaProvider | SchemaSource | dict | str | Path | None = None,
+    include_code_schema: bool = False,
+    generate: list[str] | None = None,
+    databases: list[str] | None = None,
     bindings: dict[str, str] | None = None,
     default_db: str | None = None,
     products: Path | str | None = None,
@@ -279,7 +313,18 @@ def scan(
 
     Args:
         path: Local filesystem path, or an ``https://`` GitHub repository URL.
-        schema: Optional schema provider for qualifying SQL and expanding stars.
+        schema: Optional source-of-truth schema for qualifying SQL and expanding stars: a
+            ``SchemaProvider``, a full :class:`~etl_parser.schema.base.SchemaSource`
+            (Glue/Postgres/Redshift; its alias hints merge ``glue://`` tables with their
+            S3 locations and it is kept on ``graph.schema_source`` for exporters), a
+            catalog dict, or a path to a ``catalog.json``/schema mapping file.
+        include_code_schema: Recorded on ``graph.export_options`` for the catalog
+            exporter: whether code-only tables/columns may be added to ``databases``.
+        generate: Recorded on ``graph.export_options``: catalog sections to generate
+            (``databases``, ``scripts``, ``relations``, ``lineage``, ``schedules``);
+            ``None`` means all.
+        databases: Recorded on ``graph.export_options``: database names to restrict the
+            catalog to; ``None`` means all.
         bindings: String substitutions for ``{{name}}``/``${name}`` SQL placeholders.
         default_db: Database to assume for one-part table names.
         products: Path to a ``product.yaml`` file or directory of them. If omitted,
@@ -313,6 +358,7 @@ def scan(
     """
     observer = current_observer()
     parsers = parsers or ParserRegistry()
+    schema = as_schema_provider(schema)
     observer.configure(
         source=str(path),
         parsers=[p.name for p in parsers.parsers],
@@ -450,8 +496,16 @@ def scan(
                     )
                 )
         observer.count("files.parsed" if matched else "files.no_matching_parser")
+    if is_schema_source(schema):
+        results[0].datasets.extend(_alias_hints(schema, results))
     with observer.span("graph.build"):
         graph = build_graph(results, registry, scan_commit)
+    graph.schema_source = schema if is_schema_source(schema) else None
+    graph.export_options = {
+        "include_code_schema": include_code_schema,
+        "generate": sorted(generate) if generate is not None else None,
+        "databases": sorted(databases) if databases is not None else None,
+    }
     doc = graph.document
     for category in ("jobs", "datasets", "table_edges", "column_edges", "unresolved"):
         observer.gauge(f"lineage.{category}", len(getattr(doc, category)))

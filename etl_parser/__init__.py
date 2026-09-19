@@ -14,7 +14,48 @@ __version__ = "0.1.0"
 from etl_parser.ai_analysis import AnalysisConfig, AnalysisRun, analyze, analyze_async  # noqa: E402
 from etl_parser.sdk import ParserClient  # noqa: E402
 
-__all__ = ["AnalysisConfig", "AnalysisRun", "ParserClient", "analyze", "analyze_async", "scan"]
+__all__ = [
+    "AnalysisConfig",
+    "AnalysisRun",
+    "GlueSchemaSource",
+    "ParserClient",
+    "PostgresSchemaSource",
+    "RedshiftSchemaSource",
+    "SchemaSource",
+    "SchemaSourceError",
+    "analyze",
+    "analyze_async",
+    "scan",
+    "write_schema_catalog",
+]
+
+_SCHEMA_EXPORTS = {
+    "GlueSchemaSource",
+    "PostgresSchemaSource",
+    "RedshiftSchemaSource",
+    "SchemaSource",
+    "SchemaSourceError",
+    "write_schema_catalog",
+}
+
+
+def __getattr__(name: str):
+    """Lazily resolve the schema-source exports so no driver is imported eagerly.
+
+    Args:
+        name: Attribute requested on the package.
+
+    Returns:
+        The attribute from :mod:`etl_parser.schema`.
+
+    Raises:
+        AttributeError: For any name that is not a lazy export.
+    """
+    if name in _SCHEMA_EXPORTS:
+        import etl_parser.schema as schema
+
+        return getattr(schema, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def scan(*args, **kwargs):

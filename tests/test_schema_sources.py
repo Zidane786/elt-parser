@@ -633,6 +633,288 @@ def test_redshift_missing_driver_names_extra(monkeypatch):
         RedshiftSchemaSource("redshift://h/db").catalog()
 
 
+# ---------------------------------------------------------------- CLI
+
+
+def summary_line(output, key):
+    """Return the command's JSON summary, ignoring interleaved observer log lines."""
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                parsed = json.loads(line)
+            except ValueError:
+                continue
+            if key in parsed:
+                return parsed
+    raise AssertionError(f"No summary with {key!r} in output: {output}")
+
+
+def test_schema_fetch_cli_builds_sources_from_flags_and_environment_only(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    import etl_parser.schema as schema_module
+    from etl_parser.cli import app
+
+    built = {}
+
+    def factory(name):
+        def make(*args, **kwargs):
+            built[name] = (args, kwargs)
+            return StaticSource(
+                [
+                    {
+                        "db_name": name,
+                        "db_type": name,
+                        "description": "",
+                        "tables": [table("t", "c")],
+                    }
+                ],
+                relations=[relation(f"{name}.t", f"{name}.t", "c")],
+            )
+
+        return make
+
+    monkeypatch.setattr(schema_module, "GlueSchemaSource", factory("glue"))
+    monkeypatch.setattr(schema_module, "PostgresSchemaSource", factory("postgres"))
+    monkeypatch.setattr(schema_module, "RedshiftSchemaSource", factory("redshift"))
+    out = tmp_path / "out" / "catalog.json"
+    result = CliRunner().invoke(
+        app,
+        [
+            "schema",
+            "fetch",
+            "--glue",
+            "--database",
+            "sales",
+            "--database",
+            "raw",
+            "--postgres",
+            "--redshift",
+            "--iam",
+            "--schema-name",
+            "public",
+            "--aws-profile",
+            "example-profile",
+            "--region",
+            "eu-west-1",
+            "--out",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert built["glue"] == (
+        (),
+        {"profile": "example-profile", "region": "eu-west-1", "databases": ["sales", "raw"]},
+    )
+    assert built["postgres"] == ((), {"schemas": ["public"]})
+    assert built["redshift"] == (
+        (),
+        {"schemas": ["public"], "iam": True, "profile": "example-profile", "region": "eu-west-1"},
+    )
+    assert summary_line(result.output, "out") == {
+        "databases": 3,
+        "tables": 3,
+        "relations": 3,
+        "out": str(out),
+    }
+    written = json.loads(out.read_text())
+    assert [d["db_name"] for d in written["databases"]] == ["glue", "postgres", "redshift"]
+    assert all(r["source"] == "database" for r in written["relations"])
+    # No source selected, and no way to pass credentials on the command line.
+    assert CliRunner().invoke(app, ["schema", "fetch"]).exit_code == 2
+    denied = CliRunner().invoke(app, ["schema", "fetch", "--postgres", "--dsn", "x"])
+    assert denied.exit_code == 2 and "No such option" in denied.output
+    for flag in ("--password", "--dsn"):
+        assert flag not in CliRunner().invoke(app, ["schema", "fetch", "--help"]).output
+
+
+def test_schema_fetch_cli_reports_source_errors_without_secrets(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    import etl_parser.schema as schema_module
+    from etl_parser.cli import app
+
+    class Broken:
+        def __init__(self, **kwargs):
+            pass
+
+        def catalog(self):
+            raise SchemaSourceError("Access denied calling get_tables; grant glue:GetTables")
+
+        def relations(self):
+            return []
+
+        def aliases(self):
+            return []
+
+        def columns(self, dataset_id):
+            return None
+
+    monkeypatch.setattr(schema_module, "GlueSchemaSource", Broken)
+    monkeypatch.setenv("PGPASSWORD", SECRET)
+    result = CliRunner().invoke(
+        app, ["schema", "fetch", "--glue", "--out", str(tmp_path / "c.json")]
+    )
+    assert result.exit_code == 2
+    assert "glue:GetTables" in result.output and SECRET not in result.output
+    assert not (tmp_path / "c.json").exists()
+
+
+def test_scan_cli_glue_uses_profile_region_and_schema_from_code(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    import etl_parser.cli as cli_module
+    from etl_parser.cli import app
+
+    built = {}
+
+    def glue_source(**kwargs):
+        built.update(kwargs)
+        return StaticSource([])
+
+    monkeypatch.setattr(cli_module, "GlueSchemaSource", glue_source)
+    (tmp_path / "job.sql").write_text("CREATE TABLE db.t AS SELECT x FROM db.s")
+    result = CliRunner().invoke(
+        app,
+        [
+            "scan",
+            str(tmp_path),
+            "--out",
+            str(tmp_path / "lineage.json"),
+            "--glue",
+            "--aws-profile",
+            "example-profile",
+            "--region",
+            "eu-west-1",
+            "--schema-from-code",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert built == {"profile": "example-profile", "region": "eu-west-1"}
+
+
+# ---------------------------------------------------------------- SDK surface
+
+
+def test_scan_accepts_schema_source_dict_and_path_and_records_export_options(tmp_path):
+    import etl_parser
+    from etl_parser.workers.sql import DictSchemaProvider
+
+    (tmp_path / "job.sql").write_text("CREATE TABLE db.t AS SELECT * FROM db.s")
+    catalog = {
+        "databases": [
+            {
+                "db_name": "db",
+                "db_type": "athena",
+                "description": "",
+                "tables": [table("s", "x", "y")],
+            }
+        ]
+    }
+    graph = etl_parser.scan(
+        tmp_path, schema=catalog, generate=["scripts", "databases"], databases=["db"]
+    )
+    assert graph.schema_source is None
+    assert graph.export_options == {
+        "include_code_schema": False,
+        "generate": ["databases", "scripts"],
+        "databases": ["db"],
+    }
+    assert {e.target.name for e in graph.document.column_edges} == {"x", "y"}  # star expanded
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps(catalog))
+    assert len(etl_parser.scan(tmp_path, schema=path).document.column_edges) == 2
+    assert (
+        len(etl_parser.scan(tmp_path, schema=DictSchemaProvider(catalog)).document.column_edges)
+        == 2
+    )
+    source = StaticSource(
+        catalog["databases"],
+        aliases=[("glue://db/s", "s3://bucket/s/"), ("glue://other/unused", "s3://bucket/u/")],
+        columns={"glue://db/s": ["x", "y"]},
+    )
+    graph = etl_parser.scan(tmp_path, schema=source, include_code_schema=True)
+    assert graph.schema_source is source
+    assert graph.export_options["include_code_schema"] is True
+    datasets = {d.id: d for d in graph.document.datasets}
+    assert datasets["glue://db/s"].aliases == ["s3://bucket/s/"]
+    assert datasets["glue://db/s"].physical_location == "s3://bucket/s/"
+    assert "glue://other/unused" not in datasets
+
+
+def test_client_forwards_export_options_only_when_exporter_supports_them(tmp_path, monkeypatch):
+    import etl_parser.sdk as sdk
+    from etl_parser import ParserClient
+
+    (tmp_path / "job.sql").write_text("CREATE TABLE db.t AS SELECT x FROM db.s")
+    source = StaticSource([])
+    client = ParserClient(log_level="ERROR")
+    # Current exporter: options are dropped silently, schema_drift is absent -> None.
+    result = client.run(tmp_path, schema=source, generate=["databases"], databases=["db"])
+    assert result.schema_drift is None
+    assert "schema_drift" not in result.catalog
+    seen = {}
+
+    def fake_export(
+        doc, prior=None, *, schema=None, include_code_schema=False, generate=None, databases=None
+    ):
+        seen.update(
+            schema=schema,
+            include_code_schema=include_code_schema,
+            generate=generate,
+            databases=databases,
+            prior=prior,
+        )
+        return {
+            "databases": [],
+            "relations": [],
+            "schema_drift": {"code_only": {"databases": []}, "unused_in_code": []},
+        }
+
+    monkeypatch.setattr(sdk, "export_agent_catalog", fake_export)
+    result = client.run(
+        tmp_path,
+        schema=source,
+        include_code_schema=True,
+        generate=["databases", "scripts"],
+        databases=["db"],
+        prior={"databases": [], "relations": [], "marker": 1},
+    )
+    assert seen == {
+        "schema": source,
+        "include_code_schema": True,
+        "generate": ["databases", "scripts"],
+        "databases": ["db"],
+        "prior": {"databases": [], "relations": [], "marker": 1},
+    }
+    assert result.schema_drift == {"code_only": {"databases": []}, "unused_in_code": []}
+    assert result.to_dict()["catalog"]["schema_drift"] == result.schema_drift
+    assert sdk.apply_export_options(result, generate=["databases"]) == []
+
+
+def test_client_fetch_schema_and_lazy_package_exports():
+    import sys
+
+    import etl_parser
+    from etl_parser import ParserClient
+
+    for name in ("psycopg", "redshift_connector"):
+        assert name not in sys.modules
+    assert etl_parser.GlueSchemaSource is GlueSchemaSource
+    assert etl_parser.write_schema_catalog is etl_parser.schema.write_schema_catalog
+    assert etl_parser.SchemaSourceError is SchemaSourceError
+    with pytest.raises(AttributeError):
+        etl_parser.NotARealExport  # noqa: B018
+    catalog = ParserClient.fetch_schema(
+        [StaticSource([{"db_name": "a", "db_type": "athena", "description": "", "tables": []}])]
+    )
+    assert catalog == {
+        "databases": [{"db_name": "a", "db_type": "athena", "description": "", "tables": []}],
+        "relations": [],
+    }
+
+
 def test_glue_schema_provider_alias_keeps_old_signature(glue_client):
     from etl_parser.workers import sql
 

@@ -10,11 +10,71 @@ caller-injected runners remain caller-owned and are not closed by the client.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 
 from etl_parser.ai_analysis import AnalysisConfig, AnalysisRun, analyze_async
 from etl_parser.artifacts import write_analysis
+from etl_parser.export.agent_catalog import export_agent_catalog
 from etl_parser.observability import RunObserver, observed
+from etl_parser.schema.base import is_schema_source
+from etl_parser.schema.catalog import write_schema_catalog
+
+EXPORT_OPTIONS = ("schema", "include_code_schema", "generate", "databases")
+
+
+def apply_export_options(
+    result,
+    *,
+    prior=None,
+    schema=None,
+    include_code_schema: bool = False,
+    generate: list[str] | None = None,
+    databases: list[str] | None = None,
+) -> list[str]:
+    """Re-export ``result.catalog`` with catalog options the exporter understands.
+
+    ``export_agent_catalog`` gains ``schema=``, ``include_code_schema=``, ``generate=`` and
+    ``databases=`` in a parallel work package; this wrapper forwards each option only when
+    the installed exporter's signature accepts it (or takes ``**kwargs``), so the SDK/CLI
+    surface is stable regardless of which exporter version is present. It also mirrors
+    ``catalog["schema_drift"]`` onto ``result.schema_drift`` (``None`` when absent).
+
+    Args:
+        result: The :class:`~etl_parser.ai_analysis.AnalysisRun` to update in place.
+        prior: The prior catalog the run was exported against.
+        schema: The scan's schema argument; forwarded only when it is a full
+            :class:`~etl_parser.schema.base.SchemaSource`.
+        include_code_schema: Whether code-only tables/columns may be added to
+            ``databases``.
+        generate: Catalog sections to generate (``None`` means all).
+        databases: Database names to restrict the catalog to (``None`` means all).
+
+    Returns:
+        list[str]: Requested option names the exporter does not support yet (dropped).
+    """
+    parameters = inspect.signature(export_agent_catalog).parameters
+    var_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+    requested = {}
+    if is_schema_source(schema):
+        requested["schema"] = schema
+    if include_code_schema:
+        requested["include_code_schema"] = True
+    if generate is not None:
+        requested["generate"] = list(generate)
+    if databases is not None:
+        requested["databases"] = list(databases)
+    supported = {k: v for k, v in requested.items() if k in parameters or var_kwargs}
+    if supported:
+        configuration = getattr(result, "configuration", None) or {}
+        ai_ran = configuration.get("ai_lineage", "off") != "off" or configuration.get(
+            "descriptions"
+        )
+        # After AI stages the current catalog carries their descriptions; keep them.
+        base = result.catalog if ai_ran else prior
+        result.catalog = export_agent_catalog(result.document, base, **supported)
+    result.schema_drift = (result.catalog or {}).get("schema_drift")
+    return sorted(set(requested) - set(supported))
 
 
 class ParserClient:
@@ -50,6 +110,22 @@ class ParserClient:
         self.log_dir = log_dir
         self.log_level = log_level
 
+    @staticmethod
+    def fetch_schema(sources, out_path: str | Path | None = None) -> dict:
+        """Fetch and merge source-of-truth schemas into one catalog dict.
+
+        Args:
+            sources: :class:`~etl_parser.schema.base.SchemaSource` instances (Glue,
+                Postgres, Redshift, or custom), fetched in order.
+            out_path: Optional ``catalog.json`` path to write as well.
+
+        Returns:
+            dict: ``{"databases": [...], "relations": [...]}``, deterministically sorted
+            and usable as ``schema=`` on :meth:`run`/:meth:`arun` or as a CLI ``--schema``
+            file.
+        """
+        return write_schema_catalog(sources, out_path)
+
     def run(self, source, **kwargs) -> AnalysisRun:
         """Analyze synchronously. Inside an event loop use ``await arun(...)``.
 
@@ -77,6 +153,10 @@ class ParserClient:
         runner=None,
         prior=None,
         out_dir: str | Path | None = None,
+        schema=None,
+        include_code_schema: bool = False,
+        generate: list[str] | None = None,
+        databases: list[str] | None = None,
         **scan_options,
     ) -> AnalysisRun:
         """Analyze without blocking the event loop on scanning or artifact export.
@@ -94,14 +174,26 @@ class ParserClient:
             prior: Prior catalog dict to preserve descriptions/flags from, when exporting.
             out_dir: Directory to write result artifacts to. No artifacts are written if
                 omitted.
+            schema: Source-of-truth schema: a :class:`~etl_parser.schema.base.SchemaSource`
+                (Glue/Postgres/Redshift), a catalog dict, or a path to a ``catalog.json``
+                or schema mapping file. Used to qualify SQL, expand stars, and (when a
+                full source) to supply ``databases``/``relations`` to the exporter.
+            include_code_schema: Also add tables/columns discovered only in code to the
+                catalog ``databases`` (marked ``schema_source: code``). Off by default:
+                the source schema is the truth and code-only tables become
+                ``missing_in_source`` diagnostics.
+            generate: Catalog sections to generate (among ``databases``, ``scripts``,
+                ``relations``, ``lineage``, ``schedules``); ``None`` means all.
+            databases: Restrict the catalog to these database names; ``None`` means all.
             **scan_options: Additional keyword arguments forwarded to
-                ``etl_parser.pipeline.scan`` (schema, bindings, parsers, source_provider,
-                ref, source_path, etc.), plus optional per-call ``log_dir``, ``log_level``,
+                ``etl_parser.pipeline.scan`` (bindings, parsers, source_provider, ref,
+                source_path, etc.), plus optional per-call ``log_dir``, ``log_level``,
                 ``log_max_bytes``, and ``log_max_files`` overrides.
 
         Returns:
             AnalysisRun: The completed analysis run, with ``status``, ``metrics``,
-            ``run_id``, and ``log_path`` set from this call's observer.
+            ``run_id``, ``log_path`` and ``schema_drift`` (the catalog's drift block, or
+            ``None``) set from this call.
 
         Raises:
             ValueError: If ``observer`` is passed in ``scan_options``; the client always
@@ -133,6 +225,10 @@ class ParserClient:
                 prior=prior,
                 out_dir=out_dir,
                 observer=observer,
+                schema=schema,
+                include_code_schema=include_code_schema,
+                generate=generate,
+                databases=databases,
                 **scan_options,
             )
         except BaseException as exc:
@@ -149,7 +245,20 @@ class ParserClient:
 
     @staticmethod
     @observed("sdk.run")
-    async def _execute(source, *, config, runner, prior, out_dir, observer, **scan_options):
+    async def _execute(
+        source,
+        *,
+        config,
+        runner,
+        prior,
+        out_dir,
+        observer,
+        schema=None,
+        include_code_schema=False,
+        generate=None,
+        databases=None,
+        **scan_options,
+    ):
         """Run the analysis and, if requested, write its artifacts in a worker thread.
 
         Args:
@@ -159,16 +268,39 @@ class ParserClient:
             prior: Prior catalog dict to preserve descriptions/flags from, or ``None``.
             out_dir: Directory to write result artifacts to, or ``None`` to skip writing.
             observer: This call's observer, used by the ``@observed`` decorator's span.
+            schema: Schema source/dict/path forwarded to the scan and the exporter.
+            include_code_schema: Exporter option; see :meth:`ParserClient.arun`.
+            generate: Exporter option; see :meth:`ParserClient.arun`.
+            databases: Exporter option; see :meth:`ParserClient.arun`.
             **scan_options: Additional keyword arguments forwarded to
                 :func:`~etl_parser.ai_analysis.analyze_async`.
 
         Returns:
             AnalysisRun: The result of :func:`~etl_parser.ai_analysis.analyze_async`, with
-            ``artifact_path`` set when ``out_dir`` was given.
+            ``schema_drift`` mirrored from the catalog and ``artifact_path`` set when
+            ``out_dir`` was given.
         """
         result = await analyze_async(
-            source, config=config, runner=runner, prior=prior, **scan_options
+            source,
+            config=config,
+            runner=runner,
+            prior=prior,
+            schema=schema,
+            include_code_schema=include_code_schema,
+            generate=generate,
+            databases=databases,
+            **scan_options,
         )
+        dropped = apply_export_options(
+            result,
+            prior=prior,
+            schema=schema,
+            include_code_schema=include_code_schema,
+            generate=generate,
+            databases=databases,
+        )
+        for name in dropped:
+            observer.event("export.option_unsupported", level="DEBUG", actor="sdk", option=name)
         if out_dir is not None:
             result.artifact_path = await asyncio.to_thread(write_analysis, result, out_dir)
         return result
