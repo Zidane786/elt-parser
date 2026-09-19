@@ -299,11 +299,15 @@ def _headers(raw, path):
 def _write(value, path):
     """Serialize a value to deterministic, sorted JSON and write it to disk.
 
+    Creates the destination's parent directories when they do not exist, so an export can
+    write straight into a new results folder (review finding 35).
+
     Args:
         value: The JSON-serializable value to write.
         path: Destination file path.
     """
     text = json.dumps(value, sort_keys=True, indent=2) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     observer = current_observer()
     if observer:
@@ -432,11 +436,18 @@ def scan(
 @export_app.command("catalog")
 @observed("command.export_catalog")
 def catalog_export(
-    lineage: Path,
-    out: Path = typer.Option(...),
-    prior: Path | None = None,
-    log_dir: Path | None = None,
-    log_level: str = "INFO",
+    lineage: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, help="Saved native lineage.json to export"
+    ),
+    out: Path = typer.Option(..., help="Destination catalog.json; parent directories are created"),
+    prior: Path | None = typer.Option(
+        None,
+        exists=True,
+        dir_okay=False,
+        help="Prior catalog.json whose descriptions and metadata are preserved",
+    ),
+    log_dir: Path | None = typer.Option(None, help="Persist run events and metrics in this folder"),
+    log_level: str = typer.Option("INFO", help="Console level; file logs retain DEBUG events"),
 ):
     """Create the agent catalog, retaining prior descriptions and flags.
 
@@ -446,6 +457,10 @@ def catalog_export(
         prior: Prior ``catalog.json`` to merge into, preserving human-only fields.
         log_dir: Directory to persist run events and metrics in.
         log_level: Console log level; file logs always retain DEBUG events.
+
+    Raises:
+        typer.BadParameter: If ``lineage`` or ``prior`` does not exist; the message names
+            the missing path.
     """
     _write(export_agent_catalog(read_native(lineage), _json(prior) if prior else None), out)
 
@@ -453,18 +468,24 @@ def catalog_export(
 @export_app.command("openlineage")
 @observed("command.export_openlineage")
 def openlineage_export(
-    lineage: Path,
-    out: Path = typer.Option(...),
-    log_dir: Path | None = None,
-    log_level: str = "INFO",
+    lineage: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, help="Saved native lineage.json to export"
+    ),
+    out: Path = typer.Option(..., help="Directory for one event file per job; created if absent"),
+    log_dir: Path | None = typer.Option(None, help="Persist run events and metrics in this folder"),
+    log_level: str = typer.Option("INFO", help="Console level; file logs retain DEBUG events"),
 ):
     """Write one synthetic static OpenLineage event per job.
 
     Args:
         lineage: Path to a native ``lineage.json`` file.
-        out: Directory to write one ``<runId>.json`` event file per job into.
+        out: Directory to write one ``<runId>.json`` event file per job into; created
+            with its parents when absent.
         log_dir: Directory to persist run events and metrics in.
         log_level: Console log level; file logs always retain DEBUG events.
+
+    Raises:
+        typer.BadParameter: If ``lineage`` does not exist; the message names the path.
     """
     out.mkdir(parents=True, exist_ok=True)
     for event in export_openlineage(read_native(lineage)):
@@ -474,12 +495,18 @@ def openlineage_export(
 @app.command()
 @observed("command.impact")
 def impact(
-    lineage: Path,
-    node: str,
-    upstream_direction: bool = typer.Option(False, "--upstream"),
-    depth: int | None = typer.Option(None, min=0),
-    log_dir: Path | None = None,
-    log_level: str = "INFO",
+    lineage: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, help="Saved native lineage.json to query"
+    ),
+    node: str = typer.Argument(..., help="Dataset id, or dataset_id#column id, to query"),
+    upstream_direction: bool = typer.Option(
+        False, "--upstream", help="Walk upstream provenance instead of downstream consumers"
+    ),
+    depth: int | None = typer.Option(
+        None, min=0, help="Maximum hop distance to include; unbounded when omitted"
+    ),
+    log_dir: Path | None = typer.Option(None, help="Persist run events and metrics in this folder"),
+    log_level: str = typer.Option("INFO", help="Console level; file logs retain DEBUG events"),
 ):
     """Query a dataset ID or dataset#column ID.
 
@@ -492,8 +519,8 @@ def impact(
         log_level: Console log level; file logs always retain DEBUG events.
 
     Raises:
-        typer.BadParameter: If ``depth`` is negative or ``node`` is not a known dataset or
-            column id.
+        typer.BadParameter: If ``lineage`` does not exist, ``depth`` is negative, or
+            ``node`` is not a known dataset or column id.
     """
     graph = LineageGraph(read_native(lineage))
     try:
@@ -505,13 +532,22 @@ def impact(
 
 @app.command()
 @observed("command.products")
-def products(lineage: Path, log_dir: Path | None = None, log_level: str = "INFO"):
+def products(
+    lineage: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, help="Saved native lineage.json to report on"
+    ),
+    log_dir: Path | None = typer.Option(None, help="Persist run events and metrics in this folder"),
+    log_level: str = typer.Option("INFO", help="Console level; file logs retain DEBUG events"),
+):
     """Report product dependency and orchestrator drift.
 
     Args:
         lineage: Path to a native ``lineage.json`` file.
         log_dir: Directory to persist run events and metrics in.
         log_level: Console log level; file logs always retain DEBUG events.
+
+    Raises:
+        typer.BadParameter: If ``lineage`` does not exist; the message names the path.
     """
     graph = LineageGraph(read_native(lineage))
     typer.echo(
@@ -529,9 +565,15 @@ def products(lineage: Path, log_dir: Path | None = None, log_level: str = "INFO"
 @app.command()
 @observed("command.describe")
 def describe(
-    lineage: Path,
-    catalog: Path = typer.Option(...),
-    out: Path = typer.Option(...),
+    lineage: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, help="Saved native lineage.json describing the columns"
+    ),
+    catalog: Path = typer.Option(
+        ..., exists=True, dir_okay=False, help="Existing catalog.json to enrich with descriptions"
+    ),
+    out: Path = typer.Option(
+        ..., help="Destination for the enriched catalog; parent directories are created"
+    ),
     lambda_arn: str | None = typer.Option(None, envvar="ETL_PARSER_LAMBDA_ARN"),
     runner: str = typer.Option(
         "lambda-bedrock-invoke",
@@ -578,9 +620,10 @@ def describe(
         log_max_files: Maximum number of rotated log files to keep.
 
     Raises:
-        typer.BadParameter: If the runner configuration is invalid (bad runner/URL/headers
-            combination), or runner initialization fails (missing SDK, missing
-            credentials, or invalid engine construction).
+        typer.BadParameter: If ``lineage`` or ``catalog`` does not exist, the runner
+            configuration is invalid (bad runner/URL/headers combination), or runner
+            initialization fails (missing SDK, missing credentials, or invalid engine
+            construction).
     """
     doc, existing = read_native(lineage), _json(catalog)
     try:

@@ -165,3 +165,95 @@ def test_run_strict_exit_two_takes_precedence_over_strict_exit_one(analyzed, tmp
         app, ["run", str(tmp_path), "--out-dir", str(tmp_path / "out"), "--strict"]
     )
     assert result.exit_code == 2, result.output
+
+
+@pytest.fixture
+def lineage_file(tmp_path):
+    """Write a small valid native lineage file.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+
+    Returns:
+        Path: The written ``lineage.json``.
+    """
+    from etl_parser.export.native import write_native
+
+    path = tmp_path / "lineage.json"
+    write_native(document(), path)
+    return path
+
+
+MISSING = "no/such/file.json"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["export", "catalog", MISSING, "--out", "out.json"],
+        ["export", "openlineage", MISSING, "--out", "events"],
+        ["impact", MISSING, "glue://a/b"],
+        ["products", MISSING],
+    ],
+)
+def test_missing_lineage_file_is_a_parameter_error(arguments, tmp_path):
+    result = CliRunner().invoke(app, arguments)
+    assert result.exit_code == 2, result.output
+    assert MISSING in result.output and "Traceback" not in result.output
+
+
+def test_missing_prior_catalog_is_a_parameter_error(lineage_file, tmp_path):
+    result = CliRunner().invoke(
+        app,
+        [
+            "export",
+            "catalog",
+            str(lineage_file),
+            "--out",
+            str(tmp_path / "c.json"),
+            "--prior",
+            MISSING,
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    assert MISSING in result.output and "Traceback" not in result.output
+
+
+def test_missing_describe_catalog_is_a_parameter_error(lineage_file, tmp_path):
+    result = CliRunner().invoke(
+        app,
+        [
+            "describe",
+            str(lineage_file),
+            "--catalog",
+            MISSING,
+            "--out",
+            str(tmp_path / "e.json"),
+            "--model",
+            "example-model",
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    assert MISSING in result.output and "Traceback" not in result.output
+
+
+def test_missing_run_config_is_a_parameter_error(tmp_path):
+    result = CliRunner().invoke(app, ["run", str(tmp_path), "--config", MISSING])
+    assert result.exit_code == 2, result.output
+    assert MISSING in result.output and "Traceback" not in result.output
+
+
+def test_export_catalog_creates_missing_output_directories(lineage_file, tmp_path):
+    out = tmp_path / "new" / "nested" / "catalog.json"
+    result = CliRunner().invoke(app, ["export", "catalog", str(lineage_file), "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    assert json.loads(out.read_text())["databases"] == []
+
+
+def test_export_openlineage_creates_missing_output_directories(lineage_file, tmp_path):
+    out = tmp_path / "new" / "nested" / "events"
+    result = CliRunner().invoke(
+        app, ["export", "openlineage", str(lineage_file), "--out", str(out)]
+    )
+    assert result.exit_code == 0, result.output
+    assert out.is_dir()
