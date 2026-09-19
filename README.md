@@ -53,8 +53,49 @@ Output names such as `amount_usd` remain the actual output column names.
 The native JSON contains datasets, jobs, schedules, task-to-job links, table edges,
 column edges, dependencies, provenance and unresolved items. Column IDs in impact queries
 use `dataset_id#column`. Files are deterministic for the same source, schemas, bindings
-and dependency versions. Scan exits with code 1 when `unsupported_syntax` is present;
-other diagnostic kinds remain visible in JSON and the coverage summary.
+and dependency versions. `scan` and `run` exit 1 when `unsupported_syntax` is present;
+other diagnostic kinds remain visible in JSON and the coverage summary without gating
+(see [exit codes](#exit-codes)).
+
+### Choosing what to generate
+
+`scan`, `run` and `export catalog` take repeatable `--generate SECTION` (`databases`,
+`scripts`, `relations`, `lineage`, `schedules`) and `--database NAME`. Both default to
+everything, and sections you do not select are passed through unchanged from `--prior`.
+
+```sh
+# Everything (default), then narrower regenerations of the same catalog.
+etl-parser export catalog lineage.json --prior catalog.json --out catalog.updated.json
+etl-parser export catalog lineage.json --prior catalog.json --out catalog.updated.json \
+  --generate scripts --database analytics
+etl-parser export catalog lineage.json --prior catalog.json --out catalog.updated.json \
+  --generate relations
+etl-parser export catalog lineage.json --prior catalog.json --out catalog.updated.json \
+  --generate databases --generate scripts --database analytics --database marketing
+etl-parser run ./etl --prior catalog.json --generate scripts --database analytics
+```
+
+```python
+result = client.run("./etl", prior=prior, generate=["scripts"], databases=["analytics"])
+catalog = export_agent_catalog(doc, prior, generate=["scripts"], databases=["analytics"])
+```
+
+`etl-parser schema fetch --database NAME` is the source-side equivalent: it limits which
+databases are read **from** Glue, Postgres or Redshift, while `--database` above limits
+which are written **into** the catalog. See [the CLI guide](docs/cli.md) for the full
+schema-fetch surface; credentials for Postgres and Redshift come only from the
+environment, and there is no `--dsn` or `--password` option.
+
+### Exit codes
+
+| Code | When |
+| --- | --- |
+| `0` | Finished; diagnostics may still appear in the JSON summary |
+| `1` | An `unsupported_syntax` item remains, or `--strict` was set and any unresolved item, warning or non-success status remains |
+| `2` | Usage error (unknown option, missing input file), or the AI stage failed provider authentication/authorization |
+
+`analysis_note`, `skipped_entry` and `missing_in_source` are informational and never
+change the exit code.
 
 ### Dynamic tables and environment variables
 
@@ -482,7 +523,12 @@ etl-parser export catalog lineage.json --prior catalog.template.json --out catal
 ```
 
 `--schema` supplies known column names for resolution/star expansion/AI validation.
-`--prior` supplies existing descriptions and metadata to preserve in the output catalog.
+`--prior` supplies existing descriptions and metadata to preserve in the output catalog:
+databases are matched **by name first**, so a `sqlite`, `postgres` or `mysql` prior
+catalog keeps its metadata instead of being duplicated, and scripts are matched by
+`job_id`, then `script_path`, then `script_name`, then path suffix. The source system is
+the truth for schema: a table seen only in code becomes a non-gating `missing_in_source`
+diagnostic rather than a new table, unless `--schema-from-code` is given.
 Use both if you need both; `--schema` alone does not seed prior descriptions.
 The legacy `describe --catalog` takes the catalog to enrich. The native `lineage.json`
 is a different format; do not pass it as a schema catalog.
@@ -497,7 +543,10 @@ is a different format; do not pass it as a schema catalog.
 | `datatype` | Optional preserved metadata; current schema lookup primarily uses column names |
 | `description` | Existing descriptions are preserved; empty strings are eligible for enrichment |
 | `verify`, `is_partition`, other flags | Preserved caller metadata, not instructions to execute/verify/mask actual data |
-| `relations` | Preserved application metadata; does not itself establish static lineage |
+| `relations` | Relations from a source database (`source: "database"`) or preserved human curation; does not itself establish static lineage |
+| `relations_inferred` | Relations inferred from join conditions (`source: "inferred"`, with contributing `jobs`); kept separate and never merged into `relations` |
+| `schema_drift` | `code_only.databases` (copy-ready entries for tables seen only in code) and `unused_in_code` (source tables no job touches) |
+| `description_source` | `human`, `inherited`, `code` or `ai` for each description; AI ones also carry `ai_confidence`, `ai_rationale` and `ai_model` |
 | `scripts` | Rebuilt from observed jobs with reads/writes/dependencies/schedules; may start empty |
 | `schedules` | Rebuilt from parsed orchestration metadata; may start empty |
 | `lineage.column_edges`, `lineage.unresolved` | Exported evidence/diagnostics; may start empty in an input template |

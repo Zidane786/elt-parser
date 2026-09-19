@@ -462,6 +462,68 @@ def test_header_examples_are_placeholders_everywhere_in_the_tree():
     assert not offenders, f"Internal header names remain in: {offenders}"
 
 
+@pytest.mark.parametrize(
+    "topic",
+    [
+        "--schema-from-code",
+        "missing_in_source",
+        "schema_drift",
+        "relations_inferred",
+        "description_source",
+        "ai_confidence",
+        "--min-ai-confidence",
+        "--generate",
+        "--database",
+        "etl-parser schema fetch",
+        "ETL_PARSER_POSTGRES_DSN",
+        "ETL_PARSER_REDSHIFT_DSN",
+    ],
+)
+def test_cli_guide_documents_the_new_behaviour(topic):
+    assert topic in (ROOT / "docs" / "cli.md").read_text(), f"Missing from cli.md: {topic}"
+
+
+@pytest.mark.parametrize(
+    "topic",
+    [
+        "include_code_schema",
+        "fetch_schema",
+        "GlueSchemaSource",
+        "PostgresSchemaSource",
+        "RedshiftSchemaSource",
+        "SchemaSourceError",
+        "write_schema_catalog",
+        "schema_drift",
+        "relations_inferred",
+        "description_source",
+        "ai_rationale",
+        "min_ai_confidence",
+        'AnalysisPolicyError("provider_configuration_invalid")',
+    ],
+)
+def test_sdk_guide_documents_the_new_surface(topic):
+    assert topic in (ROOT / "docs" / "sdk.md").read_text(), f"Missing from sdk.md: {topic}"
+
+
+@pytest.mark.parametrize(
+    "topic", ["--generate", "--database", "Exit codes", "relations_inferred", "schema_drift"]
+)
+def test_readme_documents_the_new_behaviour(topic):
+    assert topic in (ROOT / "README.md").read_text(), f"Missing from README: {topic}"
+
+
+def test_guides_document_the_exit_code_table():
+    for name in ("README.md", "docs/cli.md"):
+        text = (ROOT / name).read_text()
+        assert "analysis_note" in text and "unsupported_syntax" in text, name
+
+
+def test_credentials_are_documented_as_environment_only():
+    for name in ("docs/cli.md", "docs/sdk.md"):
+        text = (ROOT / name).read_text()
+        assert "--password" in text or "no `--dsn`" in text or "no `dsn=`" in text, name
+
+
 def test_dependency_guide_documents_every_declared_requirement():
     text = (ROOT / "docs" / "dependencies.md").read_text()
     for section in (
