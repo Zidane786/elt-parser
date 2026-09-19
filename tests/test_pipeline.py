@@ -23,7 +23,17 @@ def test_fixture_catalog_reads_and_writes_match_reviewed_corrections():
     graph = scan(FIXTURES / "etl", schema=DictSchemaProvider(catalog))
     exported = export_agent_catalog(graph.document)
     golden = json.loads((FIXTURES / "catalog_scripts_golden.json").read_text())
-    assert exported["scripts"] == golden
+    # The golden predates the docstring fallback (description, description_source) and may
+    # only be regenerated in WP-B; compare everything else byte-for-byte here.
+    described = {"description", "description_source"}
+    assert [{k: v for k, v in s.items() if k not in described} for s in exported["scripts"]] == [
+        {k: v for k, v in s.items() if k not in described} for s in golden
+    ]
+    descriptions = {j.id: j.description for j in graph.document.jobs}
+    assert all(
+        s["description"] == descriptions[s["job_id"]] and s["description_source"] == "code"
+        for s in exported["scripts"]
+    )
     jobs = {s["script_name"]: s for s in exported["scripts"]}
     corrections = {
         "dim_customer_scd2": {("table", "analytics_warehouse.dim_customer")},
