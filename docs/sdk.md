@@ -8,8 +8,9 @@ commands. All gateway URLs, models and function names here are placeholders.
 
 Requires Python 3.11+. Run `pip install .` from the checkout, or install your approved
 internal distribution. Install `.[glue]` for optional AWS Glue schema lookup.
-AI additionally requires the trusted private `gdtc-agent-sdk` distribution/source
-checkout, not an unrelated public package with a similar name.
+AI additionally requires your organisation's Agent SDK (`agent-sdk`) from its trusted
+internal distribution or source checkout, not an unrelated public package with a
+similar name.
 
 ```python
 from etl_parser import (

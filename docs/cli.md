@@ -16,9 +16,10 @@ etl-parser run ./etl --out-dir ./artifacts --log-dir ./logs
 ```
 
 The first run is deterministic: AI lineage and descriptions are both off.
-AI requires the trusted private `gdtc-agent-sdk` distribution/source checkout,
-not an unrelated public package named `agent-sdk`. For example, install it from
-your approved internal checkout with `pip install /path/to/trusted-agent-sdk`.
+AI requires your organisation's Agent SDK (`agent-sdk`) from its trusted internal
+distribution or source checkout, not an unrelated public package of the same name.
+For example, install it from your approved internal checkout with
+`pip install /path/to/trusted-agent-sdk`.
 Help and deterministic scanning require neither AI credentials nor the private SDK.
 
 ## Common workflows

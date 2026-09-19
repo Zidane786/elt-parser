@@ -26,8 +26,9 @@ pip install .
 pip install '.[glue]'
 ```
 
-For an internal Nexus index, configure your normal pip/uv index settings. The package
-does not store index credentials or connect to a service during an ordinary scan.
+For your internal package index, configure your normal pip/uv index settings. The
+package does not store index credentials or connect to a service during an ordinary
+scan. [Dependencies](docs/dependencies.md) lists what every requirement is for.
 
 ## Scan and explore
 
@@ -180,14 +181,14 @@ Mappings are deterministic: SQLGlot and Python AST/DataFrame tracking resolve li
 The legacy `describe` command only enriches descriptions, never mappings. The separate
 `run --ai-lineage fallback|improve` modes can propose audited lineage additions.
 
-All description calls use your **gdtc-agent-sdk**, tested against distribution
-`agent-sdk==1.3.1`, and its `BedrockInvokeLambdaRunner` or `AnthropicRunner`. The old direct Bedrock client
+All description calls use **your organisation's Agent SDK (`agent-sdk`)**, tested against
+distribution `agent-sdk==1.3.1`, and its `BedrockInvokeLambdaRunner` or `AnthropicRunner`. The old direct Bedrock client
 and custom client protocol have been removed. No model or Lambda ARN is hard-coded.
 Install the SDK from your trusted internal distribution or local checkout, **not an
 unverified public package with the same name**:
 
 ```sh
-uv pip install --python .venv/bin/python /path/to/gdtc-agent-sdk
+uv pip install --python .venv/bin/python /path/to/your-agent-sdk
 .venv/bin/etl-parser describe lineage.json --catalog catalog.json --out enriched.json \
   --lambda-arn YOUR_FUNCTION_NAME_OR_ARN --model YOUR_BEDROCK_MODEL_ID \
   --region ap-south-1 --aws-profile YOUR_PROFILE
@@ -405,7 +406,7 @@ etl-parser run ./etl --runner anthropic --model YOUR_MODEL \
 # Optional custom headers, only if your gateway requires them:
 etl-parser run ./etl --descriptions --runner anthropic \
   --base-url https://gateway.example/aigw --model YOUR_MODEL \
-  --extra-headers '{"x-duke-mode":"invoke","x-duke-stream":"true"}'
+  --extra-headers '{"x-example-mode":"invoke","x-example-stream":"true"}'
 
 # Alternatively, headers.json contains that same JSON object:
 etl-parser run ./etl --descriptions --runner anthropic \
@@ -417,7 +418,7 @@ extra headers**. Header values must be strings; JSON booleans such as `true` mus
 written as `"true"`. `--extra-headers` and `--extra-headers-file` are mutually exclusive.
 Header overrides are passed to the SDK, including custom auth/routing headers; transport
 headers `Host`, `Content-Length`, `Transfer-Encoding`, newline injection, and duplicate
-case-insensitive names are rejected. A custom `x-duke-stream` header is forwarded as
+case-insensitive names are rejected. A custom `x-example-stream` header is forwarded as
 gateway metadata; it does **not** switch the parser to `complete_stream`. The analysis
 pipeline expects a complete Anthropic-compatible JSON response, not an SSE stream.
 

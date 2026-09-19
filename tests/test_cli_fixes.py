@@ -420,6 +420,73 @@ def test_min_ai_confidence_rejects_values_outside_zero_to_one(tmp_path):
     assert result.exit_code == 2, result.output
 
 
+GUIDES = ("README.md", "docs/cli.md", "docs/sdk.md", "docs/dependencies.md")
+# Spelled in parts so this file does not itself contain the string it forbids.
+INTERNAL_HEADER = "x-" + "duke"
+PRIVATE_DISTRIBUTION = "gd" + "tc"
+
+
+def guide_text():
+    """Read every user-facing guide.
+
+    Returns:
+        dict[str, str]: Guide path to its text.
+    """
+    return {name: (ROOT / name).read_text() for name in GUIDES}
+
+
+@pytest.mark.parametrize("name", GUIDES)
+def test_guides_use_neutral_example_header_names(name):
+    text = (ROOT / name).read_text()
+    assert INTERNAL_HEADER not in text, f"{name} names an internal gateway header"
+
+
+@pytest.mark.parametrize("name", GUIDES)
+def test_guides_refer_to_the_private_sdk_generically(name):
+    text = (ROOT / name).read_text()
+    assert PRIVATE_DISTRIBUTION not in text.lower(), f"{name} names the private distribution"
+
+
+@pytest.mark.parametrize("name", GUIDES)
+def test_guides_keep_the_internal_index_generic(name):
+    text = (ROOT / name).read_text()
+    assert "nexus" not in text.lower(), f"{name} names an internal package index"
+
+
+def test_header_examples_are_placeholders_everywhere_in_the_tree():
+    offenders = [
+        str(path.relative_to(ROOT))
+        for path in list((ROOT / "etl_parser").rglob("*.py")) + list((ROOT / "tests").glob("*.py"))
+        if INTERNAL_HEADER in path.read_text()
+    ]
+    assert not offenders, f"Internal header names remain in: {offenders}"
+
+
+def test_dependency_guide_documents_every_declared_requirement():
+    text = (ROOT / "docs" / "dependencies.md").read_text()
+    for section in (
+        "Runtime requirements",
+        "Optional extras",
+        "Development tools",
+        "Considered and not used",
+    ):
+        assert section in text, f"Missing section: {section}"
+    declared = project()
+    for requirement in declared["dependencies"]:
+        assert f"`{requirement}`" in text, f"Undocumented runtime dependency: {requirement}"
+    for extra, requirements in declared["optional-dependencies"].items():
+        assert f"`{extra}`" in text
+        for requirement in requirements:
+            assert f"`{requirement}`" in text, f"Undocumented extra dependency: {requirement}"
+    for dropped in ("grimp", "libcst", "jedi", "sqllineage", "sqlglotc", "astroid", "anthropic"):
+        assert f"`{dropped}`" in text, f"Missing rationale for dropping {dropped}"
+    assert "internal package index" in text
+
+
+def test_readme_links_the_dependency_guide():
+    assert "docs/dependencies.md" in (ROOT / "README.md").read_text()
+
+
 def project():
     """Parse ``pyproject.toml``.
 
