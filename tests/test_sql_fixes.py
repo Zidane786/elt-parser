@@ -128,7 +128,11 @@ def test_update_from_join_keeps_join_indirect_sources():
     edge = a.result.column_edges[0]
     assert _src(edge) == [("postgres://a/s", "a")]
     indirect = {(r.dataset_id, r.name) for r in edge.indirect_sources}
-    assert {("postgres://a/s", "id"), ("postgres://a/u", "id"), ("postgres://b/t", "id")} <= indirect
+    assert {
+        ("postgres://a/s", "id"),
+        ("postgres://a/u", "id"),
+        ("postgres://b/t", "id"),
+    } <= indirect
     assert a.inputs >= {"postgres://a/s", "postgres://a/u"}
     assert (("postgres://a/s", "id"), ("postgres://a/u", "id")) in _pairs(a.result)
 
@@ -195,7 +199,9 @@ def test_select_into_and_create_table_like():
     a = SqlWorker().analyze("SELECT x INTO b.t FROM a.s", dialect="postgres", engine="postgres")
     assert a.outputs == {"postgres://b/t"}
     assert _src(a.result.column_edges[0]) == [("postgres://a/s", "x")]
-    a = SqlWorker().analyze("CREATE TABLE b.t LIKE a.s", dialect="spark", engine="spark", job_id="j")
+    a = SqlWorker().analyze(
+        "CREATE TABLE b.t LIKE a.s", dialect="spark", engine="spark", job_id="j"
+    )
     assert a.inputs == {"glue://a/s"} and a.outputs == {"glue://b/t"}
     assert [(t.source, t.target) for t in a.result.table_edges] == [("glue://a/s", "glue://b/t")]
     assert a.result.unresolved == [] and a.result.column_edges == []
@@ -217,7 +223,9 @@ def test_delete_where_in_subquery_reads_the_subquery_table():
 
 def test_location_and_external_location_become_dataset_aliases():
     a = SqlWorker().analyze(
-        "CREATE EXTERNAL TABLE b.t (x INT) LOCATION 's3://bucket/t/'", dialect="hive", engine="athena"
+        "CREATE EXTERNAL TABLE b.t (x INT) LOCATION 's3://bucket/t/'",
+        dialect="hive",
+        engine="athena",
     )
     ds = next(d for d in a.result.datasets if d.id == "glue://b/t")
     assert ds.aliases == ["s3://bucket/t/"] and ds.physical_location == "s3://bucket/t/"
@@ -264,7 +272,9 @@ def test_non_equality_and_constant_join_predicates_are_not_conditions():
 
 # ---------------------------------------------------------------- base helpers
 def test_parse_header_strips_trailing_comment_after_value():
-    header = parse_header("-- Owner: me@x  -- primary\n-- Schedule: 0 5 1 * *  -- monthly\nSELECT 1")
+    header = parse_header(
+        "-- Owner: me@x  -- primary\n-- Schedule: 0 5 1 * *  -- monthly\nSELECT 1"
+    )
     assert header == {"owner": "me@x", "schedule": "0 5 1 * *"}
 
 
