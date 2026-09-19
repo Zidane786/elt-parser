@@ -31,8 +31,12 @@ def test_scan_logs_findings_without_changing_graph(tmp_path, capsys):
     doc = scan(source, log_dir=tmp_path / "logs").document
     output = capsys.readouterr()
     assert not output.out
-    assert "scan.completed" in output.err
+    # Library use defaults to WARNING: INFO events are persisted, not streamed.
+    assert "scan.completed" not in output.err
+    scan(source, log_level="INFO")
+    assert "scan.completed" in capsys.readouterr().err
     events, metrics, folder = artifacts(tmp_path / "logs")
+    assert "scan.completed" in {e["event"] for e in events}
     assert expected == doc.model_dump()
     assert {"job.found", "lineage.table_found", "lineage.column_found"} <= {
         e["event"] for e in events

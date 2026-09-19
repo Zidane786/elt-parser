@@ -61,8 +61,8 @@ def test_real_anthropic_sdk_headers_model_and_analysis(monkeypatch, tmp_path, mo
         calls.append(request)
         assert str(request.url) == "https://gateway.invalid/aigw/v1/messages"
         assert request.headers["x-api-key"] == "PRIVATE_KEY"
-        assert request.headers["x-duke-mode"] == "invoke"
-        assert request.headers["x-duke-stream"] == "true"
+        assert request.headers["x-example-mode"] == "invoke"
+        assert request.headers["x-example-stream"] == "true"
         body = json.loads(request.content)
         assert body["model"] == "example-model"
         content = body["messages"][0]["content"]
@@ -73,6 +73,8 @@ def test_real_anthropic_sdk_headers_model_and_analysis(monkeypatch, tmp_path, mo
         proposal.update(
             expression=edge["transformation"]["expression"],
             kind=edge["transformation"]["kind"],
+            confidence=0.75,
+            rationale="Echoes the deterministic edge in the cited line",
             evidence={
                 "source_file": context["source_file"],
                 "source_digest": context["source_digest"],
@@ -86,7 +88,14 @@ def test_real_anthropic_sdk_headers_model_and_analysis(monkeypatch, tmp_path, mo
                 {
                     "complete": True,
                     "columns": [proposal],
-                    "descriptions": [{"target": edge["target"], "description": "Source value"}]
+                    "descriptions": [
+                        {
+                            "target": edge["target"],
+                            "description": "Source value",
+                            "confidence": 0.75,
+                            "rationale": "Taken from the cited expression",
+                        }
+                    ]
                     if descriptions
                     else [],
                 }
@@ -101,7 +110,7 @@ def test_real_anthropic_sdk_headers_model_and_analysis(monkeypatch, tmp_path, mo
             api_key="PRIVATE_KEY",
             base_url="https://gateway.invalid/aigw",
             model="example-model",
-            extra_headers={"x-duke-mode": "invoke", "x-duke-stream": "true"},
+            extra_headers={"x-example-mode": "invoke", "x-example-stream": "true"},
             ai_lineage=mode,
             descriptions=descriptions,
         ),
@@ -130,8 +139,26 @@ def test_legacy_describe_uses_anthropic_without_lambda_and_closes(monkeypatch, t
 
     def handler(request):
         calls.append(request)
-        assert "x-duke-mode" not in request.headers
-        return response('{"description":"Twice the source value"}')
+        assert "x-example-mode" not in request.headers
+        return response(
+            json.dumps(
+                {
+                    "columns": [
+                        {
+                            "name": "doubled",
+                            "description": "Twice the source value",
+                            "confidence": 0.8,
+                            "rationale": "The expression multiplies the source by two",
+                        }
+                    ],
+                    "table": {
+                        "description": "One row per source row, with doubled values",
+                        "confidence": 0.7,
+                        "rationale": "Built from a single select over the source table",
+                    },
+                }
+            )
+        )
 
     clients = install_transport(monkeypatch, handler)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "PRIVATE_KEY")
@@ -289,7 +316,7 @@ def test_public_sdk_preserves_credentials_and_token_override(
     def handler(request):
         assert str(request.url) == base_url + "/v1/messages"
         assert request.headers["x-api-key"] == "PRIVATE_KEY"
-        assert "x-duke-mode" not in request.headers
+        assert "x-example-mode" not in request.headers
         assert json.loads(request.content)["model"] == model
         assert json.loads(request.content)["max_tokens"] == 2222
         return response('{"complete":true}')

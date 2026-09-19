@@ -8,8 +8,9 @@ commands. All gateway URLs, models and function names here are placeholders.
 
 Requires Python 3.11+. Run `pip install .` from the checkout, or install your approved
 internal distribution. Install `.[glue]` for optional AWS Glue schema lookup.
-AI additionally requires the trusted private `gdtc-agent-sdk` distribution/source
-checkout, not an unrelated public package with a similar name.
+AI additionally requires your organisation's Agent SDK (`agent-sdk`) from its trusted
+internal distribution or source checkout, not an unrelated public package with a
+similar name.
 
 ```python
 from etl_parser import (
@@ -98,7 +99,13 @@ is provided. Authorize source paths/repositories and keep runner configuration/c
 server-controlled. Do not let untrusted request bodies choose arbitrary local paths,
 plugin modules, credential profiles or provider URLs.
 
-AI file failures return partial results. Invalid settings and scan/export failures raise.
+AI file failures return partial results. Scan/export failures raise. Provider
+**misconfiguration** is checked once before the file loop and raises
+`AnalysisPolicyError("provider_configuration_invalid")` rather than being reported per
+file: a missing Lambda ARN, an absent Agent SDK or an unusable base URL is a settings
+error, not an outage. Per-file provider failures during the loop are still recorded as
+decisions with a `reason` (`provider_authentication_failed`, `provider_rate_limited`,
+`timeout`, `response_schema_invalid`, `internal_error` for a non-provider fault).
 Cancellation propagates and finalizes the client's log summaries. It does not forcibly
 stop a scan/export already running in a thread, or guarantee that remote billing stops.
 
@@ -168,6 +175,86 @@ result = client.run("./etl", schema=schema)
 Without a custom client, `GlueSchemaProvider(region="us-east-1")` uses the normal AWS
 credential chain. Lambda `AnalysisConfig.aws_profile` does not configure Glue lookup.
 
+### Source-of-truth schema sources
+
+Available from this release. `etl_parser.schema` exports `SchemaSource` (the protocol),
+`GlueSchemaSource`, `PostgresSchemaSource`, `RedshiftSchemaSource`, `SchemaSourceError`
+and `write_schema_catalog`; `etl_parser` re-exports them lazily, so importing the package
+never imports a database driver.
+
+```python
+from etl_parser.schema import (
+    GlueSchemaSource, PostgresSchemaSource, RedshiftSchemaSource,
+    SchemaSource, SchemaSourceError, write_schema_catalog,
+)
+
+glue = GlueSchemaSource(profile="YOUR_PROFILE", region="ap-south-1", databases=["raw"])
+postgres = PostgresSchemaSource(schemas=["public"])       # DSN from the environment
+redshift = RedshiftSchemaSource(iam=True, profile="YOUR_PROFILE", region="ap-south-1")
+
+write_schema_catalog([glue, postgres], "catalog.json")    # merged, sorted, no credentials
+```
+
+A `SchemaSource` answers `columns(dataset_id)` (the existing provider contract),
+`catalog()` (the `databases` list, with `datatype`, `description` and `is_partition` per
+field) and `relations()` (`from_table`, `to_table`, `from_column`, `to_column`,
+`relation_type`, `source: "database"`). A driver that is not installed raises
+`SchemaSourceError` naming the extra to install (`.[postgres]`, `.[redshift]`).
+
+**Credentials come from the environment**, never from a keyword that would end up in a
+log: `ETL_PARSER_POSTGRES_DSN` or `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER`/`PGPASSWORD`,
+`ETL_PARSER_REDSHIFT_DSN` or the `REDSHIFT_*` equivalents, and the normal AWS chain for
+Glue and for Redshift IAM. There is no `dsn=` password argument on the CLI and no
+`--password` option anywhere.
+
+```python
+client = ParserClient()
+catalog = client.fetch_schema([glue, postgres])           # the merged catalog dict
+
+result = client.run(
+    "./etl",
+    schema=glue,                 # a SchemaSource, a catalog dict, or a path
+    include_code_schema=False,   # default: the source system is the truth
+)
+result.schema_drift              # {"code_only": {...}, "unused_in_code": [...]}
+payload = result.to_dict()       # includes schema_drift
+```
+
+`ParserClient.run`/`arun` and `scan` accept `schema=`, `include_code_schema` (default
+`False`) and the selection arguments below. With `include_code_schema=False` a table seen
+only in code produces an `Unresolved` item of kind `missing_in_source` instead of being
+added to `databases`; `True` is the CLI's `--schema-from-code`.
+
+### Choosing what to generate
+
+`generate` selects catalog sections and `databases` selects database names; `None` (the
+default) means everything. Unselected sections are passed through unchanged from `prior`.
+
+```python
+# Everything, the default.
+result = client.run("./etl", prior=prior)
+
+# Only the scripts section, for one database.
+result = client.run("./etl", prior=prior, generate=["scripts"], databases=["analytics"])
+
+# Only relations.
+result = client.run("./etl", prior=prior, generate=["relations"])
+
+# Databases and scripts for two databases; other sections come from prior.
+result = client.run(
+    "./etl", prior=prior,
+    generate=["databases", "scripts"], databases=["analytics", "marketing"],
+)
+
+# The same selection when exporting a saved document directly.
+catalog = export_agent_catalog(doc, prior, generate=["scripts"], databases=["analytics"])
+```
+
+Valid sections are `databases`, `scripts`, `relations`, `lineage` and `schedules` — the
+same names the CLI accepts as `--generate`, with `--database` for the database filter.
+Selecting sources (`fetch_schema`, `schema fetch --database`) limits what is read **from**
+the source system; `databases` limits what is written **into** the catalog.
+
 ## AnalysisConfig reference
 
 Fields below can be passed to `AnalysisConfig(...)` or as a client `config` dictionary.
@@ -198,6 +285,8 @@ them explicitly. See [CLI environment handling](cli.md#configuration-credentials
 | `deadline_seconds` | `3600` | Positive AI-stage deadline, after deterministic scanning |
 | `include` | `["*"]` | AI file globs; deterministic inventory is not filtered |
 | `exclude` | `[]` | AI exclusions; take precedence over inclusions |
+| `min_ai_confidence` | `0.0` | Minimum model-reported confidence (0-1) for a proposal to be applied; below it the proposal is recorded as `deferred` with reason `below_confidence_threshold`. CLI: `--min-ai-confidence` |
+| `override_existing` | `False` | Regenerate descriptions this package wrote (`description_source` `ai` or `code`); human and verified text is never overwritten |
 
 Do not use `config.model_dump()` as a complete credential-bearing clone: secrets and
 headers are intentionally excluded. A normal deep `model_copy(deep=True)` preserves
@@ -353,6 +442,25 @@ origins = upstream(graph, "glue://analytics/order_totals#double_amount")
 dependencies = product_dependencies(graph)
 drift = orchestration_drift(graph)
 ```
+
+### What the exported catalog carries
+
+| Key | Meaning |
+| --- | --- |
+| `databases` | Source-of-truth schema only, unless `include_code_schema=True` adds code-derived entries marked `schema_source: code` |
+| `relations` | Relations from a source database (`source: "database"`) or preserved prior human curation |
+| `relations_inferred` | Relations inferred from join conditions, `source: "inferred"`, with the contributing `jobs`; never merged into `relations` |
+| `schema_drift` | `{"code_only": {"databases": [...]}, "unused_in_code": [{"db_name", "table_name"}]}`, both sorted |
+| `scripts[].description` | Falls back to the job docstring's first line with `description_source: code` |
+| `lineage.unresolved` | Includes non-gating `missing_in_source`, `analysis_note` and `skipped_entry` items |
+
+Every description records a `description_source` of `human`, `inherited`, `code` or `ai`.
+Descriptions and edges an AI stage produced additionally carry `ai_confidence` (the
+model's own 0–1 score), `ai_rationale` (a short justification, ≤ 500 characters) and
+`ai_model`, alongside the existing `parser="agent_sdk_ai"`, `confidence="inferred"`,
+`request_id` and `evidence_digest` provenance. Use `AnalysisConfig.min_ai_confidence` to
+defer proposals below a threshold. These are the model's self-reported numbers: treat
+them as a triage signal for review, not as measured accuracy.
 
 Impact nodes must exist in the graph; absent IDs raise `ValueError`. Product/DAG
 reports reflect only observed and declared evidence, not execution success.

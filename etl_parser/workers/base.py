@@ -1,4 +1,11 @@
-"""Helpers shared by every worker: header parsing, cron normalisation, result plumbing."""
+"""Shared helpers used by every worker: header parsing, cron normalisation, id plumbing.
+
+Nothing here is specific to a language or dialect. ``SqlWorker`` (see design section 8.1)
+and ``AirflowWorker`` (section 8.4) both use this module to read ``Key: value`` headers
+from docstrings and SQL comments, to fold Airflow schedule strings and cron comments to a
+canonical five-field cron, and to compute the repo-relative ``Job.id`` every worker uses as
+the join key between jobs, schedules, and tasks.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +17,7 @@ from etl_parser.models import Schedule
 
 HEADER_KEYS = {"source", "target", "owner", "grain", "schedule", "dependencies", "description"}
 _HEADER_LINE = re.compile(r"^\s*(?:--|#)?\s*(?P<key>[A-Za-z][A-Za-z _]*):\s*(?P<value>.+?)\s*$")
+_TRAILING_COMMENT = re.compile(r"\s+--.*$")
 
 CRON_PRESETS = {
     "@once": None,
@@ -35,8 +43,17 @@ _EVERY_N = re.compile(r"^every\s+(\d+)\s*(minute|min|hour|day)s?", re.I)
 def parse_header(text: str) -> dict[str, str]:
     """Extract ``Key: value`` lines from a module docstring or SQL comment header.
 
-    Returns lower-cased keys. Only the leading block of the text is inspected so a
-    ``Source:`` inside later prose does not count.
+    A job's ``.py`` or ``.sql`` source often carries a metadata header (owner, schedule,
+    description, ...) as the module docstring or a leading block of ``--``/``#`` comments.
+    Workers call this to recover that metadata without executing the file.
+
+    Args:
+        text: Full source text of the ``.py`` or ``.sql`` file.
+
+    Returns:
+        Mapping of lower-cased header key (restricted to ``HEADER_KEYS``) to its value.
+        Only the leading block of the text is inspected, so a ``Source:`` line appearing
+        later in prose does not count. The first occurrence of a key wins.
     """
     out: dict[str, str] = {}
     lines: list[str] = []
@@ -61,12 +78,21 @@ def parse_header(text: str) -> dict[str, str]:
             continue
         key = m.group("key").strip().lower()
         if key in HEADER_KEYS and key not in out:
-            out[key] = m.group("value").strip()
+            # ``Schedule: 0 5 1 * *  -- monthly``: the trailing comment is not the value.
+            out[key] = _TRAILING_COMMENT.sub("", m.group("value")).strip()
     return out
 
 
 def first_docstring_line(text: str) -> str | None:
-    """The first non-empty line of a module docstring, used as a job description."""
+    """Return the first non-empty line of a module docstring, used as a job description.
+
+    Args:
+        text: Python source text to parse for a module docstring.
+
+    Returns:
+        The stripped first non-empty line of the docstring, or ``None`` when the text has
+        no docstring, is not parseable Python, or the docstring is empty.
+    """
     try:
         doc = ast.get_docstring(ast.parse(text))
     except SyntaxError:
@@ -77,7 +103,27 @@ def first_docstring_line(text: str) -> str | None:
 
 
 def normalize_cron(text: str | None) -> str | None:
-    """Best-effort normalisation of a human or Airflow schedule string to five-field cron."""
+    """Normalise a human or Airflow schedule string to five-field cron, best-effort.
+
+    Used by ``AirflowWorker`` to turn ``schedule``/``schedule_interval`` text and by
+    ``comment_schedule`` to turn a ``Schedule:`` header value into the canonical cron
+    stored on a ``Schedule``. Recognises Airflow presets (``@daily``, ``@hourly``, ...),
+    literal five-field cron, ``"daily HH:MM"``, and ``"every N minute/hour/day"`` phrasing.
+
+    Args:
+        text: Raw schedule text, or ``None``.
+
+    Returns:
+        A normalised five-field cron string, or ``None`` when ``text`` is ``None``, empty,
+        a preset with no fixed cron equivalent (e.g. ``@once``), a ``timedelta``-style
+        interval (anchored, not a wall-clock schedule), or otherwise cannot be resolved.
+
+    Example:
+        >>> normalize_cron("@daily")
+        '0 0 * * *'
+        >>> normalize_cron("every 15 minutes")
+        '*/15 * * * *'
+    """
     if text is None:
         return None
     t = text.strip().strip('"').strip("'")
@@ -107,6 +153,16 @@ def normalize_cron(text: str | None) -> str | None:
 
 
 def _valid_cron(text: str) -> bool:
+    """Check that a five-field cron string has fields within their valid ranges.
+
+    Args:
+        text: A whitespace-separated five-field cron string (minute hour day month weekday).
+            Month and weekday names (``JAN``, ``MON``, ...) are accepted.
+
+    Returns:
+        ``True`` when every field is ``*``, a bounded value, a bounded range, or a bounded
+        step, all within the field's valid range; ``False`` otherwise.
+    """
     bounds = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)]
     names = {
         name: str(i)
@@ -136,6 +192,19 @@ def _valid_cron(text: str) -> bool:
 
 
 def comment_schedule(job_id: str, text: str, source_file: str | None) -> Schedule:
+    """Build a ``Schedule`` from a job header's ``Schedule:`` value.
+
+    Used by ``SqlWorker.analyze_file`` when ``parse_header`` finds a ``schedule`` key, so a
+    job with no Airflow DAG or ``product.yaml`` entry still gets a recorded cadence.
+
+    Args:
+        job_id: Id of the job the schedule belongs to.
+        text: Raw ``Schedule:`` header value, passed through ``normalize_cron``.
+        source_file: Repo-relative path of the file the header was read from.
+
+    Returns:
+        A ``Schedule`` with orchestrator ``"cron_comment"``, id ``f"comment.{job_id}"``.
+    """
     return Schedule(
         id=f"comment.{job_id}",
         orchestrator="cron_comment",
@@ -146,12 +215,65 @@ def comment_schedule(job_id: str, text: str, source_file: str | None) -> Schedul
 
 
 def repo_relative(path: Path, root: Path | None) -> str:
+    """Return ``path`` relative to ``root``, or the raw path when that is not possible.
+
+    Args:
+        path: Absolute or relative path to a source file.
+        root: Repo root to make ``path`` relative to, or ``None``.
+
+    Returns:
+        The path as a string relative to ``root``, or ``str(path)`` unchanged when ``root``
+        is ``None`` or ``path`` does not lie under it.
+    """
     try:
         return str(path.resolve().relative_to(root.resolve())) if root else str(path)
     except ValueError:
         return str(path)
 
 
+def sql_line_offset(node: ast.AST | None) -> int:
+    """Return the ``line_offset`` to pass to ``SqlWorker.analyze`` for embedded SQL.
+
+    ``SqlWorker`` reports line ``line_offset + n`` for the ``n``-th line of the SQL text,
+    so the offset must be the line *before* the one where the SQL text itself starts.
+    Anchoring to the string constant rather than the enclosing call (review finding 15)
+    keeps reported lines exact for multi-line ``query=\"\"\"...\"\"\"`` arguments. The
+    helper descends to the leftmost string-bearing leaf: the receiver of a method call
+    such as ``"...".format(...)``/``.strip()``, the left operand of ``+`` concatenation,
+    and a parenthesised implicit concatenation (already one ``Constant`` in the AST).
+
+    Both ``AirflowWorker`` and ``PythonWorker`` embed SQL from AST string nodes; the
+    Python worker can adopt this helper in place of ``call.lineno - 1``.
+
+    Args:
+        node: The AST expression that carries the SQL text (a ``Constant``, ``JoinedStr``,
+            ``BinOp``, ``Call`` on a string, or a ``Name`` referring to one), or ``None``.
+
+    Returns:
+        ``node.lineno - 1`` for the leftmost string-bearing leaf, or ``0`` when ``node`` is
+        ``None`` or carries no line information.
+    """
+    while node is not None:
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            node = node.func.value
+        elif isinstance(node, ast.BinOp):
+            node = node.left
+        else:
+            break
+    lineno = getattr(node, "lineno", None)
+    return lineno - 1 if isinstance(lineno, int) and lineno > 0 else 0
+
+
 def job_id_for(path: Path, root: Path | None) -> str:
+    """Derive a job id from a source file path: its repo-relative path minus the extension.
+
+    Args:
+        path: Path to a ``.py`` or ``.sql`` source file.
+        root: Repo root used to make the path relative; see ``repo_relative``.
+
+    Returns:
+        Forward-slash-separated repo-relative path with a trailing ``.py`` or ``.sql``
+        stripped, used as ``Job.id`` throughout the pipeline.
+    """
     rel = repo_relative(path, root)
     return re.sub(r"\.(py|sql)$", "", rel).replace("\\", "/")

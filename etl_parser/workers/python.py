@@ -1,7 +1,19 @@
 """Static frame and I/O analysis shared by PySpark, Pandas and Polars.
 
+This module implements PythonWorker (design spec section 8.2) and, by extension,
+SparkStaticWorker (section 8.3), which re-exports it directly. Given a ``.py`` file and the
+scanned module graph, :class:`PythonWorker` builds the file's import map, matches calls
+against the sink table (``etl_parser.scanner.sinks``) to find reads/writes, reconstructs
+SQL-carrying string arguments, and hands SQL text to :class:`~etl_parser.workers.sql.SqlWorker`.
+It tracks DataFrame-shaped variables (pandas, polars, and PySpark alike) through an AST-driven
+interpreter so column-level projections, joins, aggregations, and filters become
+:class:`~etl_parser.models.ColumnEdge`/:class:`~etl_parser.models.TableEdge` records, and it
+follows one level of calls into helper modules resolved through the module graph.
+
 The interpreter handles a deliberately finite set of AST/frame operations. It never
 imports ETL code. Unknown frame operations preserve known sources with partial confidence.
+Everything the interpreter cannot resolve is reported as an
+:class:`~etl_parser.models.Unresolved` item with a reason, never guessed.
 """
 
 from __future__ import annotations
@@ -22,15 +34,142 @@ from etl_parser.models import (
     Unresolved,
     WorkerResult,
 )
-from etl_parser.scanner.repo import ScanIndex, SourceFile
+from etl_parser.scanner.imports import resolve_import
+from etl_parser.scanner.references import qualified_callee
+from etl_parser.scanner.repo import ScanIndex, SourceFile, imports_package
 from etl_parser.scanner.sinks import ENGINE_DIALECT, URL_ENGINE_HINTS, match_sink
 from etl_parser.scanner.strings import Folded, fold_string
 from etl_parser.workers.base import comment_schedule, first_docstring_line, parse_header
 from etl_parser.workers.sql import SqlWorker
 
+MAX_EXPRESSION_DEPTH = 200
+"""Deepest expression the analyzer renders as source text (design spec section 13).
+
+``ast.unparse`` recurses once per nesting level, so an expression nested deeper than this
+would raise ``RecursionError`` inside the very diagnostic that reports it. Real code stays
+an order of magnitude below this limit; generated code does not.
+"""
+
+
+def unparse(node) -> str:
+    """Render an AST node as source text without risking ``RecursionError``.
+
+    Measures the node's nesting depth iteratively first, so a pathologically deep
+    expression (a machine-generated 400-term chain, say) yields a placeholder instead of
+    exhausting the interpreter stack. Workers never raise on user code.
+
+    Args:
+        node: The AST node to render.
+
+    Returns:
+        str: ``ast.unparse(node)``, or a short placeholder naming the node type when the
+        expression nests deeper than :data:`MAX_EXPRESSION_DEPTH`.
+    """
+    stack = [(node, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > MAX_EXPRESSION_DEPTH:
+            return f"<{type(node).__name__} nested deeper than {MAX_EXPRESSION_DEPTH} levels>"
+        stack.extend((child, depth + 1) for child in ast.iter_child_nodes(current))
+    return ast.unparse(node)
+
+
+SPARK_PACKAGES = ("pyspark", "awsglue")
+"""Imports that make a file a Spark job: PySpark itself and the Glue runtime built on it."""
+
+NO_RETURN = object()
+"""Sentinel for "no ``return`` was reached", distinct from a ``return None``."""
+
+
+def merge_returns(first, second):
+    """Combine the values two paths through a function can produce.
+
+    A ``return`` inside an ``if``/``for``/``with`` does not end the analysis: the function
+    may still fall through to a later ``return``, so both outcomes have to survive (review
+    finding 20). Two frames merge into one frame carrying every branch's sources, marked
+    ``inferred`` because only one of them runs at a time (design spec section 13).
+
+    Args:
+        first: The value of the earlier path, or :data:`NO_RETURN`.
+        second: The value of the later path, or :data:`NO_RETURN`.
+
+    Returns:
+        The merged :class:`Frame` when both paths return frames, the single returned value
+        when only one path returns, otherwise the later path's value.
+    """
+    if first is NO_RETURN:
+        return second
+    if second is NO_RETURN:
+        return first
+    if not isinstance(first, Frame) or not isinstance(second, Frame):
+        return first if isinstance(first, Frame) else second
+    merged = copy.deepcopy(first)
+    merged.sources |= second.sources
+    merged.indirect |= second.indirect
+    merged.aliases.update(second.aliases)
+    merged.partial |= second.partial
+    merged.open_columns |= second.open_columns
+    merged.inferred = True
+    merged.parallel_sources = (
+        first.parallel_sources
+        or second.parallel_sources
+        # With no schema on either side, an unknown column may come from either branch.
+        or (first.open_columns and second.open_columns)
+    )
+    for key, column in second.columns.items():
+        if key in merged.columns:
+            merged.columns[key].sources |= column.sources
+            merged.columns[key].indirect |= column.indirect
+            merged.columns[key].partial |= column.partial
+        else:
+            merged.columns[key] = copy.deepcopy(column)
+    for key, column in merged.columns.items():
+        # A column only one branch produces is not guaranteed to be there.
+        column.partial |= key not in first.columns or key not in second.columns
+    return merged
+
+
+def resolvable_column(name) -> bool:
+    """Whether a tracked column name is a real name rather than an analyzer placeholder.
+
+    ``{{?}}`` (an unfolded runtime value), ``*`` (an unexpanded star) and the empty string
+    are artefacts of analysis, not columns; an edge naming one would be wrong rather than
+    incomplete, so callers record an ``unknown_column`` item instead (review finding 18).
+
+    Args:
+        name: The candidate column name.
+
+    Returns:
+        bool: ``True`` when ``name`` is a non-blank string that is neither a placeholder
+        nor a bare star.
+    """
+    return isinstance(name, str) and bool(name.strip()) and name != "*" and "{{" not in name
+
 
 @dataclass
 class Column:
+    """A single tracked DataFrame column's provenance, as understood so far.
+
+    Instances accumulate as the interpreter walks projections, joins, and aggregations;
+    :func:`PythonWorker.analyze_source`'s ``write_frame`` turns each into a ``ColumnEdge``.
+
+    Attributes:
+        sources (set[tuple[str, str]]): Direct ``(dataset_id, column_name)`` origins that
+            feed this column's value.
+        text (str): Source text of the expression that produced this column.
+        kind (str): Transformation kind, matching ``Transformation.kind`` (for example
+            ``"identity"``, ``"expression"``, ``"aggregation"``, ``"window"``).
+        partial (bool): Whether this column's provenance is incompletely known, downgrading
+            any edge built from it to ``partial`` confidence.
+        name (str | None): Output column name, when known (set by ``alias``/``name`` calls
+            or by the caller assigning it into a frame).
+        indirect (set[tuple[str, str]]): ``(dataset_id, column_name)`` origins referenced
+            only indirectly (filter/join/aggregation keys), not in the value itself.
+        source_file (str | None): Path of the file the defining expression came from.
+        line_start (int | None): First line of the defining expression.
+        line_end (int | None): Last line of the defining expression.
+    """
+
     sources: set[tuple[str, str]] = field(default_factory=set)
     text: str = ""
     kind: str = "identity"
@@ -44,11 +183,51 @@ class Column:
 
 @dataclass
 class Expression:
+    """A deferred, unevaluated AST expression node.
+
+    Wraps ``pyspark.sql.functions``-style values (``F.col``, ``Window.partitionBy``, and
+    similar) that are only resolved to a :class:`Column` once applied to a frame.
+
+    Attributes:
+        node (ast.AST): The wrapped expression node.
+    """
+
     node: ast.AST
 
 
 @dataclass
 class Frame:
+    """A tracked DataFrame variable: its known columns, source datasets, and open questions.
+
+    This is the interpreter's model of a pandas/polars/PySpark DataFrame as it is threaded
+    through assignments and chained method calls in :func:`PythonWorker.analyze_source`.
+
+    Attributes:
+        columns (dict[str, Column]): Known output columns by name.
+        sources (set[str]): Dataset ids this frame was ultimately read from.
+        aliases (dict[str, Frame]): Sub-frame aliases introduced by ``.alias(...)``, used to
+            resolve dotted column references like ``"left.id"``.
+        indirect (set[tuple[str, str]]): ``(dataset_id, column_name)`` origins referenced
+            only through filters, join keys, or group-by keys on this frame.
+        partial (bool): Whether this frame's shape is only partially known (an unhandled
+            operation was applied, or a source could not be resolved).
+        open_columns (bool): Whether columns outside ``self.columns`` may still exist (no
+            input schema was available to enumerate them), as opposed to ``self.columns``
+            being the complete, closed set of columns.
+        group (list[str]): Group-by key column names, set by a ``groupBy``/``groupby`` call
+            and consumed by the following ``agg``/``sum``/``mean``/etc. call.
+        parallel_sources (bool): Whether this frame was read from multiple dataset arguments
+            at once (for example ``pd.read_csv([a, b])``), so an unknown column's origin
+            fans out across all of ``sources`` rather than just one.
+        write_options (dict[str, ast.AST]): Writer builder options accumulated by
+            ``.format(...)``/``.option(...)``/``.options(...)`` calls on a ``df.write``
+            chain, keyed by option name, with values as their literal AST nodes. A
+            ``"path"`` entry supplies the output location for a terminal ``.save()``.
+        inferred (bool): Whether this frame's shape was reached through a heuristic (a
+            helper function followed one level, or a branch merge), so edges built from it
+            are ``inferred`` rather than ``exact`` (design spec section 13).
+    """
+
     columns: dict[str, Column] = field(default_factory=dict)
     sources: set[str] = field(default_factory=set)
     aliases: dict[str, Frame] = field(default_factory=dict)
@@ -57,8 +236,23 @@ class Frame:
     open_columns: bool = True
     group: list[str] = field(default_factory=list)
     parallel_sources: bool = False
+    write_options: dict[str, ast.AST] = field(default_factory=dict)
+    inferred: bool = False
 
     def column(self, name: str) -> Column:
+        """Resolve a column reference against this frame, including dotted alias access.
+
+        Args:
+            name (str): Column name to resolve. A dotted prefix matching a key in
+                ``self.aliases`` (for example ``"left.id"``) resolves against that aliased
+                sub-frame instead.
+
+        Returns:
+            Column: A copy of the known column when tracked. When the column is not tracked
+            but this frame has exactly one source dataset (or ``parallel_sources`` is set)
+            and columns are still open, a best-effort :class:`Column` sourced from every
+            source dataset under that name. Otherwise a :class:`Column` marked ``partial``.
+        """
         alias, dot, tail = name.partition(".")
         if dot and alias in self.aliases:
             return self.aliases[alias].column(tail)
@@ -71,15 +265,57 @@ class Frame:
 
 @dataclass
 class Connection:
+    """A resolved database connection/engine, tracked so later SQL calls know their dialect.
+
+    Attributes:
+        engine (str): Engine name (for example ``"postgres"``, ``"athena"``), derived from a
+            connection URL via ``URL_ENGINE_HINTS``.
+    """
+
     engine: str
 
 
 @dataclass
 class Reader:
+    """A partially-built PySpark ``spark.read``/``sqlContext.read`` builder chain.
+
+    Accumulates ``.format(...)``/``.option(...)``/``.options(...)`` calls before the chain
+    terminates in a load call (``.load()``, ``.parquet()``, ``.table()``, and similar).
+
+    Attributes:
+        options (dict[str, ast.AST]): Builder options captured so far, keyed by option name
+            (for example ``"path"``, ``"format"``), with values as their literal AST nodes
+            (folded to constants once known).
+    """
+
     options: dict[str, ast.AST] = field(default_factory=dict)
 
 
 class PythonWorker:
+    """Static ast-driven lineage worker for Python, pandas, polars, and PySpark files.
+
+    Implements design spec section 8.2 (and, via the ``SparkStaticWorker`` alias, section
+    8.3): builds each file's import map, matches calls against the sink table, folds
+    SQL/dataset string arguments, tracks DataFrame variables through supported chained
+    operations, and follows helper-module calls up to ``max_import_depth`` levels deep.
+    Unhandled frame operations degrade the affected columns to ``partial`` confidence and
+    continue rather than aborting the analysis.
+
+    Attributes:
+        sql (SqlWorker): Worker used to analyze SQL text found in string arguments.
+        index (ScanIndex | None): Scanned repository used to resolve local imports and
+            helper modules; when ``None``, import following is disabled.
+        bindings (dict[str, str]): Explicit values for otherwise-unresolvable symbols or
+            environment keys, seeded into every analysis's folding environment.
+        default_db (str | None): Default database used to qualify one-part dataset/table
+            names.
+        max_import_depth (int): Maximum depth of helper-module calls to follow.
+        language (str | None): Language every file analyzed by this worker is written in,
+            or ``None`` (the default) to detect it from each file's imports.
+    """
+
+    language: str | None = None
+
     def __init__(
         self,
         sql_worker: SqlWorker | None = None,
@@ -89,6 +325,19 @@ class PythonWorker:
         default_db: str | None = None,
         max_import_depth: int = 3,
     ):
+        """Configure a worker for analyzing Python/PySpark files.
+
+        Args:
+            sql_worker (SqlWorker | None): Worker to delegate SQL text to; a default
+                :class:`~etl_parser.workers.sql.SqlWorker` is created when not given.
+            index (ScanIndex | None): Scanned repository, used to resolve imports to helper
+                module files. Import following is skipped when ``None``.
+            bindings (dict[str, str] | None): Explicit values for otherwise-unresolvable
+                symbols or environment keys.
+            default_db (str | None): Default database for qualifying one-part table names.
+            max_import_depth (int): Maximum depth of helper-module calls to follow before
+                recording a ``partial``/``unresolved_import`` result. Defaults to 3.
+        """
         self.sql = sql_worker or SqlWorker()
         self.index = index
         self.bindings = bindings or {}
@@ -96,9 +345,23 @@ class PythonWorker:
         self.max_import_depth = max_import_depth
 
     def analyze_file(self, path: Path) -> WorkerResult:
+        """Read a ``.py`` file from disk and analyze it.
+
+        Args:
+            path (Path): Path to the Python file to analyze.
+
+        Returns:
+            WorkerResult: The analysis result from :meth:`analyze_source`, or a result
+            containing a single ``unsupported_syntax`` item when the file cannot be read.
+        """
         root = self.index.root if self.index else path.parent
         try:
-            source = SourceFile(path.relative_to(root).as_posix(), path.read_text(), ".py")
+            # A file outside the index root has no repository-relative name; use its path.
+            try:
+                relative = path.relative_to(root).as_posix()
+            except ValueError:
+                relative = str(path)
+            source = SourceFile(relative, path.read_text(), ".py")
         except (OSError, UnicodeError) as exc:
             return WorkerResult(
                 unresolved=[
@@ -114,18 +377,55 @@ class PythonWorker:
         entry_function: str | None = None,
         job_id_override: str | None = None,
     ) -> WorkerResult:
+        """Analyze one Python/PySpark source file and return its lineage contributions.
+
+        This is the core of PythonWorker (design spec section 8.2): it walks the module's
+        top-level statements (and, when ``entry_function`` is given, that function's body),
+        matching sink calls, tracking DataFrame variables, and following one level of helper
+        calls resolved through ``self.index``. When no ``entry_function`` is given, a
+        function named ``main``, ``handler``, or ``lambda_handler`` is invoked automatically
+        if present and not already reached by another call, so Lambda-style entry points are
+        still analyzed as their own job. A :class:`~etl_parser.models.Job` record is emitted
+        for the file (or entry function) with its resolved inputs/outputs, owner and
+        description from header comments/docstring, and schedule, if any.
+
+        Args:
+            source (SourceFile): The file to analyze.
+            entry_function (str | None): Name of a specific function to treat as the job's
+                entry point, analyzed instead of (in addition to) top-level statements. When
+                given, only import/function/assignment statements are executed at module
+                level before the function itself is invoked.
+            job_id_override (str | None): Job id to use instead of ``source.job_id``.
+
+        Returns:
+            WorkerResult: Datasets, the job, column edges, table edges, schedules, and
+            unresolved items found while analyzing this file.
+        """
         result = WorkerResult()
         inputs: set[str] = set()
         outputs: set[str] = set()
         job_id = job_id_override or source.job_id
         root_source = source
-        language = "pyspark" if "pyspark" in source.text else "python"
+        language = self.language or (
+            "pyspark" if imports_package(source, *SPARK_PACKAGES) else "python"
+        )
         default_engine = "spark" if language == "pyspark" else "unknown"
         invoked: set[tuple[str, str]] = set()
         active: set[tuple[str, str]] = set()
         loading_modules: set[str] = set()
 
         def issue(node, reason, kind="unsupported_syntax", folded=None):
+            """Append an :class:`Unresolved` item for the current file at ``node``'s line.
+
+            Args:
+                node: AST node the issue is attached to; its source text and line number
+                    are recorded.
+                reason (str): Human-readable explanation of the issue.
+                kind (str): ``Unresolved.kind`` value. Defaults to ``"unsupported_syntax"``.
+                folded (Folded | None): The folded value, when the issue came from folding a
+                    string expression; supplies ``partial_text``, ``symbols``, and
+                    ``assumptions``, and changes the default remediation text.
+            """
             result.unresolved.append(
                 Unresolved(
                     kind=kind,
@@ -133,7 +433,7 @@ class PythonWorker:
                     line=getattr(node, "lineno", None),
                     reason=reason,
                     job_id=job_id,
-                    expression=ast.unparse(node),
+                    expression=unparse(node),
                     partial_text=folded.text if folded else None,
                     symbols=folded.placeholders if folded else [],
                     assumptions=folded.assumptions if folded else {},
@@ -147,6 +447,22 @@ class PythonWorker:
 
         @dataclass
         class State:
+            """Per-module interpreter state: one file's symbol table and import map.
+
+            A new ``State`` is created for the entry module and for each helper module
+            loaded via ``imported_state``/``invoke``, so each file's names stay isolated.
+
+            Attributes:
+                source (SourceFile): The module this state belongs to.
+                env (dict): Symbol table mapping names to their tracked values (``Frame``,
+                    ``Column``, ``Folded``, ``Connection``, ``Reader``, nested ``State`` for
+                    imported modules, or a plain string/AST value).
+                imports (dict): Maps a local import name to ``(dotted_module, level)``.
+                functions (dict): Maps a local function name to its ``ast.FunctionDef``.
+                depth (int): Helper-module recursion depth, compared against
+                    ``self.max_import_depth``.
+            """
+
             source: SourceFile
             env: dict = field(default_factory=lambda: dict(self.bindings))
             imports: dict = field(default_factory=dict)
@@ -156,6 +472,13 @@ class PythonWorker:
         state = State(source)
 
         def strings():
+            """Collect string-like environment values for folding, including one import level.
+
+            Returns:
+                dict: Every ``str``/``Folded`` value in the current scope's ``env``, plus,
+                for each imported module bound to a name, its own string values exposed
+                under ``"module.attr"`` keys.
+            """
             values = {k: v for k, v in state.env.items() if isinstance(v, (str, Folded))}
             for key, module in state.env.items():
                 if isinstance(module, State):
@@ -169,9 +492,28 @@ class PythonWorker:
             return values
 
         def folded(node):
+            """Fold an AST expression to a :class:`Folded` string using the current scope.
+
+            Args:
+                node: Expression node to fold.
+
+            Returns:
+                Folded: The folded value, using the current scope's string-like bindings
+                (see ``strings``) to resolve names.
+            """
             return fold_string(node, strings())
 
         def concrete(node, kind):
+            """Fold ``node`` and require a fully concrete result, else record an issue.
+
+            Args:
+                node: Expression node to fold.
+                kind (str): ``Unresolved.kind`` to use if the value cannot be resolved.
+
+            Returns:
+                str | None: The folded text, or ``None`` (with an issue recorded) when the
+                value is incomplete or relies on an environment-default assumption.
+            """
             value = folded(node)
             if not value.complete or value.assumptions:
                 issue(
@@ -181,17 +523,60 @@ class PythonWorker:
             return value.text
 
         def callee(node):
-            text = ast.unparse(node)
-            first, dot, rest = text.partition(".")
-            imported = state.imports.get(first)
-            if imported:
-                text = imported[0] + (dot + rest if dot else "")
-            for package, alias in (("pandas", "pd"), ("polars", "pl"), ("awswrangler", "wr")):
-                if text.startswith(package + "."):
-                    return alias + text[len(package) :]
-            return text
+            """Render a call target's fully qualified name, resolving local import aliases.
+
+            Args:
+                node: The ``Call.func`` expression to render.
+
+            Returns:
+                str: The dotted callee text, as resolved by
+                :func:`~etl_parser.scanner.references.qualified_callee` against this
+                module's imports, so a call site resolves to the same sink table entry
+                here and in the standalone references pass.
+            """
+            return qualified_callee(node, {k: v[0] for k, v in state.imports.items()})
+
+        def is_udf(func):
+            """Whether a call target is a user-defined function applied to columns.
+
+            Recognises both spellings: a name bound to ``F.udf(...)``/``F.pandas_udf(...)``
+            and a function declared with a ``@udf``/``@pandas_udf`` decorator. The call
+            that *builds* a UDF is not itself a UDF application, so attribute targets such
+            as ``F.udf`` return ``False``.
+
+            Args:
+                func: The ``Call.func`` expression of the call being evaluated.
+
+            Returns:
+                bool: ``True`` when the call applies a UDF to its arguments.
+            """
+            if not isinstance(func, ast.Name):
+                return False
+            value = state.env.get(func.id)
+            if isinstance(value, Expression) and isinstance(value.node, ast.Call):
+                builder = callee(value.node.func).rsplit(".", 1)[-1]
+                if builder in {"udf", "pandas_udf"}:
+                    return True
+            function = state.functions.get(func.id)
+            return bool(function) and any(
+                unparse(decorator).rsplit(".", 1)[-1].partition("(")[0] in {"udf", "pandas_udf"}
+                for decorator in function.decorator_list
+            )
 
         def col_expr(node, frame):
+            """Evaluate a column expression and stamp it with its source location.
+
+            Thin wrapper around ``_col_expr`` that fills in ``source_file``/``line_start``/
+            ``line_end`` on the returned :class:`Column` when not already set, so every
+            column edge carries the location of the expression that produced it.
+
+            Args:
+                node: Expression node to evaluate as a column.
+                frame (Frame): Frame the expression is evaluated against.
+
+            Returns:
+                Column: The evaluated column, with location fields populated.
+            """
             column = _col_expr(node, frame)
             if column.source_file is None:
                 column.source_file = state.source.path
@@ -200,6 +585,26 @@ class PythonWorker:
             return column
 
         def _col_expr(node, frame):
+            """Evaluate an expression node to a :class:`Column`, tracking provenance.
+
+            Handles names bound to a tracked :class:`Column`/:class:`Expression`, literal
+            constants, subscript column access, attribute access on a tracked
+            :class:`Frame`, and a broad set of PySpark/pandas/polars column-function calls
+            (``col``, ``lit``, ``cast``/``astype``, ``over``, ``alias``/``name``, ``expr``,
+            aggregate functions, and a fixed list of scalar column functions). Any other
+            node falls back to combining the sources/partial state of its child expression
+            nodes. This is the recursive worker behind ``col_expr``, which is called instead
+            of it everywhere else in this function.
+
+            Args:
+                node: Expression node to evaluate.
+                frame (Frame): Frame the expression is evaluated against, used to resolve
+                    column references and aggregate group-by keys.
+
+            Returns:
+                Column: The evaluated column, without source-location fields set (those are
+                filled in by ``col_expr``).
+            """
             if isinstance(node, ast.Name) and isinstance(state.env.get(node.id), Column):
                 return copy.deepcopy(state.env[node.id])
             if isinstance(node, ast.Name) and isinstance(state.env.get(node.id), Expression):
@@ -224,22 +629,32 @@ class PythonWorker:
                     return owner.column(node.attr)
             if isinstance(node, ast.Call):
                 method = (
-                    node.func.attr
-                    if isinstance(node.func, ast.Attribute)
-                    else ast.unparse(node.func)
+                    node.func.attr if isinstance(node.func, ast.Attribute) else unparse(node.func)
                 )
+                if is_udf(node.func):
+                    # A UDF body is opaque: its arguments feed the output and nothing more
+                    # is known about how (design spec section 8.3).
+                    values = [col_expr(argument, frame) for argument in node.args]
+                    return Column(
+                        set().union(set(), *(v.sources for v in values)),
+                        unparse(node),
+                        "unknown",
+                        True,
+                        next((v.name for v in values if v.name), None),
+                        set().union(set(), *(v.indirect for v in values)),
+                    )
                 if method in {"col", "column"} and node.args:
                     name = folded(node.args[0])
                     return frame.column(name.text) if name.complete else Column(partial=True)
                 if method in {"lit", "literal"}:
-                    return Column(text=ast.unparse(node), kind="expression")
+                    return Column(text=unparse(node), kind="expression")
                 if method in {"cast", "astype"}:
                     value = col_expr(node.func.value, frame)
-                    value.text = ast.unparse(node)
+                    value.text = unparse(node)
                     return value
                 if method == "over":
                     value = col_expr(node.func.value, frame)
-                    value.kind, value.text = "window", ast.unparse(node)
+                    value.kind, value.text = "window", unparse(node)
                     for arg in node.args:
                         window = col_expr(arg, frame)
                         value.indirect |= window.sources | window.indirect
@@ -419,7 +834,7 @@ class PythonWorker:
                 )
                 return Column(
                     set().union(*(v.sources for v in values)),
-                    ast.unparse(node),
+                    unparse(node),
                     "window" if method == "over" else "aggregation" if aggregate else "expression",
                     not known or any(v.partial for v in values),
                     next((v.name for v in values if v.name), None),
@@ -430,13 +845,27 @@ class PythonWorker:
             ]
             return Column(
                 set().union(*(v.sources for v in children)),
-                ast.unparse(node),
+                unparse(node),
                 "expression",
                 any(v.partial for v in children),
                 indirect=set().union(*(v.indirect for v in children)),
             )
 
         def sql_expression(node, frame):
+            """Evaluate a raw SQL expression string (``F.expr``/``selectExpr``) via sqlglot.
+
+            Qualifies the text against a synthetic single-column-list relation built from
+            ``frame``'s known columns, then rewrites the resulting column edge's sources
+            back onto ``frame``'s actual column origins.
+
+            Args:
+                node: Expression node holding the SQL text (folded via ``concrete``).
+                frame (Frame): Frame whose columns the SQL expression is evaluated against.
+
+            Returns:
+                Column: The evaluated column. Marked ``partial`` when the text cannot be
+                folded to a concrete string or sqlglot produces no column edge for it.
+            """
             text = concrete(node, "dynamic_sql")
             if text is None:
                 return Column(partial=True)
@@ -462,6 +891,22 @@ class PythonWorker:
             )
 
         def select_frame(frame, args):
+            """Build a new frame containing only the selected columns/expressions.
+
+            Backs ``select``/``selectExpr``-style calls. Flattens list/tuple arguments,
+            expands a bare ``"*"`` string to all currently-known columns, and evaluates
+            non-string arguments as column expressions via ``col_expr``.
+
+            Args:
+                frame (Frame): Source frame the selection is applied to.
+                args: Sequence of AST argument nodes naming or computing output columns.
+
+            Returns:
+                Frame: A copy of ``frame`` with ``columns`` replaced by the selection and
+                ``open_columns`` set to ``False`` (except where ``"*"`` preserves it),
+                marked ``partial`` for any argument whose output column name could not be
+                determined.
+            """
             out = copy.deepcopy(frame)
             out.columns = {}
             out.open_columns = False
@@ -488,6 +933,16 @@ class PythonWorker:
             return out
 
         def frame_from_dataset(ds):
+            """Create a :class:`Frame` for a dataset read, recording it as a job input.
+
+            Args:
+                ds (str): Normalized dataset id being read.
+
+            Returns:
+                Frame: A frame sourced from ``ds``, with columns seeded from the schema
+                provider when available; ``open_columns`` is ``True`` when no schema was
+                found, since unlisted columns may still exist.
+            """
             inputs.add(ds)
             columns = self.sql.schema.columns(ds) if self.sql.schema else None
             return Frame(
@@ -497,6 +952,21 @@ class PythonWorker:
             )
 
         def write_frame(frame, ds, node):
+            """Record a dataset write: table edges from every known source, column edges.
+
+            Emits one ``TableEdge`` per source dataset ``frame`` was built from (or, when
+            ``frame`` is not a tracked :class:`Frame`, per input seen so far in this file,
+            conservatively) and, when ``frame`` is a tracked :class:`Frame`, one
+            ``ColumnEdge`` per known column. Records issues for an untracked write receiver,
+            an output with open (possibly incomplete) columns, and any column whose
+            provenance is only partially known.
+
+            Args:
+                frame (Frame): The frame being written, or any other tracked value when the
+                    write target could not be resolved to a frame.
+                ds (str): Normalized dataset id being written.
+                node: The write call node, used for its source text and line range.
+            """
             outputs.add(ds)
             refs = sorted(frame.sources) if isinstance(frame, Frame) else sorted(inputs)
             partial = not isinstance(frame, Frame) or frame.partial
@@ -509,13 +979,20 @@ class PythonWorker:
                         source_file=state.source.path,
                         line=node.lineno,
                         transformation=Transformation(
-                            expression=ast.unparse(node),
+                            expression=unparse(node),
                             source_file=state.source.path,
                             line_start=node.lineno,
                             line_end=getattr(node, "end_lineno", node.lineno),
                         ),
                         provenance=Provenance(
-                            parser="python_ast", confidence="partial" if partial else "exact"
+                            parser="python_ast",
+                            confidence=(
+                                "partial"
+                                if partial
+                                else "inferred"
+                                if isinstance(frame, Frame) and frame.inferred
+                                else "exact"
+                            ),
                         ),
                     )
                 )
@@ -529,8 +1006,23 @@ class PythonWorker:
             if frame.open_columns:
                 issue(node, "Output contains columns requiring an input schema", "missing_schema")
             for name, column in frame.columns.items():
-                confidence = "partial" if partial or column.partial else "exact"
-                if column.partial:
+                if not resolvable_column(name):
+                    # A placeholder is not a column name; report it instead of inventing one.
+                    issue(node, f"Output column name is unresolved: {name!r}", "unknown_column")
+                    continue
+                sources = sorted(s for s in column.sources if resolvable_column(s[1]))
+                indirect = sorted(
+                    s for s in frame.indirect | column.indirect if resolvable_column(s[1])
+                )
+                unnamed = len(sources) != len(column.sources)
+                confidence = (
+                    "partial"
+                    if partial or column.partial or unnamed
+                    else "inferred"
+                    if frame.inferred
+                    else "exact"
+                )
+                if column.partial or unnamed:
                     issue(
                         node,
                         f"Output {name!r} contains unresolved columns or unsupported expressions",
@@ -539,13 +1031,8 @@ class PythonWorker:
                 result.column_edges.append(
                     ColumnEdge(
                         target=ColumnRef(dataset_id=ds, name=name),
-                        sources=[
-                            ColumnRef(dataset_id=d, name=c) for d, c in sorted(column.sources)
-                        ],
-                        indirect_sources=[
-                            ColumnRef(dataset_id=d, name=c)
-                            for d, c in sorted(frame.indirect | column.indirect)
-                        ],
+                        sources=[ColumnRef(dataset_id=d, name=c) for d, c in sources],
+                        indirect_sources=[ColumnRef(dataset_id=d, name=c) for d, c in indirect],
                         transformation=Transformation(
                             expression=column.text,
                             kind=column.kind,
@@ -562,6 +1049,24 @@ class PythonWorker:
                 )
 
         def invoke(function, args, keywords, module_state):
+            """Bind arguments and run a function body under its own interpreter state.
+
+            Guards against unbounded recursion/import depth via ``active`` and
+            ``max_import_depth``, binds positional and keyword arguments (falling back to
+            evaluated defaults, or an unknown placeholder when neither is supplied) into a
+            copy of ``module_state``'s environment, then interprets the function body.
+
+            Args:
+                function (ast.FunctionDef): The function to invoke.
+                args (list): Already-evaluated positional argument values.
+                keywords (dict): Already-evaluated keyword argument values by name.
+                module_state (State): The state of the module ``function`` is defined in,
+                    used as the base environment for the call.
+
+            Returns:
+                The function's ``return`` value, as produced by ``statements``, or ``None``
+                when the recursion/depth limit is reached or the function has no return.
+            """
             nonlocal state
             key = (module_state.source.path, function.name)
             if key in active or module_state.depth > self.max_import_depth:
@@ -583,15 +1088,36 @@ class PythonWorker:
             active.add(key)
             invoked.add(key)
             try:
-                return statements(function.body)
+                returned = statements(function.body)
+                if isinstance(returned, Frame):
+                    # A frame that reached here came through a helper call: a heuristic.
+                    returned = copy.deepcopy(returned)
+                    returned.inferred = True
+                return None if returned is NO_RETURN else returned
             finally:
                 active.remove(key)
                 state = old
 
         def imported_state(module, level=0):
+            """Resolve and load a helper module's definitions (functions and constants).
+
+            Loads only import/function/assignment statements (``definitions_only=True``),
+            so importing a helper module never executes its top-level side effects, and
+            guards against re-entering a module already being loaded or exceeding
+            ``max_import_depth``.
+
+            Args:
+                module (str): Dotted module name to resolve.
+                level (int): Relative import level; ``0`` for an absolute import.
+
+            Returns:
+                State | None: The loaded module's state, or ``None`` when ``self.index`` is
+                unset, the module cannot be resolved, it is already being loaded (import
+                cycle), or the depth limit is reached.
+            """
             if not self.index:
                 return None
-            helper = self.index.resolve_module(module, state.source, level)
+            helper = resolve_import(module, level, state.source, self.index)
             if helper is None:
                 return None
             if helper.path in loading_modules or state.depth >= self.max_import_depth:
@@ -605,8 +1131,51 @@ class PythonWorker:
             return module_state
 
         def evaluate(node):
+            """Evaluate an arbitrary AST expression to its tracked runtime-shaped value.
+
+            This is the interpreter's dispatch core. Depending on ``node`` it returns: the
+            bound value or a folded string for a ``Name``; a :class:`Folded` constant; a
+            folded string, or a column-tracking :class:`Column` for arithmetic/f-strings
+            that touch frame columns; a :class:`Frame`/:class:`Column`/folded value for
+            subscript access (list/tuple selection, string column access, group-by-aware
+            single-key access, or an indexed slice); a :class:`Reader` builder, a resolved
+            attribute, or a folded value for attribute access; and, for calls, one of many
+            outcomes depending on the callee: an invoked helper function's return value; a
+            :class:`Connection` for ``create_engine``/``connect``; an updated
+            :class:`Reader` for builder calls (``format``/``option``/``options``); a
+            :class:`Column` for calls on a tracked column; an updated :class:`Frame` for
+            supported chained DataFrame operations (``select``, ``withColumn``, ``rename``,
+            ``drop``, ``filter``/``where``, ``join``/``merge``, ``groupBy``/``agg``,
+            ``union``, and several no-op passthroughs), with unsupported operations
+            downgrading the frame to ``partial`` and recording an issue; for a call matching
+            the sink table, a new input :class:`Frame`, the write receiver echoed back after
+            recording a write, or ``None`` after a SQL write; an :class:`Expression` for
+            unresolved ``pyspark.sql.functions``/``Window``-style calls; or a folded value
+            as the fallback.
+
+            Args:
+                node: Expression node to evaluate, or ``None``.
+
+            Returns:
+                The tracked value described above, or ``None`` when ``node`` is ``None`` or
+                the call could not be resolved to a usable value (dataset argument missing,
+                SQL write with no output frame requested, and similar cases handled by
+                returning ``None``).
+            """
             if node is None:
                 return None
+            if isinstance(node, ast.NamedExpr):
+                # Walrus: bind the name, then behave as the assigned expression.
+                value = evaluate(node.value)
+                if isinstance(node.target, ast.Name):
+                    state.env[node.target.id] = value
+                return value
+            if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+                # Container elements are real call sites; a tuple assignment reads them.
+                values = [evaluate(element) for element in node.elts]
+                if any(isinstance(v, (Frame, Column)) for v in values):
+                    return values
+                return folded(node)
             if isinstance(node, ast.Name):
                 return state.env.get(node.id, folded(node))
             if isinstance(node, ast.Constant):
@@ -633,7 +1202,7 @@ class PythonWorker:
                     return out
                 return folded(node)
             if isinstance(node, ast.Attribute):
-                if node.attr == "read" and ast.unparse(node.value) in {"spark", "sqlContext"}:
+                if node.attr == "read" and unparse(node.value) in {"spark", "sqlContext"}:
                     return Reader()
                 base = evaluate(node.value)
                 if isinstance(base, State):
@@ -654,7 +1223,7 @@ class PythonWorker:
                     {k: evaluate(v) for k, v in keywords.items()},
                     state,
                 )
-            first = ast.unparse(node.func).split(".")[0]
+            first = unparse(node.func).split(".")[0]
             imported = state.imports.get(first)
             if imported and self.index:
                 module_name, level = imported
@@ -707,6 +1276,9 @@ class PythonWorker:
                     if resolved is not None:
                         reader.options[key] = ast.Constant(resolved)
                 return reader
+            if isinstance(receiver, Connection) and method in {"cursor", "connect", "begin"}:
+                # A cursor speaks its connection's dialect (review finding 34).
+                return receiver
             if isinstance(receiver, Column):
                 return col_expr(node, Frame())
             if isinstance(receiver, Frame) and method not in {
@@ -737,13 +1309,27 @@ class PythonWorker:
                             import sqlglot
 
                             expr = sqlglot.parse_one(text, read="spark")
+                            if isinstance(expr, sqlglot.exp.Star):
+                                # "*" is every known column, not a column named "*".
+                                out.columns.update(copy.deepcopy(receiver.columns))
+                                out.open_columns |= receiver.open_columns
+                                continue
                             value = sql_expression(ast.Constant(expr.unalias().sql()), receiver)
-                            out.columns[expr.alias_or_name] = value
+                            if resolvable_column(expr.alias_or_name):
+                                out.columns[expr.alias_or_name] = value
+                            else:
+                                out.partial = True
+                                issue(arg, "Cannot determine output column name", "unknown_column")
                     else:
                         out = select_frame(receiver, node.args)
                 elif method in {"withColumn", "with_columns", "assign"}:
                     if method == "withColumn":
-                        out.columns[folded(node.args[0]).text] = col_expr(node.args[1], receiver)
+                        name = folded(node.args[0]).text
+                        if resolvable_column(name):
+                            out.columns[name] = col_expr(node.args[1], receiver)
+                        else:
+                            out.partial = True
+                            issue(node, "Cannot determine output column name", "unknown_column")
                     elif method == "assign":
                         for key, value in keywords.items():
                             if isinstance(value, ast.Lambda):
@@ -883,7 +1469,7 @@ class PythonWorker:
                     for key, value in keywords.items():
                         if isinstance(value, ast.Tuple) and len(value.elts) == 2:
                             col = receiver.column(folded(value.elts[0]).text)
-                            col.kind, col.text = "aggregation", ast.unparse(value)
+                            col.kind, col.text = "aggregation", unparse(value)
                             out.columns[key] = col
                 elif method in {"sum", "mean", "min", "max", "count"}:
                     if receiver.group:
@@ -893,7 +1479,7 @@ class PythonWorker:
                                 col.text = f"{method}({col.text})"
                         out.open_columns = False
                     else:
-                        return Column(text=ast.unparse(node), kind="aggregation")
+                        return Column(text=unparse(node), kind="aggregation")
                 elif method in {"union", "unionByName", "vstack"}:
                     right = evaluate(node.args[0])
                     if isinstance(right, Frame):
@@ -902,29 +1488,55 @@ class PythonWorker:
                         out.partial |= right.partial
                         out.open_columns |= right.open_columns
                         for position, key in enumerate(list(out.columns)):
-                            right_key = (
-                                key
-                                if method != "union"
-                                else (
-                                    list(right.columns)[position]
-                                    if position < len(right.columns)
-                                    else ""
-                                )
-                            )
+                            right_key = key
+                            if method == "union":
+                                # Positional union: the right frame's column list must be
+                                # known, or the branch's contribution cannot be named.
+                                if position >= len(right.columns):
+                                    out.columns[key].partial = True
+                                    issue(
+                                        node,
+                                        f"Union branch has no column matching position "
+                                        f"{position} for {key!r}",
+                                        "unknown_column",
+                                    )
+                                    continue
+                                right_key = list(right.columns)[position]
                             col = right.column(right_key)
                             out.columns[key].sources |= col.sources
                             out.columns[key].partial |= col.partial
+                            out.columns[key].indirect |= col.indirect
+                            # A union column is derived the way either branch derived it.
+                            kinds = {out.columns[key].kind, col.kind} - {"identity"}
+                            out.columns[key].kind = (
+                                kinds.pop()
+                                if len(kinds) == 1
+                                else "expression"
+                                if kinds
+                                else "identity"
+                            )
                         if method == "unionByName":
                             for key in right.columns.keys() - out.columns.keys():
                                 out.columns[key] = right.columns[key]
                     else:
                         out.partial = True
+                elif method in {"format", "option", "options"}:
+                    # Writer builder options; ".option('path', ...)" names the output.
+                    if method == "option" and len(node.args) >= 2:
+                        out.write_options[folded(node.args[0]).text] = node.args[1]
+                    elif method == "options":
+                        out.write_options.update(keywords)
+                    elif node.args:
+                        out.write_options["format"] = node.args[0]
+                    # Capture the path at the builder call, not after a later reassignment.
+                    path = out.write_options.get("path")
+                    if path is not None and not isinstance(path, ast.Constant):
+                        resolved = concrete(path, "dynamic_path")
+                        if resolved is not None:
+                            out.write_options["path"] = ast.Constant(resolved)
                 elif method in {
                     "mode",
                     "partitionBy",
-                    "format",
-                    "option",
-                    "options",
                     "copy",
                     "dropDuplicates",
                     "drop_duplicates",
@@ -946,6 +1558,8 @@ class PythonWorker:
                 else:
                     out.partial = True
                     issue(node, f"Frame method {method!r} has no handler", "unknown_column")
+                    for argument in [*node.args, *(kw.value for kw in node.keywords)]:
+                        evaluate(argument)
                 return out
 
             sink = match_sink(name)
@@ -959,7 +1573,27 @@ class PythonWorker:
                 "table",
             }:
                 sink = match_sink("read." + method)
+            if isinstance(receiver, Frame) and method in {
+                "parquet",
+                "csv",
+                "json",
+                "orc",
+                "text",
+                "save",
+            }:
+                # Writer builder chains (df.write.mode(...).parquet(path)) lose the
+                # "write." prefix from the callee text, so resolve them the way readers are.
+                writer = match_sink("write." + method)
+                sink = writer if writer and writer.direction == "write" else sink
             if method in {"load", "save"} and not isinstance(receiver, (Reader, Frame)):
+                sink = None
+            if (
+                sink
+                and sink.callee in {"execute", "executemany"}
+                and not isinstance(receiver, Connection)
+            ):
+                # Any object can have an "execute" method; only a connection or cursor
+                # makes its first argument SQL (review finding 32).
                 sink = None
             if sink:
                 arg = (
@@ -969,6 +1603,8 @@ class PythonWorker:
                 )
                 if arg is None and isinstance(receiver, Reader):
                     arg = receiver.options.get("path")
+                if arg is None and isinstance(receiver, Frame):
+                    arg = receiver.write_options.get("path")
                 if arg is None:
                     # Builder calls such as .load() require option tracking, not a guessed path.
                     issue(node, "Dataset argument is unavailable", "dynamic_table_name")
@@ -984,7 +1620,7 @@ class PythonWorker:
                     (
                         list(arg.elts)
                         if isinstance(arg, (ast.List, ast.Tuple))
-                        else list(node.args)
+                        else (list(node.args) or [arg])
                         if isinstance(receiver, Reader) and method == "parquet"
                         else [arg]
                     )
@@ -1001,6 +1637,9 @@ class PythonWorker:
                         if len(node.args) > 1
                         else evaluate(keywords.get("con") or keywords.get("connection"))
                     )
+                    if not isinstance(connection, Connection) and isinstance(receiver, Connection):
+                        # conn.cursor().execute(...): the receiver carries the dialect.
+                        connection = receiver
                     engine = (
                         connection.engine if isinstance(connection, Connection) else default_engine
                     )
@@ -1058,6 +1697,16 @@ class PythonWorker:
                     )
 
                 def dataset_id(text):
+                    """Normalize a resolved path/table string to a canonical dataset id.
+
+                    Args:
+                        text (str): The resolved path or table name.
+
+                    Returns:
+                        str: ``"file://" + text`` for a bare path-scheme value with no
+                        scheme prefix, otherwise the result of
+                        :func:`~etl_parser.identity.normalize_dataset_id`.
+                    """
                     if sink.scheme == "path" and "://" not in text:
                         return "file://" + text
                     return normalize_dataset_id(text, engine=engine, default_db=self.default_db)
@@ -1089,13 +1738,41 @@ class PythonWorker:
                 ("F.", "pl.", "pyspark.sql.functions.", "Window.", "pyspark.sql.Window.")
             ):
                 return Expression(node)
+            # An unknown call is still a call: its arguments may read datasets.
+            for argument in [*node.args, *(kw.value for kw in node.keywords)]:
+                evaluate(argument)
             return folded(node)
 
         def statements(body):
+            """Interpret a sequence of statements against the current interpreter state.
+
+            Handles function/class-level definitions (registered for later calls, not
+            executed), imports (resolved via ``imported_state``), assignments (including
+            subscript assignment onto a tracked :class:`Frame`'s columns), bare expression
+            statements, ``return``, ``if``/``else`` (both branches are interpreted from a
+            shared starting environment and merged afterward, with divergent values
+            downgraded to a :class:`Frame` union or an unknown placeholder), ``with``, a
+            bounded ``for`` loop over a literal list/tuple with no ``break``/``continue``/
+            ``return`` in its body (interpreted once per item), and other loops/``try``
+            blocks (interpreted once conservatively, with every tracked frame marked
+            partial afterward). Any exception raised while interpreting one statement is
+            caught and recorded as an issue rather than aborting the rest of the body.
+
+            Args:
+                body (list): Sequence of statement nodes to interpret.
+
+            Returns:
+                The value of a ``return`` statement encountered directly in ``body``, or
+                ``None`` when none is reached.
+            """
+            pending = NO_RETURN
             for node in body:
                 try:
                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         state.functions[node.name] = node
+                    elif isinstance(node, ast.ClassDef):
+                        # Class bodies read datasets too; methods register as functions.
+                        pending = merge_returns(pending, statements(node.body))
                     elif isinstance(node, ast.Import):
                         for alias in node.names:
                             state.imports[alias.asname or alias.name] = (alias.name, 0)
@@ -1117,36 +1794,66 @@ class PythonWorker:
                         for target in targets:
                             if isinstance(target, ast.Name):
                                 state.env[target.id] = value
+                            elif isinstance(target, (ast.Tuple, ast.List)):
+                                # Unpacking: bind each name to its own element.
+                                items = value if isinstance(value, list) else []
+                                for element, item in zip(target.elts, items, strict=False):
+                                    if isinstance(element, ast.Name):
+                                        state.env[element.id] = item
+                                for element in target.elts[len(items) :]:
+                                    if isinstance(element, ast.Name):
+                                        state.env[element.id] = Folded("{{?}}", False, [element.id])
                             elif isinstance(target, ast.Subscript):
                                 frame = evaluate(target.value)
                                 if isinstance(frame, Frame):
                                     frame.columns[folded(target.slice).text] = col_expr(
                                         node.value, frame
                                     )
+                    elif isinstance(node, ast.AugAssign):
+                        # "t += x" is "t = t + x"; folding it keeps the name concrete.
+                        combined = ast.copy_location(
+                            ast.BinOp(
+                                left=ast.copy_location(
+                                    ast.Name(id=getattr(node.target, "id", ""), ctx=ast.Load()),
+                                    node,
+                                ),
+                                op=node.op,
+                                right=node.value,
+                            ),
+                            node,
+                        )
+                        value = evaluate(combined)
+                        if isinstance(node.target, ast.Name):
+                            state.env[node.target.id] = value
                     elif isinstance(node, ast.Expr):
                         evaluate(node.value)
                     elif isinstance(node, ast.Return):
-                        return evaluate(node.value)
+                        return merge_returns(pending, evaluate(node.value))
                     elif isinstance(node, ast.If):
-                        if "__name__" in ast.unparse(node.test):
-                            statements(node.body)
+                        if "__name__" in unparse(node.test):
+                            pending = merge_returns(pending, statements(node.body))
                         else:
+                            evaluate(node.test)
                             original = copy.deepcopy(state.env)
-                            statements(node.body)
+                            taken = statements(node.body)
                             left = state.env
                             state.env = copy.deepcopy(original)
-                            statements(node.orelse)
+                            skipped = statements(node.orelse)
                             for key in set(left) | set(state.env):
                                 a, b = left.get(key), state.env.get(key)
                                 if a != b:
                                     if isinstance(a, Frame) and isinstance(b, Frame):
-                                        a.sources |= b.sources
-                                        a.partial = True
-                                        state.env[key] = a
+                                        state.env[key] = merge_returns(a, b)
                                     else:
                                         state.env[key] = Folded("{{?}}", False, [key])
+                            if taken is not NO_RETURN and skipped is not NO_RETURN:
+                                # Every path through this statement returns.
+                                return merge_returns(pending, merge_returns(taken, skipped))
+                            pending = merge_returns(pending, merge_returns(taken, skipped))
                     elif isinstance(node, (ast.With, ast.AsyncWith)):
-                        statements(node.body)
+                        returned = statements(node.body)
+                        if returned is not NO_RETURN:
+                            return merge_returns(pending, returned)
                     elif (
                         isinstance(node, ast.For)
                         and isinstance(node.target, ast.Name)
@@ -1163,17 +1870,57 @@ class PythonWorker:
                             state.env[node.target.id] = evaluate(item)
                             statements(node.body)
                         statements(node.orelse)
-                    elif isinstance(node, (ast.For, ast.While, ast.Try)):
-                        issue(node, "Dynamic control flow analyzed conservatively")
-                        statements(node.body)
+                    elif isinstance(node, (ast.For, ast.AsyncFor, ast.While, ast.Try, ast.Match)):
+                        issue(
+                            node,
+                            "Dynamic control flow analyzed conservatively",
+                            "analysis_note",
+                        )
+                        bodies = []
+                        if isinstance(node, (ast.For, ast.AsyncFor)):
+                            iterated = evaluate(node.iter)
+                            if isinstance(node.target, ast.Name):
+                                state.env[node.target.id] = (
+                                    iterated
+                                    if isinstance(iterated, Frame)
+                                    else Folded("{{?}}", False, [node.target.id])
+                                )
+                            bodies = [node.body, node.orelse]
+                        elif isinstance(node, ast.While):
+                            evaluate(node.test)
+                            bodies = [node.body, node.orelse]
+                        elif isinstance(node, ast.Match):
+                            evaluate(node.subject)
+                            bodies = [case.body for case in node.cases]
+                        else:
+                            # Every part of a try statement can run, handlers included.
+                            bodies = [
+                                node.body,
+                                *(handler.body for handler in node.handlers),
+                                node.orelse,
+                                node.finalbody,
+                            ]
+                        for branch in bodies:
+                            pending = merge_returns(pending, statements(branch))
                         for value in state.env.values():
                             if isinstance(value, Frame):
                                 value.partial = True
                 except Exception as exc:
                     issue(node, f"{type(exc).__name__}: {exc}")
-            return None
+            return pending
 
         def load_module(source, module_state, definitions_only=False):
+            """Parse a module and interpret its body under ``module_state``.
+
+            Args:
+                source (SourceFile): The module to parse and interpret.
+                module_state (State): The state to interpret the module's body under; made
+                    the active ``state`` for the duration of this call.
+                definitions_only (bool): When ``True``, only ``Import``, ``ImportFrom``,
+                    ``FunctionDef``, ``AsyncFunctionDef``, ``Assign``, and ``AnnAssign``
+                    top-level statements are interpreted, so loading a helper module never
+                    runs its other top-level side effects.
+            """
             nonlocal state
             old, state = state, module_state
             try:

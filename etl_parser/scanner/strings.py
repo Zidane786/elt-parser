@@ -1,8 +1,16 @@
 """Reconstruct string values from Python AST nodes without executing code.
 
-Literal parts join directly. Names resolve through an environment of module-level constants.
-Anything else becomes a ``{{?}}`` placeholder and the result is marked incomplete, so callers
-can decide whether the unknown part affects table or column identity.
+This is the constant folder used by design section 8.2 step 2-3 (PythonWorker string
+reconstruction for SQL-carrying calls and table/path arguments) and by ``AirflowWorker``
+(section 8.4) to resolve ``dag_id``, ``schedule``, and operator arguments statically.
+Literal parts join directly. Names resolve through an ``env`` mapping of module-level
+constants and other already-folded values supplied by the caller. Anything that cannot be
+resolved becomes a ``{{?}}`` placeholder and the result is marked incomplete (``Folded.
+complete = False``), so callers can decide whether the unresolved part affects table or
+column identity, or can be safely ignored (e.g. a date filter literal).
+
+Entry points: ``fold_string`` (fold one AST node) and ``collect_constants`` (fold every
+module-level assignment into an environment for later ``fold_string`` calls).
 """
 
 from __future__ import annotations
@@ -18,6 +26,24 @@ PLACEHOLDER = "{{?}}"
 
 @dataclass
 class Folded:
+    """Result of folding a Python AST expression to a string, with provenance of gaps.
+
+    Attributes:
+        text: The folded text. When ``complete`` is ``False`` this contains ``{{?}}``
+            placeholders in place of unresolved parts.
+        complete: Whether every part of the expression was statically resolved.
+        placeholders: Names or descriptions of the parts that could not be resolved, in
+            the order encountered.
+        assumptions: Values substituted for unresolved parts that came with an explicit
+            default, keyed by a description of the source (for example ``"env:HOST"`` for
+            an ``os.environ.get("HOST", ...)`` default). Recorded so callers can flag that
+            the folded text depends on an assumed value even though ``complete`` is
+            ``True``.
+        value_type: Python type name (``"str"``, ``"int"``, ``"float"``, ``"bool"``,
+            ``"NoneType"``) of the original value, used to convert ``text`` back with
+            ``_native`` for arithmetic and formatting.
+    """
+
     text: str
     complete: bool
     placeholders: list[str] = field(default_factory=list)
@@ -26,6 +52,15 @@ class Folded:
 
 
 def _native(value: Folded):
+    """Convert a ``Folded`` value's text back to its original Python type.
+
+    Args:
+        value: A folded value whose ``value_type`` names the type to convert to.
+
+    Returns:
+        The text converted to ``int``, ``float``, ``bool``, or ``None``, or the text
+        unchanged for ``value_type == "str"``.
+    """
     if value.value_type == "int":
         return int(value.text)
     if value.value_type == "float":
@@ -38,10 +73,33 @@ def _native(value: Folded):
 
 
 def _bounded_spec(spec: str) -> bool:
+    """Check that a format spec's numeric widths are small enough to fold safely.
+
+    Guards against pathological ``format``/``%``-style width or precision numbers that
+    would make constructing the formatted string expensive.
+
+    Args:
+        spec: A format spec or ``%``-style conversion string.
+
+    Returns:
+        ``True`` when every number embedded in ``spec`` is at most 10000.
+    """
     return all(int(n) <= 10000 for n in re.findall(r"\d+", spec))
 
 
 def _combine(text: str, values: list[Folded]) -> Folded:
+    """Build a ``Folded`` result from the pieces that were folded to produce ``text``.
+
+    Args:
+        text: The combined text.
+        values: The ``Folded`` pieces that contributed to ``text``, used to merge
+            ``complete``, ``placeholders``, and ``assumptions``.
+
+    Returns:
+        A ``Folded`` whose ``complete`` is ``True`` only if every piece is complete, whose
+        ``placeholders`` is the deduplicated union of the pieces', in order, and whose
+        ``assumptions`` is the union of the pieces'.
+    """
     return Folded(
         text,
         all(v.complete for v in values),
@@ -51,6 +109,14 @@ def _combine(text: str, values: list[Folded]) -> Folded:
 
 
 def _name_of(node: ast.AST) -> str:
+    """Return a short human-readable name for an AST node, for use in a placeholder.
+
+    Args:
+        node: The AST node that could not be folded.
+
+    Returns:
+        ``ast.unparse(node)``, or the node's class name when unparsing fails.
+    """
     try:
         return ast.unparse(node)
     except Exception:  # pragma: no cover
@@ -58,6 +124,27 @@ def _name_of(node: ast.AST) -> str:
 
 
 def fold_string(node: ast.AST | None, env: Mapping[str, str | Folded] | None = None) -> Folded:
+    """Statically fold an AST expression to its string value, without executing code.
+
+    Recursively handles string and numeric literals, f-strings (``JoinedStr``), name and
+    attribute lookups against ``env``, string concatenation (``+``) and ``%``-formatting
+    (``BinOp``), ``str.format``/``.join``/``.strip``/``.lower``/``.upper`` calls,
+    ``os.environ``/``os.getenv`` lookups (via ``_environ_default``), and ``str(...)``.
+    Anything else, including calls to unknown functions, folds to the ``{{?}}``
+    placeholder. This is the core of PythonWorker's SQL string reconstruction and
+    AirflowWorker's DAG/operator argument resolution (design section 8.2 step 2-3).
+
+    Args:
+        node: The AST expression to fold, or ``None``.
+        env: Names available for substitution, typically module-level constants from
+            ``collect_constants`` plus caller-supplied bindings (for example
+            ``env:VAR_NAME`` keys for known environment variable values).
+
+    Returns:
+        A ``Folded`` value. ``complete`` is ``True`` only when every referenced name and
+        sub-expression was resolved; otherwise ``text`` contains ``{{?}}`` in place of the
+        unresolved parts and ``placeholders`` names them.
+    """
     env = env or {}
     if node is None:
         return Folded(PLACEHOLDER, False, ["<missing>"])
@@ -163,9 +250,20 @@ def fold_string(node: ast.AST | None, env: Mapping[str, str | Folded] | None = N
 
 
 def _environ_default(node: ast.AST, env: Mapping[str, str | Folded]) -> Folded | None:
-    """``os.environ.get("X", "dflt")`` / ``os.getenv("X", "dflt")`` -> default value.
+    """Fold ``os.environ.get``, ``os.getenv``, and ``os.environ[...]`` lookups.
 
+    ``os.environ.get("X", "dflt")`` and ``os.getenv("X", "dflt")`` fold to their default
+    value, recorded in ``Folded.assumptions`` under an ``env:X`` key. A caller-supplied
+    ``env:X`` binding in ``env`` takes precedence over the literal default.
     ``os.environ["X"]`` has no default and stays a placeholder that names the variable.
+
+    Args:
+        node: The ``Call`` or ``Subscript`` node to check.
+        env: Environment used to resolve the key and any caller-supplied ``env:X`` value.
+
+    Returns:
+        The folded default value when ``node`` matches one of the recognised environment
+        lookup patterns, otherwise ``None`` (not an environment lookup at all).
     """
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         base = ast.unparse(node.func.value)
@@ -200,6 +298,21 @@ def _environ_default(node: ast.AST, env: Mapping[str, str | Folded]) -> Folded |
 
 
 def _apply_percent(template: Folded, values: list[Folded]) -> Folded:
+    """Apply ``%``-style formatting (``template % values``) to already-folded pieces.
+
+    Substitutes ``%s``/``%%`` positionally even when some ``values`` are incomplete, so
+    the resolved pieces still contribute to the output text.
+
+    Args:
+        template: The folded left-hand side format string.
+        values: The folded right-hand side values, one per ``%`` conversion.
+
+    Returns:
+        The folded formatted string. Falls back to a ``{{?}}`` placeholder when
+        ``template`` is incomplete, when formatting raises, when a format width exceeds
+        the safety bound checked by ``_bounded_spec``, or when a conversion other than
+        ``%s``/``%%`` is used while some ``values`` are incomplete.
+    """
     if not template.complete:
         return Folded(
             template.text,
@@ -245,6 +358,20 @@ def _apply_percent(template: Folded, values: list[Folded]) -> Folded:
 def _apply_format(
     template: Folded, positional: list[Folded], keywords: dict[str, Folded]
 ) -> Folded:
+    """Apply ``str.format``-style substitution to already-folded pieces.
+
+    Args:
+        template: The folded string being formatted (the receiver of ``.format(...)``).
+        positional: Folded positional arguments, indexed by ``{}`` auto-numbering or an
+            explicit ``{0}``-style index.
+        keywords: Folded keyword arguments, matched by ``{name}`` fields.
+
+    Returns:
+        The folded formatted string, with an unresolved field folded to the ``{{?}}``
+        placeholder while resolved fields are still substituted. Falls back to a
+        placeholder for the whole result when ``template`` is incomplete or its format
+        spec cannot be parsed.
+    """
     if not template.complete:
         return Folded(template.text, False, template.placeholders)
     used = [template]
@@ -280,7 +407,19 @@ def _apply_format(
 
 
 def collect_constants(tree: ast.Module) -> dict[str, str]:
-    """Module-level ``NAME = <foldable>`` assignments, resolved in order."""
+    """Fold every module-level ``NAME = <foldable>`` assignment into an environment.
+
+    Assignments are resolved in source order, so a later constant can reference an
+    earlier one. Used to build the ``env`` passed to ``fold_string`` when reconstructing
+    SQL text and Airflow DAG/operator arguments elsewhere in a module.
+
+    Args:
+        tree: The parsed module.
+
+    Returns:
+        Mapping of constant name to its folded text. A name whose value could not be
+        fully folded is omitted (and removed if a prior assignment to it had succeeded).
+    """
     env: dict[str, str] = {}
     for stmt in tree.body:
         targets: list[ast.expr] = []
