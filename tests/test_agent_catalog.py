@@ -123,3 +123,79 @@ def test_prior_scripts_match_in_priority_order_and_unmatched_are_kept_last():
     ]
     assert catalog["scripts"][-1] == prior["scripts"][-1]
     assert [s["job_id"] for s in catalog["scripts"][:4]] == ["alpha", "beta", "delta", "gamma"]
+
+
+def test_prior_descriptions_are_marked_human_and_empty_ones_unmarked(prior, fixture_document):
+    catalog = export_agent_catalog(fixture_document, prior)
+    assert all(s["description_source"] == "human" for s in catalog["scripts"])
+    for database in catalog["databases"]:
+        assert database["description_source"] == "human"
+        for table in database["tables"]:
+            assert (table.get("description_source") == "human") is bool(table["description"])
+            for column in table["schema"]:
+                has_text = bool(column.get("description"))
+                assert (column.get("description_source") == "human") is has_text
+
+
+def test_script_description_falls_back_to_docstring_first_line(fixture_document):
+    catalog = export_agent_catalog(fixture_document)
+    jobs = {j.id: j for j in fixture_document.jobs}
+    assert len(catalog["scripts"]) == 28
+    for script in catalog["scripts"]:
+        assert script["description"] == jobs[script["job_id"]].description
+        assert script["description_source"] == "code"
+
+
+def test_code_sourced_script_description_refreshes_but_human_text_is_kept():
+    doc = LineageDocument(
+        jobs=[
+            Job(id="a", name="a", source_file="a.py", description="New docstring."),
+            Job(id="b", name="b", source_file="b.py", description="Docstring."),
+            Job(id="c", name="c", source_file="c.py"),
+        ]
+    )
+    prior = {
+        "scripts": [
+            {
+                "job_id": "a",
+                "script_path": "a.py",
+                "description": "Old",
+                "description_source": "code",
+            },
+            {"job_id": "b", "script_path": "b.py", "description": "Analyst text"},
+            {"job_id": "c", "script_path": "c.py", "description": ""},
+        ]
+    }
+    scripts = {s["job_id"]: s for s in export_agent_catalog(doc, prior)["scripts"]}
+    assert scripts["a"]["description"] == "New docstring."
+    assert scripts["a"]["description_source"] == "code"
+    assert scripts["b"]["description"] == "Analyst text"
+    assert scripts["b"]["description_source"] == "human"
+    assert scripts["c"]["description"] == "" and "description_source" not in scripts["c"]
+
+
+def test_ai_description_keys_on_prior_columns_are_preserved():
+    doc = LineageDocument(
+        datasets=[DatasetRef(id="glue://db/t", namespace="glue://db", name="t", columns=["x"])]
+    )
+    column = {
+        "field_name": "x",
+        "description": "Model text",
+        "description_source": "ai",
+        "ai_confidence": 0.8,
+        "ai_rationale": "Derived from the expression.",
+        "ai_model": "example-model",
+    }
+    prior = {
+        "databases": [
+            {
+                "db_name": "db",
+                "db_type": "athena",
+                "description": "",
+                "tables": [{"table_name": "t", "description": "", "schema": [dict(column)]}],
+            }
+        ]
+    }
+    exported = export_agent_catalog(doc, prior)["databases"][0]["tables"][0]["schema"][0]
+    assert exported == column
+    assert "description_source" not in export_agent_catalog(doc, prior)["databases"][0]

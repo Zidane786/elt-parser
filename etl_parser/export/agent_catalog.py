@@ -86,6 +86,58 @@ def _find_database(databases, namespace, scheme):
     return None
 
 
+def _mark_description(entry, source="human"):
+    """Stamp ``description_source`` on an entry that has a description but no source.
+
+    Entries whose source is already recorded (``ai``, ``inherited``, ``code``, ...) are
+    left untouched, so AI keys such as ``ai_confidence`` and ``ai_model`` survive as they
+    were written. Empty descriptions get no source.
+
+    Args:
+        entry: A database, table, column or script dict.
+        source: The source to record when none is present.
+    """
+    if entry.get("description") and not entry.get("description_source"):
+        entry["description_source"] = source
+
+
+def _mark_human_descriptions(databases):
+    """Mark every prior database, table and column description without a source as human.
+
+    Args:
+        databases: The catalog ``databases`` list, mutated in place.
+    """
+    for database in databases:
+        _mark_description(database)
+        for table in database.get("tables", []):
+            _mark_description(table)
+            for column in table.get("schema", []):
+                _mark_description(column)
+
+
+def _script_description(old, job):
+    """Choose a script's description and its source.
+
+    Prior text written by a person or the AI layer is kept; text this exporter derived
+    from code earlier is refreshed from the job's docstring, as is an empty description.
+
+    Args:
+        old: The matched prior script entry (possibly empty).
+        job: The scanned :class:`~etl_parser.models.Job`.
+
+    Returns:
+        dict: ``{"description": str}`` plus ``description_source`` when the text is
+        non-empty.
+    """
+    text = old.get("description") or ""
+    source = old.get("description_source")
+    if text and source != "code":
+        return {"description": text, "description_source": source or "human"}
+    if job.description:
+        return {"description": job.description, "description_source": "code"}
+    return {"description": ""}
+
+
 def _path_suffix_match(prior_path, source_file):
     """Tell whether two script paths denote the same file up to a directory prefix.
 
@@ -164,6 +216,7 @@ def export_agent_catalog(doc, prior=None):
     """
     catalog = copy.deepcopy(prior) if prior is not None else {"databases": [], "relations": []}
     databases = catalog.setdefault("databases", [])
+    _mark_human_descriptions(databases)
     prior_scripts, unmatched_scripts = _match_prior_scripts(catalog.get("scripts", []), doc.jobs)
 
     for dataset in doc.datasets:
@@ -220,12 +273,13 @@ def export_agent_catalog(doc, prior=None):
         old = prior_scripts.get(job.id, {})
         schedule = doc.schedules.get(job.schedule_id)
         deps = doc.job_dependencies.get(job.id, [])
+        entry = {key: value for key, value in old.items() if key != "description_source"}
         scripts.append(
             {
-                **old,
+                **entry,
                 "script_name": job.name,
                 "script_path": job.source_file,
-                "description": old.get("description", ""),
+                **_script_description(old, job),
                 "language": job.language,
                 "schedule": schedule.interval_text if schedule else None,
                 "reads_from": [reference(d) for d in sorted(job.inputs)],
