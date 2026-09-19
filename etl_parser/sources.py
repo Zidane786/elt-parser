@@ -138,8 +138,8 @@ class GitHubSource:
                 when ``None``.
             path: Repository-relative path scoping the scan to a subdirectory or
                 single file; the whole repository when ``None``.
-            token: GitHub API token. Falls back to the ``GITHUB_TOKEN`` then
-                ``GH_TOKEN`` environment variable, then unauthenticated.
+            token: GitHub API token. Falls back to ``GITHUB_TOKEN``, then ``GH_TOKEN``
+                when ``GITHUB_TOKEN`` is unset or empty, then unauthenticated.
             timeout: Per-request timeout in seconds; must be positive.
             retries: Retries after the first attempt for retryable failures;
                 must be nonnegative.
@@ -174,9 +174,11 @@ class GitHubSource:
         self.origin = "https://github.com/" + self.repo
         self.ref = ref
         self.path = "" if str(selected) == "." else str(selected)
-        self.token = (
-            token if token is not None else os.getenv("GITHUB_TOKEN", os.getenv("GH_TOKEN"))
-        )
+        # An empty GITHUB_TOKEN is no token at all; fall through to GH_TOKEN as the
+        # SDK guide documents, rather than letting the empty value shadow it.
+        self.token = token if token is not None else (os.getenv("GITHUB_TOKEN") or None)
+        if self.token is None:
+            self.token = os.getenv("GH_TOKEN") or None
         self.timeout, self.retries = timeout, retries
         self.max_files, self.max_file_bytes = max_files, max_file_bytes
         self.max_total_bytes = max_total_bytes
@@ -361,6 +363,32 @@ class GitHubSource:
             raise ValueError("Git LFS pointer: external object not fetched")
         return content
 
+    def _unfetched(self, remaining, scope, extensions):
+        """Count the entries a stopped scan would still have read.
+
+        Args:
+            remaining: Tree entries after the one the scan stopped on.
+            scope: Repository-relative prefix the scan is limited to, or ``""``.
+            extensions: File extensions (including the leading dot) being collected.
+
+        Returns:
+            int: How many remaining blobs are in scope, outside excluded directories,
+            and carry a collected extension, so the diagnostic can say what was missed.
+        """
+        excluded = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist"}
+        count = 0
+        for entry in remaining:
+            path = entry["path"]
+            if scope and not path.startswith(scope + "/"):
+                continue
+            relative = path[len(scope) + 1 :] if scope else path
+            parts = PurePosixPath(relative).parts
+            if entry["type"] != "blob" or any(p in excluded for p in parts):
+                continue
+            if PurePosixPath(relative).suffix in extensions | {".zip"}:
+                count += 1
+        return count
+
     def scan(self, *, extensions):
         """Scan the configured repository scope and build a :class:`ScanIndex`.
 
@@ -368,10 +396,13 @@ class GitHubSource:
         ``self.path`` (a single file, a ``.zip`` archive to expand, a subdirectory, or
         the whole repository), skips VCS/build/dependency directories, symlinks and
         submodules, and reads each remaining file matching ``extensions`` (or member
-        of a matched ``.zip``) through :meth:`read_file`. Per-entry read/decode
-        failures are recorded as :class:`~etl_parser.models.Unresolved` entries rather
-        than aborting the scan; the scan stops early only once the total byte budget
-        is exceeded.
+        of a matched ``.zip``) through :meth:`read_file`. Symlinks and submodules become
+        non-gating ``skipped_entry`` items: there is no file behind them to read, so they
+        are not a parser limitation. Per-entry read/decode failures are recorded as
+        :class:`~etl_parser.models.Unresolved` entries rather than aborting the scan. The
+        scan stops early when the total byte budget is exceeded, and after three
+        consecutive request failures, which adds one ``analysis_note`` saying how many
+        files were left unfetched.
 
         Args:
             extensions: File extensions (including the leading dot) to include.
@@ -401,7 +432,8 @@ class GitHubSource:
         zip_reader = RepoScanner(".", extensions=extensions, max_file_bytes=self.max_file_bytes)
         seen = set()
         found_scope = False
-        for entry in entries:
+        consecutive_failures = 0
+        for position, entry in enumerate(entries):
             path = entry["path"]
             if scope and not path.startswith(scope + "/"):
                 continue
@@ -430,7 +462,25 @@ class GitHubSource:
                     raise ValueError("Unsafe or duplicate repository path")
                 seen.add(relative)
                 if entry["type"] != "blob" or entry.get("mode") in {"120000", "160000"}:
-                    raise ValueError("Symlink/submodule is not followed")
+                    # Not a parser limitation: there is no file here to read. Recorded so
+                    # the entry is visible, but never as a coverage failure.
+                    index.unresolved.append(
+                        Unresolved(
+                            kind="skipped_entry",
+                            source_file=relative,
+                            reason="Symlink or submodule is not followed",
+                            remediation="Scan the target repository or path directly.",
+                        )
+                    )
+                    if observer:
+                        observer.count("source.skipped_entries")
+                        observer.event(
+                            "source.skipped",
+                            level="DEBUG",
+                            source=relative,
+                            reason="symlink_or_submodule",
+                        )
+                    continue
                 suffix = PurePosixPath(relative).suffix
                 if suffix not in extensions | {".zip"}:
                     if observer:
@@ -466,6 +516,7 @@ class GitHubSource:
                     if b"\x00" in content:
                         raise ValueError("Binary source cannot be parsed as text")
                     index.files.append(SourceFile(relative, content.decode("utf-8"), suffix))
+                consecutive_failures = 0
             except (
                 ValueError,
                 KeyError,
@@ -484,6 +535,31 @@ class GitHubSource:
                 if observer:
                     observer.count("source.read_failures")
                 if self._total_bytes > self.max_total_bytes:
+                    break
+                # A request failure (rate limit, outage) tends to repeat. Stop asking
+                # after three in a row instead of spending the rest of the inventory
+                # on requests that will fail the same way.
+                consecutive_failures += 1 if isinstance(exc, RuntimeError) else 0
+                if consecutive_failures >= 3:
+                    unfetched = self._unfetched(entries[position + 1 :], scope, extensions)
+                    index.unresolved.append(
+                        Unresolved(
+                            kind="analysis_note",
+                            reason=f"GitHub read stopped after {consecutive_failures} "
+                            f"consecutive request failures; {unfetched} files were not "
+                            "fetched at this revision.",
+                            remediation="Re-run the scan once the GitHub API is available.",
+                        )
+                    )
+                    if observer:
+                        observer.count("source.request_breaker_opened")
+                        observer.event(
+                            "source.scan_stopped",
+                            level="WARNING",
+                            reason="consecutive_request_failures",
+                            consecutive_failures=consecutive_failures,
+                            unfetched_files=unfetched,
+                        )
                     break
         if self.path and not found_scope:
             raise ValueError("Requested GitHub path does not exist at the selected revision")

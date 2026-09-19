@@ -26,6 +26,8 @@ def response_for(messages, system, tools, kwargs, *, source_name="x", bad_eviden
                 "kind": edge["transformation"]["kind"]
                 if edge["provenance"]["confidence"] == "exact"
                 else "identity",
+                "confidence": 0.8,
+                "rationale": "Column read directly from the cited statement",
                 "evidence": {
                     "source_file": source["source_file"],
                     "source_digest": source["source_digest"],
@@ -35,7 +37,14 @@ def response_for(messages, system, tools, kwargs, *, source_name="x", bad_eviden
                 },
             }
         ],
-        "descriptions": [{"target": edge["target"], "description": "Source value"}],
+        "descriptions": [
+            {
+                "target": edge["target"],
+                "description": "Source value",
+                "confidence": 0.8,
+                "rationale": "Derived from the cited expression",
+            }
+        ],
     }
     return text_response(json.dumps(response))
 
@@ -385,6 +394,8 @@ def test_table_and_transformation_differences_are_reported_without_replacing_exa
                 "job_id": item["job_id"],
                 "source": "glue://db/s",
                 "target": "glue://db/t",
+                "confidence": 0.7,
+                "rationale": "Both tables named in the cited statement",
                 "evidence": item["evidence"],
             }
         ]

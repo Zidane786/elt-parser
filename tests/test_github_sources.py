@@ -114,6 +114,64 @@ def test_remote_limits_and_lfs_are_visible_diagnostics():
     assert not doc.jobs
 
 
+def test_symlinks_and_submodules_are_skipped_entries_not_syntax_failures():
+    remote, _ = provider({"job.py": b'spark.table("db.s").write.saveAsTable("db.t")'})
+    entries = [
+        {"path": "link.py", "sha": "9", "type": "blob", "mode": "120000", "size": 4},
+        {"path": "vendor", "sha": "8", "type": "commit", "mode": "160000", "size": 0},
+    ]
+    original = remote.transport
+
+    def transport(endpoint):
+        result = original(endpoint)
+        if endpoint.endswith("?recursive=1"):
+            return {"tree": result["tree"] + entries, "truncated": False}
+        return result
+
+    remote.transport = transport
+    index = remote.scan(extensions={".py"})
+    kinds = {u.kind for u in index.unresolved}
+    assert kinds == {"skipped_entry"}
+    assert len(index.unresolved) == 2
+    assert len(index.files) == 1
+
+
+def test_consecutive_request_failures_stop_the_scan_with_one_note():
+    files = {f"job{i}.py": b'spark.table("db.s")' for i in range(6)}
+    attempted = []
+
+    def transport(endpoint):
+        if endpoint.startswith("commits/"):
+            return {"sha": "pinned", "commit": {"tree": {"sha": "root"}}}
+        if endpoint == "git/trees/root?recursive=1":
+            return {
+                "tree": [
+                    {"path": p, "sha": str(i), "type": "blob", "mode": "100644", "size": 10}
+                    for i, p in enumerate(files)
+                ],
+                "truncated": False,
+            }
+        attempted.append(endpoint)
+        raise RuntimeError("GitHub read failed with HTTP 500")
+
+    remote = GitHubSource("https://github.com/example/etl", transport=transport)
+    index = remote.scan(extensions={".py"})
+    assert len(attempted) == 3  # Breaker opens; the remaining blobs are never requested.
+    notes = [u for u in index.unresolved if u.kind == "analysis_note"]
+    assert len(notes) == 1
+    assert "3" in notes[0].reason
+
+
+def test_gh_token_is_used_when_github_token_is_unset_or_empty(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "FALLBACK_TOKEN")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    assert GitHubSource("https://github.com/example/etl").token == "FALLBACK_TOKEN"
+    monkeypatch.setenv("GITHUB_TOKEN", "")
+    assert GitHubSource("https://github.com/example/etl").token == "FALLBACK_TOKEN"
+    monkeypatch.setenv("GITHUB_TOKEN", "PRIMARY_TOKEN")
+    assert GitHubSource("https://github.com/example/etl").token == "PRIMARY_TOKEN"
+
+
 def test_no_redirect_token_forwarding():
     from etl_parser.sources import _NoRedirect
 

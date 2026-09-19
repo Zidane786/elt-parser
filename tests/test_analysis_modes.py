@@ -91,7 +91,8 @@ def test_multiple_proposals_keep_dataset_scope_when_one_schema_is_unknown():
     from etl_parser.scanner.repo import SourceFile
     from etl_parser.workers.sql import DictSchemaProvider
 
-    source = SourceFile("job.py", 'df.write.saveAsTable("db.t")', ".py")
+    # The quote must name the proposed columns, so the evidence rule can accept them.
+    source = SourceFile("job.py", 'df.select("x", "y").write.saveAsTable("db.t")', ".py")
     job = Job(
         id="job",
         name="job",
@@ -115,6 +116,8 @@ def test_multiple_proposals_keep_dataset_scope_when_one_schema_is_unknown():
                     "sources": [{"dataset_id": "s3://bucket/orders", "name": name}],
                     "expression": name,
                     "kind": "identity",
+                    "confidence": 0.9,
+                    "rationale": "Written by the cited statement",
                     "evidence": evidence,
                 }
                 for name in ("x", "y")
@@ -124,6 +127,8 @@ def test_multiple_proposals_keep_dataset_scope_when_one_schema_is_unknown():
                     "job_id": "job",
                     "source": "s3://bucket/orders",
                     "target": "glue://db/t",
+                    "confidence": 0.9,
+                    "rationale": "Both datasets appear in the cited write",
                     "evidence": evidence,
                 }
             ],

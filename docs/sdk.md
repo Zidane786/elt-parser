@@ -198,6 +198,8 @@ them explicitly. See [CLI environment handling](cli.md#configuration-credentials
 | `deadline_seconds` | `3600` | Positive AI-stage deadline, after deterministic scanning |
 | `include` | `["*"]` | AI file globs; deterministic inventory is not filtered |
 | `exclude` | `[]` | AI exclusions; take precedence over inclusions |
+| `min_ai_confidence` | `0.0` | 0–1 floor on the model's own reported confidence; proposals below it are recorded as `deferred` with reason `below_confidence_threshold` |
+| `override_existing` | `False` | Regenerate descriptions this package wrote (`description_source` `ai` or `code`); human and verified text is never overwritten |
 
 Do not use `config.model_dump()` as a complete credential-bearing clone: secrets and
 headers are intentionally excluded. A normal deep `model_copy(deep=True)` preserves
