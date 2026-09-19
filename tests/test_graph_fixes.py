@@ -24,6 +24,7 @@ from etl_parser.models import (
     WorkerResult,
 )
 from etl_parser.pipeline import scan
+from etl_parser.registry import ProductRegistry
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -254,6 +255,73 @@ def test_openlineage_events_validate_against_the_client_models(tmp_path):
             transformationType=field.get("transformationType"),
         )
         assert Serde.to_dict(rebuilt) == field
+
+
+def test_registry_reads_schedules_written_as_scripts():
+    """Finding 31: meter's product.yaml uses schedules.scripts, not schedules.steps."""
+    registry = ProductRegistry.load(FIXTURES / "products" / "meter" / "product.yaml")
+    schedules = registry.schedules()
+    assert schedules["product.meter.stage_reads"].cron == "0 1 * * *"
+    assert schedules["product.meter.ingest_interval_reads"].interval_text == "hourly"
+    assert schedules["product.meter.__primary__"].cron == "0 2 * * *"
+
+
+def test_registry_merges_steps_and_scripts(tmp_path):
+    """Both spellings are read, and a step keeps its own schedule."""
+    (tmp_path / "product.yaml").write_text(
+        "code: p\nname: product\n"
+        "schedules:\n"
+        "  steps:\n    one: '0 1 * * *'\n"
+        "  scripts:\n    two: '0 2 * * *'\n"
+    )
+    schedules = ProductRegistry.load(tmp_path).schedules()
+    assert schedules["product.p.one"].cron == "0 1 * * *"
+    assert schedules["product.p.two"].cron == "0 2 * * *"
+
+
+def test_product_attach_honours_the_declared_database_engine(products_graph):
+    """Finding 30: a Postgres table is not owned by a database declared as Athena."""
+    products = {d.id: d.product for d in products_graph.document.datasets}
+    assert products["glue://meter_cur/fact_consumption"] == "meter"
+    assert products["postgres://meter_cur/fact_consumption"] is None
+    assert products["postgres://billing_pg/invoices"] == "bill"
+
+
+def test_engine_mismatch_is_reported_rather_than_silently_unattributed(products_graph):
+    """A declared database seen on another engine leaves a non-gating note behind.
+
+    The bill product declares bill_raw/bill_stg/bill_cur as Athena while its jobs run them
+    over Postgres, so those datasets are no longer attributed to it. That is drift worth
+    seeing, not something to swallow.
+    """
+    reasons = [
+        u.reason
+        for u in products_graph.document.unresolved
+        if u.kind == "analysis_note" and "another engine" in u.reason
+    ]
+    for dataset_id in ("postgres://bill_cur/fact_invoice", "postgres://meter_cur/fact_consumption"):
+        assert any(dataset_id in reason for reason in reasons), dataset_id
+    assert not any("glue://meter_cur/fact_consumption" in reason for reason in reasons)
+
+
+def test_registry_matches_engine_families_to_schemes(tmp_path):
+    """Athena, Spark and Glue all address the glue scheme; postgres addresses postgres."""
+    (tmp_path / "product.yaml").write_text(
+        "code: p\nname: product\n"
+        "databases:\n"
+        "  - name: warehouse\n    type: athena\n    layer: curated\n"
+        "  - name: ledger\n    type: postgresql\n    layer: source\n"
+        "  - name: anything\n    layer: raw\n"
+    )
+    registry = ProductRegistry.load(tmp_path)
+    assert registry.product_for_database("warehouse", "glue").code == "p"
+    assert registry.product_for_database("warehouse", "postgres") is None
+    assert registry.product_for_database("ledger", "postgres").code == "p"
+    assert registry.layer_for_database("ledger", "postgres") == "source"
+    assert registry.layer_for_database("ledger", "glue") is None
+    # An undeclared engine still matches any scheme, so existing product.yaml keeps working.
+    assert registry.product_for_database("anything", "glue").code == "p"
+    assert registry.product_for_database("anything", "s3").code == "p"
 
 
 def _cross_product_document():

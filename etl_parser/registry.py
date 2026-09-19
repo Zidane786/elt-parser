@@ -4,6 +4,7 @@ from pathlib import Path
 
 import yaml
 
+from etl_parser.identity import scheme_for_engine
 from etl_parser.models import DeclaredDependency, Product, ProductDatabase, Schedule
 from etl_parser.workers.base import normalize_cron
 
@@ -90,12 +91,22 @@ class ProductRegistry:
                 raise ValueError(f"Database has multiple product owners: {database.name}")
         self.products.append(product)
         for database in product.databases:
-            self._databases[database.name] = (product, database.layer)
+            self._databases[database.name] = (
+                product,
+                database.layer,
+                scheme_for_engine(database.type),
+            )
         schedules = data.get("schedules", {})
-        steps = schedules.get("steps", {})
-        values = (
-            {s["step"]: s["schedule"] for s in steps} if isinstance(steps, list) else dict(steps)
-        )
+        values: dict[str, object] = {}
+        # Products spell per-script schedules either way; the meter fixture uses "scripts"
+        # and its schedules were silently ignored while only "steps" was read (finding 31).
+        for key in ("steps", "scripts"):
+            entries = schedules.get(key) or {}
+            values.update(
+                {s["step"]: s["schedule"] for s in entries}
+                if isinstance(entries, list)
+                else dict(entries)
+            )
         if schedules.get("primary") is not None:
             values["__primary__"] = schedules["primary"]
         for name, value in values.items():
@@ -110,30 +121,54 @@ class ProductRegistry:
             )
         return product
 
-    def product_for_database(self, db):
+    def _owner(self, db, scheme=None):
+        """Return the ownership entry for a database name, honoring the declared engine.
+
+        Args:
+            db: Database name (matches ``ProductDatabase.name``).
+            scheme: Dataset id scheme the name was seen under (e.g. ``"glue"``), or
+                ``None`` to accept any. A database that declares no ``type`` matches any
+                scheme, so a ``product.yaml`` without engines keeps working.
+
+        Returns:
+            tuple | None: The ``(product, layer, scheme)`` entry, or ``None`` when the
+            name is unknown or was declared for a different engine.
+        """
+        value = self._databases.get(db)
+        if value is None:
+            return None
+        if scheme is not None and value[2] is not None and value[2] != scheme:
+            return None
+        return value
+
+    def product_for_database(self, db, scheme=None):
         """Return the product that owns a database, if any.
 
         Args:
             db: Database name (matches ``ProductDatabase.name``).
+            scheme: Dataset id scheme the name was seen under, to reject a same-named
+                database on another engine (finding 30).
 
         Returns:
             Product | None: The owning product, or ``None`` if no registered product
-            declares this database.
+            declares this database for this scheme.
         """
-        value = self._databases.get(db)
+        value = self._owner(db, scheme)
         return value[0] if value else None
 
-    def layer_for_database(self, db):
+    def layer_for_database(self, db, scheme=None):
         """Return the declared layer for a database, if any.
 
         Args:
             db: Database name (matches ``ProductDatabase.name``).
+            scheme: Dataset id scheme the name was seen under, to reject a same-named
+                database on another engine.
 
         Returns:
             str | None: The declared layer (e.g. ``"raw"``), or ``None`` if the database
-            is not owned by a registered product or declares no layer.
+            is not owned by a registered product for this scheme, or declares no layer.
         """
-        value = self._databases.get(db)
+        value = self._owner(db, scheme)
         return value[1] if value else None
 
     def schedules(self):

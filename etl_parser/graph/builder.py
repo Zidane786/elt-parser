@@ -169,10 +169,30 @@ def build_graph(
         registry.resolve_dependencies()
         schedules.update(registry.schedules())
         for ds in refs:
-            _, namespace, _ = split_dataset_id(ds.id)
-            product = registry.product_for_database(namespace)
+            scheme, namespace, _ = split_dataset_id(ds.id)
+            # The engine is part of ownership: a product's Athena warehouse does not own a
+            # same-named Postgres database (finding 30).
+            product = registry.product_for_database(namespace, scheme)
             if product:
-                ds.product, ds.layer = product.code, registry.layer_for_database(namespace)
+                ds.product = product.code
+                ds.layer = registry.layer_for_database(namespace, scheme)
+                continue
+            declared = registry.product_for_database(namespace)
+            if declared:
+                combined.unresolved.append(
+                    Unresolved(
+                        kind="analysis_note",
+                        reason=(
+                            f"Database {namespace!r} is declared by product "
+                            f"{declared.code!r} for another engine, so {ds.id} is left "
+                            "unattributed"
+                        ),
+                        remediation=(
+                            "Declare this engine in the product's databases, or correct "
+                            "the connection the job uses."
+                        ),
+                    )
+                )
         products = {d.id: d.product for d in refs}
         for job in jobs.values():
             candidates = {products.get(d) for d in job.outputs} - {None}

@@ -28,6 +28,26 @@ URI_SCHEMES = {"s3", "s3a", "s3n", "gs", "hdfs", "file", "kafka", "kinesis", "ht
 _QUOTED = re.compile(r'^\s*(["`\[])(.*)(["`\]])\s*$')
 
 
+def scheme_for_engine(engine: str | None) -> str | None:
+    """Return the dataset id scheme an engine's tables are addressed under.
+
+    Args:
+        engine: Engine name as declared by a product or a call site (e.g. ``"athena"``,
+            ``"postgresql"``), or ``None``.
+
+    Returns:
+        str | None: ``"glue"`` for the Glue-catalog family (Athena, Spark, Glue, Trino,
+        Presto, Hive), the mapped scheme for other known engines, the engine name itself
+        for unknown engines, and ``None`` when ``engine`` is ``None`` or empty.
+    """
+    if not engine:
+        return None
+    engine = engine.lower()
+    if engine in GLUE_ENGINES:
+        return "glue"
+    return ENGINE_SCHEME.get(engine, engine)
+
+
 def _split_identifier(name: str) -> list[tuple[str, bool]]:
     """Split a dotted identifier into its parts, honoring quoted segments.
 
