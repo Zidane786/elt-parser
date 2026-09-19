@@ -1876,7 +1876,11 @@ class PythonWorker:
                             statements(node.body)
                         statements(node.orelse)
                     elif isinstance(node, (ast.For, ast.AsyncFor, ast.While, ast.Try, ast.Match)):
-                        issue(node, "Dynamic control flow analyzed conservatively")
+                        issue(
+                            node,
+                            "Dynamic control flow analyzed conservatively",
+                            "analysis_note",
+                        )
                         bodies = []
                         if isinstance(node, (ast.For, ast.AsyncFor)):
                             iterated = evaluate(node.iter)

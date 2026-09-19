@@ -283,6 +283,16 @@ def test_sqlalchemy_text_is_matched_through_its_import(tmp_path):
     assert doc.jobs[0].outputs == ["table://shop/target"]
 
 
+def test_conservative_control_flow_is_an_analysis_note_not_a_syntax_failure(tmp_path):
+    doc = run(
+        tmp_path,
+        'for name in names:\n    spark.table(f"a.{name}")\n',
+    )
+    notes = [u for u in doc.unresolved if "conservatively" in u.reason]
+    assert notes and {u.kind for u in notes} == {"analysis_note"}
+    assert not [u for u in doc.unresolved if u.kind == "unsupported_syntax"]
+
+
 def test_one_bad_zip_member_does_not_abort_the_rest(tmp_path):
     with zipfile.ZipFile(tmp_path / "a.zip", "w") as archive:
         archive.writestr("bad.py", b"\xff\xfe not utf-8 at all")
