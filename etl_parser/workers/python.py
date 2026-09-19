@@ -532,6 +532,33 @@ class PythonWorker:
                     return alias + text[len(package) :]
             return text
 
+        def is_udf(func):
+            """Whether a call target is a user-defined function applied to columns.
+
+            Recognises both spellings: a name bound to ``F.udf(...)``/``F.pandas_udf(...)``
+            and a function declared with a ``@udf``/``@pandas_udf`` decorator. The call
+            that *builds* a UDF is not itself a UDF application, so attribute targets such
+            as ``F.udf`` return ``False``.
+
+            Args:
+                func: The ``Call.func`` expression of the call being evaluated.
+
+            Returns:
+                bool: ``True`` when the call applies a UDF to its arguments.
+            """
+            if not isinstance(func, ast.Name):
+                return False
+            value = state.env.get(func.id)
+            if isinstance(value, Expression) and isinstance(value.node, ast.Call):
+                builder = callee(value.node.func).rsplit(".", 1)[-1]
+                if builder in {"udf", "pandas_udf"}:
+                    return True
+            function = state.functions.get(func.id)
+            return bool(function) and any(
+                unparse(decorator).rsplit(".", 1)[-1].partition("(")[0] in {"udf", "pandas_udf"}
+                for decorator in function.decorator_list
+            )
+
         def col_expr(node, frame):
             """Evaluate a column expression and stamp it with its source location.
 
@@ -600,6 +627,18 @@ class PythonWorker:
                 method = (
                     node.func.attr if isinstance(node.func, ast.Attribute) else unparse(node.func)
                 )
+                if is_udf(node.func):
+                    # A UDF body is opaque: its arguments feed the output and nothing more
+                    # is known about how (design spec section 8.3).
+                    values = [col_expr(argument, frame) for argument in node.args]
+                    return Column(
+                        set().union(set(), *(v.sources for v in values)),
+                        unparse(node),
+                        "unknown",
+                        True,
+                        next((v.name for v in values if v.name), None),
+                        set().union(set(), *(v.indirect for v in values)),
+                    )
                 if method in {"col", "column"} and node.args:
                     name = folded(node.args[0])
                     return frame.column(name.text) if name.complete else Column(partial=True)
@@ -942,7 +981,14 @@ class PythonWorker:
                             line_end=getattr(node, "end_lineno", node.lineno),
                         ),
                         provenance=Provenance(
-                            parser="python_ast", confidence="partial" if partial else "exact"
+                            parser="python_ast",
+                            confidence=(
+                                "partial"
+                                if partial
+                                else "inferred"
+                                if isinstance(frame, Frame) and frame.inferred
+                                else "exact"
+                            ),
                         ),
                     )
                 )
@@ -1453,8 +1499,15 @@ class PythonWorker:
                             out.columns[key].sources |= col.sources
                             out.columns[key].partial |= col.partial
                             out.columns[key].indirect |= col.indirect
-                            if method == "unionByName" and col.kind != out.columns[key].kind:
-                                out.columns[key].kind = "expression"
+                            # A union column is derived the way either branch derived it.
+                            kinds = {out.columns[key].kind, col.kind} - {"identity"}
+                            out.columns[key].kind = (
+                                kinds.pop()
+                                if len(kinds) == 1
+                                else "expression"
+                                if kinds
+                                else "identity"
+                            )
                         if method == "unionByName":
                             for key in right.columns.keys() - out.columns.keys():
                                 out.columns[key] = right.columns[key]

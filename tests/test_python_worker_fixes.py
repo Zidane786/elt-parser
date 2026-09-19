@@ -163,3 +163,53 @@ def test_return_nested_in_a_branch_is_not_discarded(tmp_path):
     edge = next(e for e in doc.column_edges if e.target.dataset_id == "glue://a/t")
     assert origin(edge) == {("glue://a/a", "id"), ("glue://a/b", "id")}
     assert edge.provenance.confidence == "inferred"
+
+
+def test_helper_followed_frame_is_inferred_not_exact(tmp_path):
+    (tmp_path / "helpers.py").write_text('def load():\n    return spark.table("a.b")\n')
+    doc = run(
+        tmp_path,
+        'from helpers import load\nload().select("id").write.saveAsTable("a.t")\n',
+    )
+    edge = next(e for e in doc.column_edges if e.target.dataset_id == "glue://a/t")
+    assert edge.provenance.confidence == "inferred"
+    assert [e.provenance.confidence for e in doc.table_edges] == ["inferred"]
+
+
+UDF_HEADER = "from pyspark.sql import functions as F\nfrom pyspark.sql.types import StringType\n"
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        "clean = F.udf(lambda s: s.strip(), StringType())\n",
+        "@F.udf(returnType=StringType())\ndef clean(s):\n    return s.strip()\n",
+        "@F.pandas_udf(StringType())\ndef clean(s):\n    return s\n",
+    ],
+)
+def test_udf_output_is_unknown_kind_with_partial_confidence(tmp_path, definition):
+    doc = run(
+        tmp_path,
+        UDF_HEADER + definition + 'df = spark.table("a.b")\n'
+        'df.withColumn("name", clean(F.col("raw"))).write.saveAsTable("a.t")\n',
+    )
+    edge = next(e for e in doc.column_edges if e.target.name == "name")
+    assert edge.transformation.kind == "unknown"
+    assert edge.provenance.confidence == "partial"
+    assert origin(edge) == {("glue://a/b", "raw")}
+
+
+def test_union_by_name_merges_kind_and_column_indirect_sources(tmp_path):
+    doc = run(
+        tmp_path,
+        "from pyspark.sql import functions as F\nfrom pyspark.sql import Window\n"
+        'left = spark.table("x.a").select("amount")\n'
+        'right = spark.table("x.b").withColumn(\n'
+        '    "amount", F.sum("amount").over(Window.partitionBy("region"))\n'
+        ').select("amount")\n'
+        'left.unionByName(right).write.saveAsTable("x.t")\n',
+    )
+    edge = next(e for e in doc.column_edges if e.target.dataset_id == "glue://x/t")
+    assert origin(edge) == {("glue://x/a", "amount"), ("glue://x/b", "amount")}
+    assert ("glue://x/b", "region") in {(r.dataset_id, r.name) for r in edge.indirect_sources}
+    assert edge.transformation.kind == "window"
