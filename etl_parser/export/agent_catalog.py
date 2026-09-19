@@ -10,6 +10,8 @@ prior catalog when supplied so human/AI descriptions and catalog flags (``to_tok
 import copy
 
 from etl_parser.identity import ENGINE_SCHEME, GLUE_ENGINES, agent_table_name, split_dataset_id
+from etl_parser.models import Unresolved
+from etl_parser.observability import current_observer
 
 
 def _database_scheme(database):
@@ -178,6 +180,137 @@ def _relations_inferred(join_conditions):
     ]
 
 
+def _referencing_jobs(doc, dataset):
+    """Return the jobs that read or write a dataset (by id or alias), sorted by id.
+
+    Args:
+        doc: The :class:`~etl_parser.models.LineageDocument` being exported.
+        dataset: The :class:`~etl_parser.models.DatasetRef` to look up.
+
+    Returns:
+        list[Job]: Referencing jobs in id order.
+    """
+    ids = {dataset.id, *dataset.aliases}
+    return sorted(
+        (j for j in doc.jobs if ids & set(j.inputs) or ids & set(j.outputs)), key=lambda j: j.id
+    )
+
+
+def _record_code_only(drift, scheme, namespace, name, columns, jobs):
+    """Record a table (or the code-only columns of a known table) in the drift collector.
+
+    Args:
+        drift: ``{(db_name, scheme): {table_name: table_entry}}`` accumulator.
+        scheme: Dataset id scheme.
+        namespace: Dataset namespace (database name).
+        name: Table name.
+        columns: Column names seen only in code.
+        jobs: Jobs referencing the dataset, sorted by id.
+    """
+    drift.setdefault((namespace, scheme), {})[name] = {
+        "table_name": name,
+        "description": "",
+        "schema": [
+            {"field_name": column, "datatype": None, "description": ""}
+            for column in sorted(columns)
+        ],
+        "referenced_by": [job.id for job in jobs],
+        "source_files": sorted({job.source_file for job in jobs}),
+    }
+
+
+def _missing_in_source(dataset_id, symbols, jobs, whole_table):
+    """Build the non-gating ``missing_in_source`` item for a code-only table or columns.
+
+    Args:
+        dataset_id: Canonical id of the dataset referenced in code.
+        symbols: The dataset id (whole table) or the code-only column names.
+        jobs: Jobs referencing the dataset, sorted by id; the first anchors the item.
+        whole_table: True when the table itself is absent from the source schema.
+
+    Returns:
+        Unresolved: The item, ready to be serialized into ``lineage.unresolved``.
+    """
+    first = jobs[0] if jobs else None
+    reason = (
+        f"{dataset_id} is referenced in code but absent from the source schema"
+        if whole_table
+        else f"{dataset_id}: columns referenced in code are absent from the source schema"
+    )
+    return Unresolved(
+        kind="missing_in_source",
+        source_file=first.source_file if first else None,
+        job_id=first.id if first else None,
+        reason=reason,
+        symbols=list(symbols),
+        assumptions={"referenced_by": ", ".join(job.id for job in jobs)},
+        remediation=(
+            "Verify against the source system and add it to the catalog, or export with "
+            "include_code_schema=True to add the code-derived entry marked schema_source: code."
+        ),
+    )
+
+
+def _drift_databases(drift):
+    """Render the drift collector in the ``databases`` shape, sorted.
+
+    Args:
+        drift: ``{(db_name, scheme): {table_name: table_entry}}`` accumulator.
+
+    Returns:
+        list[dict]: One database per key with its tables ordered by name.
+    """
+    return [
+        {
+            "db_name": namespace,
+            "db_type": _db_type(scheme),
+            "description": "",
+            "tables": [tables[name] for name in sorted(tables)],
+        }
+        for (namespace, scheme), tables in sorted(drift.items())
+    ]
+
+
+def _unused_in_code(databases, touched):
+    """List source tables no scanned job reads or writes.
+
+    Args:
+        databases: The catalog ``databases`` list.
+        touched: ``id()`` of every table entry a scanned dataset was matched to.
+
+    Returns:
+        list[dict]: Sorted ``{"db_name", "table_name"}`` entries.
+    """
+    return sorted(
+        (
+            {"db_name": database["db_name"], "table_name": table["table_name"]}
+            for database in databases
+            for table in database.get("tables", [])
+            if id(table) not in touched
+        ),
+        key=lambda entry: (entry["db_name"], entry["table_name"]),
+    )
+
+
+def _log_drift(schema_drift):
+    """Emit one ``schema.drift`` event with counts when a run observer is active.
+
+    Args:
+        schema_drift: The ``catalog["schema_drift"]`` block.
+    """
+    observer = current_observer()
+    if observer is None:
+        return
+    databases = schema_drift["code_only"]["databases"]
+    observer.event(
+        "schema.drift",
+        actor="exporter",
+        code_only_tables=sum(len(d["tables"]) for d in databases),
+        code_only_columns=sum(len(t["schema"]) for d in databases for t in d["tables"]),
+        unused_in_code=len(schema_drift["unused_in_code"]),
+    )
+
+
 def _path_suffix_match(prior_path, source_file):
     """Tell whether two script paths denote the same file up to a directory prefix.
 
@@ -237,57 +370,90 @@ def _match_prior_scripts(prior_scripts, jobs):
     return matched, unmatched
 
 
-def export_agent_catalog(doc, prior=None):
+def export_agent_catalog(doc, prior=None, *, include_code_schema=False):
     """Build (or update) an agent ``catalog.json`` dict from a lineage document.
+
+    The source system (or the prior catalog produced from it) is the truth for
+    databases, tables and columns; code only says how data is used. Tables and columns
+    seen only in code are therefore reported under ``schema_drift`` and as non-gating
+    ``missing_in_source`` items instead of being added to ``databases``, unless
+    ``include_code_schema`` is set.
 
     Args:
         doc: The scanned :class:`~etl_parser.models.LineageDocument`.
-        prior: A previously exported catalog dict to merge into. Databases, tables, and
-            scripts it contains are updated in place (by db/table name, or by job id/source
-            path for scripts); anything the current scan did not touch is kept unchanged.
-            If omitted, a fresh catalog with empty ``databases``/``relations`` is built.
+        prior: A previously exported catalog dict to merge into. Databases are matched by
+            ``db_name`` (see :func:`_find_database`), scripts by job id, path, name or
+            path suffix (see :func:`_match_prior_scripts`); anything the current scan did
+            not touch is kept unchanged. If omitted, a fresh catalog with empty
+            ``databases``/``relations`` is built.
+        include_code_schema: When True, code-only tables and columns are added to
+            ``databases`` marked ``schema_source: "code"`` (new glue databases get
+            ``db_type: "athena"``). They are still listed under ``schema_drift``.
 
     Returns:
-        dict: The catalog, with ``databases`` (schema per table, preserving unrelated
-        prior flags), ``scripts`` (one entry per job, with ``depends_on`` and the
-        extension field ``depends_on_detail``), ``schedules``, and ``lineage``
-        (``column_edges`` and ``unresolved``) all populated. ``relations`` is passed
-        through unchanged from ``prior``, since it is not inferred from code.
+        dict: The catalog, with ``databases`` (schema per table, preserving prior flags
+        and descriptions, each description carrying ``description_source``), ``scripts``
+        (one entry per job, with ``depends_on`` and the extension field
+        ``depends_on_detail``, followed by unmatched prior scripts), ``relations`` (passed
+        through from ``prior``), ``relations_inferred`` (from join conditions),
+        ``schedules``, ``lineage`` (``column_edges`` and ``unresolved`` including the
+        ``missing_in_source`` items) and ``schema_drift`` (``code_only.databases`` in the
+        ``databases`` shape plus ``unused_in_code``).
     """
     catalog = copy.deepcopy(prior) if prior is not None else {"databases": [], "relations": []}
     databases = catalog.setdefault("databases", [])
     _mark_human_descriptions(databases)
     prior_scripts, unmatched_scripts = _match_prior_scripts(catalog.get("scripts", []), doc.jobs)
 
+    drift: dict = {}
+    missing: list[Unresolved] = []
+    touched: set[int] = set()
     for dataset in doc.datasets:
         if dataset.kind != "table" or dataset.id.startswith("frame://"):
             continue
         scheme, namespace, name = split_dataset_id(dataset.id)
+        jobs = _referencing_jobs(doc, dataset)
         database = _find_database(databases, namespace, scheme)
-        if database is None:
-            database = {
-                "db_name": namespace,
-                "db_type": _db_type(scheme),
-                "description": "",
-                "tables": [],
-            }
-            databases.append(database)
-        elif not database.get("db_type"):
+        table = None
+        if database is not None:
+            table = next(
+                (t for t in database.setdefault("tables", []) if t["table_name"] == name), None
+            )
+        created = table is None
+        if created:
+            _record_code_only(drift, scheme, namespace, name, dataset.columns, jobs)
+            missing.append(_missing_in_source(dataset.id, [dataset.id], jobs, whole_table=True))
+            if not include_code_schema:
+                continue
+            if database is None:
+                database = {
+                    "db_name": namespace,
+                    "db_type": _db_type(scheme),
+                    "description": "",
+                    "tables": [],
+                    "schema_source": "code",
+                }
+                databases.append(database)
+            table = {"table_name": name, "description": "", "schema": [], "schema_source": "code"}
+            database["tables"].append(table)
+        if not database.get("db_type"):
             database["db_type"] = _db_type(scheme)
         if dataset.product:
             database["product"] = dataset.product
         if dataset.layer:
             database["layer"] = dataset.layer
-        table = next(
-            (t for t in database.setdefault("tables", []) if t["table_name"] == name), None
-        )
-        if table is None:
-            table = {"table_name": name, "description": "", "schema": []}
-            database["tables"].append(table)
+        touched.add(id(table))
         table["dataset_id"] = dataset.id
         existing = {c["field_name"] for c in table.setdefault("schema", [])}
-        for column in sorted(set(dataset.columns) - existing):
-            table["schema"].append({"field_name": column, "description": ""})
+        new_columns = sorted(set(dataset.columns) - existing)
+        if new_columns and not created:
+            _record_code_only(drift, scheme, namespace, name, new_columns, jobs)
+            missing.append(_missing_in_source(dataset.id, new_columns, jobs, whole_table=False))
+        if include_code_schema:
+            for column in new_columns:
+                table["schema"].append(
+                    {"field_name": column, "description": "", "schema_source": "code"}
+                )
 
     def reference(ident):
         """Build a ``reads_from``/``writes_to`` entry for a dataset id.
@@ -333,8 +499,14 @@ def export_agent_catalog(doc, prior=None):
     catalog.setdefault("relations", [])
     catalog["relations_inferred"] = _relations_inferred(doc.join_conditions)
     catalog["schedules"] = {k: v.model_dump(mode="json") for k, v in sorted(doc.schedules.items())}
+    missing.sort(key=lambda u: (u.source_file or "", u.line or 0, u.kind, u.reason))
     catalog["lineage"] = {
         "column_edges": [e.model_dump(mode="json") for e in doc.column_edges],
-        "unresolved": [u.model_dump(mode="json") for u in doc.unresolved],
+        "unresolved": [u.model_dump(mode="json") for u in [*doc.unresolved, *missing]],
     }
+    catalog["schema_drift"] = {
+        "code_only": {"databases": _drift_databases(drift)},
+        "unused_in_code": _unused_in_code(databases, touched),
+    }
+    _log_drift(catalog["schema_drift"])
     return catalog

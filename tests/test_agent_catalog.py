@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from etl_parser.export import agent_catalog
 from etl_parser.export.agent_catalog import export_agent_catalog
 from etl_parser.models import (
     ColumnRef,
@@ -13,6 +14,7 @@ from etl_parser.models import (
     JoinCondition,
     LineageDocument,
     Provenance,
+    Unresolved,
 )
 from etl_parser.pipeline import scan
 from etl_parser.workers.sql import DictSchemaProvider
@@ -261,3 +263,134 @@ def test_relations_inferred_from_join_conditions_never_merge_into_relations():
     ]
     empty = export_agent_catalog(LineageDocument())
     assert empty["relations"] == [] and empty["relations_inferred"] == []
+
+
+def drift_document():
+    return LineageDocument(
+        datasets=[
+            DatasetRef(id="glue://db/t", namespace="glue://db", name="t", columns=["x", "y"]),
+            DatasetRef(id="glue://db/new", namespace="glue://db", name="new", columns=["a"]),
+            DatasetRef(id="glue://other/o", namespace="glue://other", name="o", columns=["k"]),
+        ],
+        jobs=[
+            Job(id="j1", name="j1", source_file="j1.sql", inputs=["glue://db/new"], outputs=[]),
+            Job(id="j2", name="j2", source_file="j2.sql", inputs=[], outputs=["glue://db/t"]),
+            Job(id="j3", name="j3", source_file="z/j3.py", inputs=["glue://other/o"], outputs=[]),
+        ],
+        unresolved=[Unresolved(kind="unknown_column", reason="kept", job_id="j1")],
+    )
+
+
+def drift_prior():
+    return {
+        "databases": [
+            {
+                "db_name": "db",
+                "db_type": "sqlite",
+                "description": "",
+                "tables": [
+                    {"table_name": "t", "description": "", "schema": [{"field_name": "x"}]},
+                    {"table_name": "unused", "description": "", "schema": []},
+                ],
+            }
+        ],
+        "relations": [],
+    }
+
+
+def test_code_only_tables_and_columns_are_not_added_by_default():
+    catalog = export_agent_catalog(drift_document(), drift_prior())
+    assert [d["db_name"] for d in catalog["databases"]] == ["db"]
+    table = {t["table_name"]: t for t in catalog["databases"][0]["tables"]}
+    assert set(table) == {"t", "unused"}
+    assert [c["field_name"] for c in table["t"]["schema"]] == ["x"]
+    assert table["t"]["dataset_id"] == "glue://db/t"
+    assert catalog["schema_drift"] == {
+        "code_only": {
+            "databases": [
+                {
+                    "db_name": "db",
+                    "db_type": "athena",
+                    "description": "",
+                    "tables": [
+                        {
+                            "table_name": "new",
+                            "description": "",
+                            "schema": [{"field_name": "a", "datatype": None, "description": ""}],
+                            "referenced_by": ["j1"],
+                            "source_files": ["j1.sql"],
+                        },
+                        {
+                            "table_name": "t",
+                            "description": "",
+                            "schema": [{"field_name": "y", "datatype": None, "description": ""}],
+                            "referenced_by": ["j2"],
+                            "source_files": ["j2.sql"],
+                        },
+                    ],
+                },
+                {
+                    "db_name": "other",
+                    "db_type": "athena",
+                    "description": "",
+                    "tables": [
+                        {
+                            "table_name": "o",
+                            "description": "",
+                            "schema": [{"field_name": "k", "datatype": None, "description": ""}],
+                            "referenced_by": ["j3"],
+                            "source_files": ["z/j3.py"],
+                        }
+                    ],
+                },
+            ]
+        },
+        "unused_in_code": [{"db_name": "db", "table_name": "unused"}],
+    }
+    unresolved = catalog["lineage"]["unresolved"]
+    assert unresolved[0]["kind"] == "unknown_column"
+    missing = [u for u in unresolved if u["kind"] == "missing_in_source"]
+    assert [(u["symbols"], u["source_file"]) for u in missing] == [
+        (["glue://db/new"], "j1.sql"),
+        (["y"], "j2.sql"),
+        (["glue://other/o"], "z/j3.py"),
+    ]
+    assert all(u["job_id"] and u["reason"] and u["remediation"] for u in missing)
+    assert all(Unresolved(**u) for u in missing)
+
+
+def test_include_code_schema_adds_tables_marked_from_code():
+    catalog = export_agent_catalog(drift_document(), drift_prior(), include_code_schema=True)
+    databases = {d["db_name"]: d for d in catalog["databases"]}
+    assert databases["other"]["db_type"] == "athena"
+    assert databases["other"]["schema_source"] == "code"
+    tables = {t["table_name"]: t for t in databases["db"]["tables"]}
+    assert tables["new"]["schema_source"] == "code" and "schema_source" not in tables["t"]
+    columns = {c["field_name"]: c for c in tables["t"]["schema"]}
+    assert columns["y"] == {"field_name": "y", "description": "", "schema_source": "code"}
+    assert "schema_source" not in columns["x"]
+    assert catalog["schema_drift"]["unused_in_code"] == [{"db_name": "db", "table_name": "unused"}]
+    assert len(catalog["schema_drift"]["code_only"]["databases"]) == 2
+    assert export_agent_catalog(drift_document())["databases"] == []
+
+
+def test_schema_drift_is_logged_once_with_counts(monkeypatch):
+    events = []
+
+    class Observer:
+        def event(self, name, **fields):
+            events.append((name, fields))
+
+    monkeypatch.setattr(agent_catalog, "current_observer", lambda: Observer())
+    export_agent_catalog(drift_document(), drift_prior())
+    assert events == [
+        (
+            "schema.drift",
+            {
+                "actor": "exporter",
+                "code_only_tables": 3,
+                "code_only_columns": 3,
+                "unused_in_code": 1,
+            },
+        )
+    ]
