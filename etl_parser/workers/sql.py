@@ -1677,29 +1677,6 @@ def _table_name(t: exp.Table) -> str:
     return ".".join(p.sql() for p in t.parts)
 
 
-def _all_selects(body: exp.Expression) -> list[exp.Expression]:
-    """Collect every output projection of a select/set-operation/subquery body.
-
-    Unlike the single ``outer.selects`` used inline in ``_analyze_select`` (which only
-    looks at the outermost branch), this recurses into both sides of a set operation
-    (``UNION``, etc.) and through a wrapping subquery.
-
-    Args:
-        body: The query body to collect projections from.
-
-    Returns:
-        A flat list of projection expressions across every branch, or an empty list when
-        ``body`` is not a ``Select``, ``SetOperation``, or ``Subquery``.
-    """
-    if isinstance(body, exp.SetOperation):
-        return _all_selects(body.left) + _all_selects(body.right)
-    if isinstance(body, exp.Subquery):
-        return _all_selects(body.this)
-    if isinstance(body, exp.Select):
-        return list(body.selects)
-    return []
-
-
 def _kind(proj: exp.Expression) -> str:
     """Classify a projection's ``Transformation.kind`` for design section 8.1 step 4.
 
