@@ -13,9 +13,28 @@ from openlineage.client.facet_v2 import schema_dataset as schema
 from openlineage.client.run import InputDataset, Job, OutputDataset, Run, RunEvent, RunState
 from openlineage.client.serde import Serde
 
+from etl_parser.graph.builder import JOB_IO_PARSER
 from etl_parser.identity import dataset_ref_from_id
 
+# The repository name really is "elt-parser": that is the remote this package is published
+# from, and a producer URI has to resolve, so the transposition is deliberate here.
 PRODUCER = "https://github.com/Zidane786/elt-parser"
+
+DIRECT_SUBTYPES = {"identity": "IDENTITY", "aggregation": "AGGREGATION"}
+"""Direct transformation kind to OpenLineage ``DIRECT`` subtype; others are TRANSFORMATION."""
+
+INDIRECT_SUBTYPES = {
+    "filter": "FILTER",
+    "join": "JOIN",
+    "aggregation": "GROUP_BY",
+    "window": "WINDOW",
+}
+"""Indirect transformation kind to OpenLineage ``INDIRECT`` subtype (spec section 10).
+
+Kinds outside this mapping (``identity``, ``expression``, ``unknown``) leave ``subtype``
+unset: the edge records that a column was used indirectly, but not which clause used it,
+and the OpenLineage spec has no value for "indirect, clause unknown".
+"""
 
 
 def export_openlineage(doc):
@@ -55,6 +74,8 @@ def export_openlineage(doc):
                     for edge in doc.column_edges:
                         if edge.job_id != job.id or edge.target.dataset_id != ident:
                             continue
+                        if edge.provenance.parser == JOB_IO_PARSER:
+                            continue  # A declared read is not traced column lineage.
                         refs = []
                         roles = [(r, "DIRECT") for r in edge.sources]
                         roles += [(r, "INDIRECT") for r in edge.indirect_sources]
@@ -70,12 +91,11 @@ def export_openlineage(doc):
                                     transformations=[
                                         cl.Transformation(
                                             type=role,
-                                            subtype={
-                                                "identity": "IDENTITY",
-                                                "aggregation": "AGGREGATION",
-                                            }.get(edge.transformation.kind, "TRANSFORMATION")
+                                            subtype=DIRECT_SUBTYPES.get(
+                                                edge.transformation.kind, "TRANSFORMATION"
+                                            )
                                             if role == "DIRECT"
-                                            else None,
+                                            else INDIRECT_SUBTYPES.get(edge.transformation.kind),
                                             description=edge.transformation.expression,
                                         )
                                     ],
@@ -99,6 +119,12 @@ def export_openlineage(doc):
                         expressions = [edge.transformation.expression]
                         if prior:
                             expressions.append(prior.transformationDescription)
+                        # Only IDENTITY and MASKED are defined for the field-level type, and
+                        # masking is never detected here; anything else stays unset rather
+                        # than emitting an invented value (finding 13).
+                        field_type = "IDENTITY" if edge.transformation.kind == "identity" else None
+                        if prior and prior.transformationType != field_type:
+                            field_type = None
                         fields[edge.target.name] = cl.Fields(
                             inputFields=list(merged.values()),
                             transformationDescription="\n".join(
@@ -107,12 +133,7 @@ def export_openlineage(doc):
                                 )
                             )
                             or None,
-                            transformationType=(
-                                "MIXED"
-                                if prior
-                                and prior.transformationType != edge.transformation.kind.upper()
-                                else edge.transformation.kind.upper()
-                            ),
+                            transformationType=field_type,
                         )
                     if fields:
                         facets["columnLineage"] = cl.ColumnLineageDatasetFacet(

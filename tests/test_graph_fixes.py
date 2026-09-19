@@ -7,7 +7,10 @@ Covers findings 3, 11, 12, 13 and 27-31 of ``docs/reports/2026-09-19-full-review
 from pathlib import Path
 
 import pytest
+from openlineage.client.facet_v2 import column_lineage_dataset as cl
+from openlineage.client.serde import Serde
 
+from etl_parser.export.openlineage_out import PRODUCER, export_openlineage
 from etl_parser.graph.builder import LineageGraph, build_graph
 from etl_parser.graph.impact import downstream
 from etl_parser.models import (
@@ -157,6 +160,100 @@ def test_job_io_edges_cover_every_unlinked_pair_without_changing_dependencies():
     fallback = {(e.source, e.target) for e in doc.table_edges if e.provenance.parser == "job_io"}
     assert fallback == {("glue://db/b", "glue://db/out"), ("glue://db/seed", "glue://db/a")}
     assert [d.job_id for d in doc.job_dependencies["reader"]] == ["writer"]
+
+
+def _transformations(fields, column):
+    """Return every transformation emitted for one output column of a facet."""
+    return [t for reference in fields[column]["inputFields"] for t in reference["transformations"]]
+
+
+def test_openlineage_indirect_subtypes_come_from_the_edge_kind(tmp_path):
+    """Finding 13: INDIRECT transformations carry the subtype the spec defines.
+
+    The kind belongs to the projection, so a subtype is emitted only where the projection
+    itself says which clause used the column (aggregation, window). An identity projection
+    whose indirect sources came from a filter or join carries no clause information, and
+    the exporter leaves the subtype unset rather than guessing one.
+    """
+    (tmp_path / "job.sql").write_text(
+        "CREATE TABLE db.t AS SELECT customer_id, sum(amount) AS total "
+        "FROM db.s JOIN db.d ON db.s.k = db.d.k GROUP BY customer_id"
+    )
+    fields = export_openlineage(scan(tmp_path).document)[0]["outputs"][0]["facets"][
+        "columnLineage"
+    ]["fields"]
+    everything = _transformations(fields, "total") + _transformations(fields, "customer_id")
+    assert {t["type"] for t in everything} <= {"DIRECT", "INDIRECT"}
+    assert all(
+        t.get("subtype") in {"IDENTITY", "TRANSFORMATION", "AGGREGATION"}
+        for t in everything
+        if t["type"] == "DIRECT"
+    )
+    aggregated = _transformations(fields, "total")
+    assert {t.get("subtype") for t in aggregated if t["type"] == "INDIRECT"} == {"GROUP_BY"}
+    identity = _transformations(fields, "customer_id")
+    assert {t.get("subtype") for t in identity if t["type"] == "INDIRECT"} == {None}
+
+
+def test_openlineage_window_edges_get_the_window_subtype(tmp_path):
+    """Finding 13: a window projection maps its indirect sources to WINDOW."""
+    (tmp_path / "job.py").write_text(
+        "from pyspark.sql import functions as F, Window\n"
+        'df = spark.table("a.s").select(F.col("raw").alias("x"))\n'
+        'w = Window.orderBy("x")\n'
+        'out = df.withColumn("rank", F.row_number().over(w))\n'
+        'out.write.saveAsTable("b.t")\n'
+    )
+    fields = export_openlineage(scan(tmp_path).document)[0]["outputs"][0]["facets"][
+        "columnLineage"
+    ]["fields"]
+    assert [t.get("subtype") for t in _transformations(fields, "rank")] == ["WINDOW"]
+
+
+def test_openlineage_field_transformation_type_stays_spec_valid(tmp_path):
+    """Finding 13: the deprecated field-level type never emits invented values."""
+    (tmp_path / "job.sql").write_text(
+        "CREATE TABLE db.t AS SELECT x AS kept, x + 1 AS changed FROM db.s"
+    )
+    fields = export_openlineage(scan(tmp_path).document)[0]["outputs"][0]["facets"][
+        "columnLineage"
+    ]["fields"]
+    assert fields["kept"]["transformationType"] == "IDENTITY"
+    # Serde strips nulls: an unknown transformation omits the field rather than inventing
+    # a value such as the old "EXPRESSION", which no OpenLineage version defines.
+    assert fields["changed"].get("transformationType") is None
+
+
+def test_openlineage_ignores_job_io_edges_in_column_facets():
+    """job_io edges record a declared read, not traced column lineage."""
+    document = _cross_product_document()
+    document.column_edges[0].provenance = Provenance(parser="job_io", confidence="partial")
+    outputs = export_openlineage(document)[0]["outputs"]
+    assert "columnLineage" not in outputs[0]["facets"]
+
+
+def test_openlineage_events_validate_against_the_client_models(tmp_path):
+    """Spec 10: every emitted facet value is representable by openlineage-python."""
+    (tmp_path / "job.sql").write_text("CREATE TABLE db.t AS SELECT x AS y FROM db.s WHERE x > 0")
+    event = export_openlineage(scan(tmp_path).document)[0]
+    assert event["producer"] == PRODUCER
+    assert event["eventType"] == "COMPLETE"
+    for field in event["outputs"][0]["facets"]["columnLineage"]["fields"].values():
+        # Constructing the typed models rejects stray keys and non-spec shapes.
+        rebuilt = cl.Fields(
+            inputFields=[
+                cl.InputField(
+                    namespace=reference["namespace"],
+                    name=reference["name"],
+                    field=reference["field"],
+                    transformations=[cl.Transformation(**t) for t in reference["transformations"]],
+                )
+                for reference in field["inputFields"]
+            ],
+            transformationDescription=field.get("transformationDescription"),
+            transformationType=field.get("transformationType"),
+        )
+        assert Serde.to_dict(rebuilt) == field
 
 
 def _cross_product_document():
