@@ -398,19 +398,11 @@ def test_min_ai_confidence_reaches_the_analysis_configuration(
     assert captured_config[0].min_ai_confidence == 0.75
 
 
-def test_min_ai_confidence_is_a_no_op_when_unset(captured_config, tmp_path):
+def test_min_ai_confidence_defaults_to_accepting_every_proposal(captured_config, tmp_path):
+    # Unset means no floor, so a run behaves exactly as it did before the option existed.
     result = CliRunner().invoke(app, ["run", str(tmp_path), "--out-dir", str(tmp_path / "out")])
     assert result.exit_code == 0, result.output
-    assert not hasattr(captured_config[0], "min_ai_confidence")
-
-
-def test_min_ai_confidence_reports_a_clear_error_when_unsupported(captured_config, tmp_path):
-    result = CliRunner().invoke(
-        app,
-        ["run", str(tmp_path), "--out-dir", str(tmp_path / "out"), "--min-ai-confidence", "0.5"],
-    )
-    assert result.exit_code == 2, result.output
-    assert "min-ai-confidence" in result.output and "Traceback" not in result.output
+    assert captured_config[0].min_ai_confidence == 0.0
 
 
 def test_min_ai_confidence_rejects_values_outside_zero_to_one(tmp_path):

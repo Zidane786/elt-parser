@@ -899,17 +899,16 @@ def test_scan_accepts_schema_source_dict_and_path_and_records_export_options(tmp
     assert "glue://other/unused" not in datasets
 
 
-def test_client_forwards_export_options_only_when_exporter_supports_them(tmp_path, monkeypatch):
+def test_client_forwards_every_export_option_to_the_exporter(tmp_path, monkeypatch):
     import etl_parser.sdk as sdk
     from etl_parser import ParserClient
 
     (tmp_path / "job.sql").write_text("CREATE TABLE db.t AS SELECT x FROM db.s")
     source = StaticSource([])
     client = ParserClient(log_level="ERROR")
-    # Current exporter: options are dropped silently, schema_drift is absent -> None.
+    # The exporter supports every option, so a real run reports drift rather than dropping it.
     result = client.run(tmp_path, schema=source, generate=["databases"], databases=["db"])
-    assert result.schema_drift is None
-    assert "schema_drift" not in result.catalog
+    assert result.schema_drift == result.catalog["schema_drift"]
     seen = {}
 
     def fake_export(

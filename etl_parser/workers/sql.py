@@ -207,6 +207,7 @@ def _substitute_holes(text: str) -> tuple[str, list[tuple[str, str, int]]]:
     holes: list[tuple[str, str, int]] = []
 
     def replace(match: re.Match) -> str:
+        """Swap one template placeholder for a marker sqlglot can parse, recording it."""
         marker = f"{_HOLE_MARKER}{len(holes)}__"
         name = (match.group(1) if match.group(1) is not None else match.group(2)) or "?"
         holes.append((marker, name.strip() or "?", match.start()))
@@ -237,6 +238,7 @@ def _place_holes(expression: exp.Expression, holes: list[tuple[str, str, int]]) 
     names = {marker: f"{{{{ {name} }}}}" for marker, name, _ in holes}
 
     def restore(text: str) -> str:
+        """Put the original placeholder text back into rendered SQL."""
         return _HOLE_TOKEN.sub(lambda m: names.get(m.group(0), m.group(0)), text)
 
     rewrites: list[tuple[exp.Expression, exp.Expression]] = []

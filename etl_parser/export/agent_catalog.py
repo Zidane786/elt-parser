@@ -473,15 +473,19 @@ def _match_prior_scripts(prior_scripts, jobs):
     matched: dict[str, dict] = {}
 
     def rule_job_id(job, script):
+        """Match a prior script by the job id this exporter previously wrote."""
         return script.get("job_id") == job.id
 
     def rule_path(job, script):
+        """Match a prior script by an exact source path."""
         return script.get("script_path") == job.source_file
 
     def rule_name(job, script):
+        """Match a prior script by script name, for catalogs written before job ids."""
         return script.get("script_name") == job.name
 
     def rule_suffix(job, script):
+        """Match a prior script whose path differs only by a leading directory prefix."""
         return _path_suffix_match(script.get("script_path"), job.source_file)
 
     for rule in (rule_job_id, rule_path, rule_name, rule_suffix):

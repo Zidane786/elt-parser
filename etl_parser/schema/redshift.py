@@ -225,6 +225,7 @@ class RedshiftSchemaSource(PostgresSchemaSource):
         """Render a query template: system schema list and optional schema filter."""
 
         def render(match):
+            """Expand one schema-filter placeholder into a literal IN list, or nothing."""
             column = match.group(1)
             if not self.schemas:
                 return ""

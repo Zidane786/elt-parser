@@ -872,6 +872,16 @@ def _rebuild(baseline, columns, tables):
     )
     graph = build_graph([combined], scan_commit=baseline.scan_commit)
     graph.document.products = copy.deepcopy(baseline.products)
+    # An edge that targets a column is itself an observation that the dataset has it, so
+    # a newly proposed output column must appear on its dataset or the catalog cannot
+    # carry it (and any description written for it would have nowhere to live).
+    proposed: dict[str, set[str]] = {}
+    for edge in columns:
+        proposed.setdefault(edge.target.dataset_id, set()).add(edge.target.name)
+    for dataset in graph.document.datasets:
+        names = proposed.get(dataset.id)
+        if names:
+            dataset.columns = sorted(set(dataset.columns) | names)
     _mark_ai_origin(graph.document, baseline, columns, tables, known_jobs)
     return graph.document.sorted()
 
@@ -1111,7 +1121,15 @@ async def analyze_async(
     # Filesystem/GitHub indexing and static parsing must not block a service's event loop.
     graph = await asyncio.to_thread(scan, path, **scan_options)
     doc, index = graph.document, graph.source_index
-    result = AnalysisRun(doc, index, export_agent_catalog(doc, prior))
+    # Whether code may define the schema is decided once, from what the caller supplied.
+    # The re-export after a merge must reuse that decision: the catalog this run just
+    # produced is not itself a source of truth, and treating it as one would discard the
+    # very columns the AI proposed.
+    schema = scan_options.get("schema")
+    code_schema = scan_options.get("include_code_schema") or (schema is None and prior is None)
+    result = AnalysisRun(
+        doc, index, export_agent_catalog(doc, prior, schema=schema, include_code_schema=code_schema)
+    )
     result.configuration = sanitize(config.model_dump())
     observer.configure(**config.model_dump(), source=str(path))
     if config.descriptions:
@@ -1874,7 +1892,9 @@ async def analyze_async(
     if applied_columns or applied_tables:
         result.document = _rebuild(doc, applied_columns, applied_tables)
         _record_additions(result, doc, observer)
-        result.catalog = export_agent_catalog(result.document, result.catalog)
+        result.catalog = export_agent_catalog(
+            result.document, result.catalog, schema=schema, include_code_schema=code_schema
+        )
         final_columns = _catalog_columns(result.catalog)
         for key, (text, proposal) in new_descriptions.items():
             column = final_columns.get(key)

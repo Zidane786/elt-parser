@@ -10,14 +10,12 @@ caller-injected runners remain caller-owned and are not closed by the client.
 from __future__ import annotations
 
 import asyncio
-import inspect
 from pathlib import Path
 
 from etl_parser.ai_analysis import AnalysisConfig, AnalysisRun, analyze_async
 from etl_parser.artifacts import write_analysis
 from etl_parser.export.agent_catalog import export_agent_catalog
 from etl_parser.observability import RunObserver, observed
-from etl_parser.schema.base import is_schema_source
 from etl_parser.schema.catalog import write_schema_catalog
 
 
@@ -41,20 +39,17 @@ def apply_export_options(
     Args:
         result: The :class:`~etl_parser.ai_analysis.AnalysisRun` to update in place.
         prior: The prior catalog the run was exported against.
-        schema: The scan's schema argument; forwarded only when it is a full
-            :class:`~etl_parser.schema.base.SchemaSource`.
+        schema: The scan's schema argument: a schema source, catalog dict or path.
         include_code_schema: Whether code-only tables/columns may be added to
             ``databases``.
         generate: Catalog sections to generate (``None`` means all).
         databases: Database names to restrict the catalog to (``None`` means all).
 
     Returns:
-        list[str]: Requested option names the exporter does not support yet (dropped).
+        list[str]: Always empty; kept so callers can report options that were dropped.
     """
-    parameters = inspect.signature(export_agent_catalog).parameters
-    var_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
     requested = {}
-    if is_schema_source(schema):
+    if schema is not None:
         requested["schema"] = schema
     if include_code_schema:
         requested["include_code_schema"] = True
@@ -62,18 +57,17 @@ def apply_export_options(
         requested["generate"] = list(generate)
     if databases is not None:
         requested["databases"] = list(databases)
-    supported = {k: v for k, v in requested.items() if k in parameters or var_kwargs}
-    if supported:
+    if requested:
         configuration = getattr(result, "configuration", None) or {}
         ai_ran = configuration.get("ai_lineage", "off") != "off" or configuration.get(
             "descriptions"
         )
         # After AI stages the current catalog carries their descriptions; keep them.
         base = getattr(result, "catalog", None) if ai_ran else prior
-        result.catalog = export_agent_catalog(result.document, base, **supported)
+        result.catalog = export_agent_catalog(result.document, base, **requested)
     # A result need not carry a catalog: a scan-only run has none to read drift from.
     result.schema_drift = (getattr(result, "catalog", None) or {}).get("schema_drift")
-    return sorted(set(requested) - set(supported))
+    return []
 
 
 class ParserClient:
