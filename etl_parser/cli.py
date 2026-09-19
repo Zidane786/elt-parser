@@ -46,27 +46,53 @@ app.add_typer(export_app, name="export")
 @app.command("run")
 @observed("command.run")
 def analysis_run(
-    source: str,
-    out_dir: Path = typer.Option(Path("artifacts")),
-    config: Path | None = typer.Option(None, exists=True),
-    ai_lineage: str | None = typer.Option(None, help="off (default), fallback, or improve"),
-    descriptions: bool | None = typer.Option(None, "--descriptions/--no-descriptions"),
-    background_comparison: bool | None = typer.Option(
-        None, "--background-comparison/--no-background-comparison"
+    source: str = typer.Argument(..., help="Local path or https://github.com/OWNER/REPO"),
+    out_dir: Path = typer.Option(
+        Path("artifacts"), help="Directory to write this run's artifact folder into"
     ),
-    dry_run: bool | None = typer.Option(None, "--dry-run/--no-dry-run"),
-    schema: Path | None = typer.Option(None, exists=True),
+    config: Path | None = typer.Option(
+        None, exists=True, help="JSON AnalysisConfig; explicit options override its values"
+    ),
+    ai_lineage: str | None = typer.Option(None, help="off (default), fallback, or improve"),
+    descriptions: bool | None = typer.Option(
+        None, "--descriptions/--no-descriptions", help="Generate missing column descriptions"
+    ),
+    background_comparison: bool | None = typer.Option(
+        None,
+        "--background-comparison/--no-background-comparison",
+        help="Allow a needed description call to also return a shadow lineage comparison",
+    ),
+    dry_run: bool | None = typer.Option(
+        None, "--dry-run/--no-dry-run", help="Plan AI work without making any provider call"
+    ),
+    schema: Path | None = typer.Option(
+        None, exists=True, help="JSON catalog or schema mapping for qualifying SQL and stars"
+    ),
     glue: bool = typer.Option(False, help="Fetch input schemas from AWS Glue"),
     plugin: list[str] | None = typer.Option(None, help="Explicitly trusted module:factory plugins"),
-    bindings: Path | None = typer.Option(None, exists=True),
-    products: Path | None = typer.Option(None, exists=True),
-    prior: Path | None = typer.Option(None, exists=True),
-    engine: str = "athena",
-    dialect: str | None = None,
-    default_db: str | None = None,
-    ref: str | None = None,
-    source_path: str | None = typer.Option(None, "--path"),
-    lambda_arn: str | None = typer.Option(None, envvar="ETL_PARSER_LAMBDA_ARN"),
+    bindings: Path | None = typer.Option(
+        None, exists=True, help="JSON string-to-string substitutions for SQL placeholders"
+    ),
+    products: Path | None = typer.Option(
+        None, exists=True, help="product.yaml file, or a directory of them"
+    ),
+    prior: Path | None = typer.Option(
+        None,
+        exists=True,
+        help="Prior catalog.json whose descriptions and metadata are preserved",
+    ),
+    engine: str = typer.Option("athena", help="Default execution engine for standalone .sql files"),
+    dialect: str | None = typer.Option(
+        None, help="Default sqlglot dialect for standalone .sql files"
+    ),
+    default_db: str | None = typer.Option(None, help="Database to assume for one-part table names"),
+    ref: str | None = typer.Option(None, help="GitHub branch, tag or commit to pin"),
+    source_path: str | None = typer.Option(None, "--path", help="GitHub repository subpath"),
+    lambda_arn: str | None = typer.Option(
+        None,
+        envvar="ETL_PARSER_LAMBDA_ARN",
+        help="Function name or ARN for the Bedrock invoke runner",
+    ),
     runner: str | None = typer.Option(
         None,
         envvar="ETL_PARSER_RUNNER",
@@ -86,25 +112,49 @@ def analysis_run(
     extra_headers_file: Path | None = typer.Option(
         None, exists=True, help="JSON header object; mutually exclusive with --extra-headers"
     ),
-    model: str | None = typer.Option(None, envvar="ETL_PARSER_MODEL"),
-    region: str | None = typer.Option(None, envvar="AWS_REGION"),
-    aws_profile: str | None = typer.Option(None, envvar="AWS_PROFILE"),
-    web_adapter: bool | None = typer.Option(None, "--web-adapter/--no-web-adapter"),
-    max_calls: int | None = typer.Option(None, min=0),
+    model: str | None = typer.Option(
+        None, envvar="ETL_PARSER_MODEL", help="SDK model id or registered model slug"
+    ),
+    region: str | None = typer.Option(
+        None, envvar="AWS_REGION", help="AWS region for the Bedrock invoke runner and Glue"
+    ),
+    aws_profile: str | None = typer.Option(
+        None, envvar="AWS_PROFILE", help="Named AWS profile for the Lambda runner"
+    ),
+    web_adapter: bool | None = typer.Option(
+        None, "--web-adapter/--no-web-adapter", help="Use the SDK Lambda Web Adapter envelope"
+    ),
+    max_calls: int | None = typer.Option(
+        None, min=0, help="Maximum AI calls this run may make (default: 20)"
+    ),
     max_output_tokens: int | None = typer.Option(
         None, min=1, help="Maximum output tokens per AI file request (default: 16000)"
     ),
-    max_total_tokens: int | None = typer.Option(None, min=1),
-    max_context_chars: int | None = typer.Option(None, min=1024),
-    timeout_seconds: float | None = typer.Option(None, min=0.001),
-    deadline_seconds: float | None = typer.Option(None, min=0.001),
-    include: list[str] | None = None,
-    exclude: list[str] | None = None,
+    max_total_tokens: int | None = typer.Option(
+        None, min=1, help="Optional cap on cumulative accounted tokens for the run"
+    ),
+    max_context_chars: int | None = typer.Option(
+        None, min=1024, help="Maximum serialized context characters per AI call"
+    ),
+    timeout_seconds: float | None = typer.Option(
+        None, min=0.001, help="Per-request timeout in seconds (default: 300)"
+    ),
+    deadline_seconds: float | None = typer.Option(
+        None, min=0.001, help="Wall-clock budget for the AI stage (default: 3600)"
+    ),
+    include: list[str] | None = typer.Option(
+        None, help="Glob selecting files eligible for AI work; repeatable"
+    ),
+    exclude: list[str] | None = typer.Option(
+        None, help="Glob excluding files from AI work; repeatable, wins over --include"
+    ),
     strict: bool = typer.Option(False, help="Fail if any unresolved/AI-incomplete work remains"),
-    log_dir: Path | None = None,
-    log_level: str = "INFO",
-    log_max_bytes: int = typer.Option(10_000_000, min=1024),
-    log_max_files: int = typer.Option(20, min=1),
+    log_dir: Path | None = typer.Option(None, help="Persist run events and metrics in this folder"),
+    log_level: str = typer.Option("INFO", help="Console level; file logs retain DEBUG events"),
+    log_max_bytes: int = typer.Option(
+        10_000_000, min=1024, help="Maximum size of one log file before rotation"
+    ),
+    log_max_files: int = typer.Option(20, min=1, help="Maximum number of rotated log files"),
 ):
     """Run deterministic lineage plus explicitly enabled AI work; defaults make no AI calls.
 
@@ -346,20 +396,32 @@ def _factory(spec):
 @observed("command.scan")
 def scan(
     repo: str = typer.Argument(..., help="Local path or https://github.com/OWNER/REPO"),
-    out: Path = typer.Option(Path("lineage.json")),
-    schema: Path | None = typer.Option(None, exists=True),
+    out: Path = typer.Option(
+        Path("lineage.json"), help="Destination for the native lineage JSON output"
+    ),
+    schema: Path | None = typer.Option(
+        None, exists=True, help="JSON catalog or schema mapping for qualifying SQL and stars"
+    ),
     glue: bool = typer.Option(False, help="Fetch input schemas from AWS Glue"),
-    region: str | None = None,
-    products: Path | None = typer.Option(None, exists=True),
-    bindings: Path | None = typer.Option(None, exists=True),
-    default_db: str | None = None,
-    engine: str = "athena",
-    dialect: str | None = None,
+    region: str | None = typer.Option(None, help="AWS region for the Glue schema lookup"),
+    products: Path | None = typer.Option(
+        None, exists=True, help="product.yaml file, or a directory of them"
+    ),
+    bindings: Path | None = typer.Option(
+        None, exists=True, help="JSON string-to-string substitutions for SQL placeholders"
+    ),
+    default_db: str | None = typer.Option(None, help="Database to assume for one-part table names"),
+    engine: str = typer.Option("athena", help="Default execution engine for standalone .sql files"),
+    dialect: str | None = typer.Option(
+        None, help="Default sqlglot dialect for standalone .sql files"
+    ),
     plugin: list[str] | None = typer.Option(None, help="Explicitly trusted module:factory plugins"),
     log_dir: Path | None = typer.Option(None, help="Persist run events and metrics in this folder"),
     log_level: str = typer.Option("INFO", help="Console level; file logs retain DEBUG events"),
-    log_max_bytes: int = typer.Option(10_000_000, min=1024),
-    log_max_files: int = typer.Option(20, min=1),
+    log_max_bytes: int = typer.Option(
+        10_000_000, min=1024, help="Maximum size of one log file before rotation"
+    ),
+    log_max_files: int = typer.Option(20, min=1, help="Maximum number of rotated log files"),
     ref: str | None = typer.Option(None, help="GitHub branch, tag or commit to pin"),
     source_path: str | None = typer.Option(None, "--path", help="GitHub repository subpath"),
 ):
@@ -574,27 +636,49 @@ def describe(
     out: Path = typer.Option(
         ..., help="Destination for the enriched catalog; parent directories are created"
     ),
-    lambda_arn: str | None = typer.Option(None, envvar="ETL_PARSER_LAMBDA_ARN"),
+    lambda_arn: str | None = typer.Option(
+        None,
+        envvar="ETL_PARSER_LAMBDA_ARN",
+        help="Function name or ARN for the Bedrock invoke runner",
+    ),
     runner: str = typer.Option(
         "lambda-bedrock-invoke",
         envvar="ETL_PARSER_RUNNER",
         help="lambda-bedrock-invoke, lbi (alias), or anthropic",
     ),
     base_url: str | None = typer.Option(
-        None, envvar=["ANTHROPIC_API_BASE_URL", "ANTHROPIC_BASE_URL"]
+        None,
+        envvar=["ANTHROPIC_API_BASE_URL", "ANTHROPIC_BASE_URL"],
+        help="Anthropic-compatible HTTPS root; SDK appends /v1/messages",
     ),
-    api_key: str | None = typer.Option(None, envvar="ANTHROPIC_API_KEY"),
+    api_key: str | None = typer.Option(
+        None,
+        envvar="ANTHROPIC_API_KEY",
+        help="Prefer the environment variable over a command-line secret",
+    ),
     extra_headers: str | None = typer.Option(None, help="JSON object of custom HTTP headers"),
-    extra_headers_file: Path | None = typer.Option(None, exists=True),
-    model: str = typer.Option(..., envvar="ETL_PARSER_MODEL"),
-    region: str = typer.Option("us-east-1", envvar="AWS_REGION"),
-    aws_profile: str | None = typer.Option(None, envvar="AWS_PROFILE"),
+    extra_headers_file: Path | None = typer.Option(
+        None, exists=True, help="JSON header object; mutually exclusive with --extra-headers"
+    ),
+    model: str = typer.Option(
+        ..., envvar="ETL_PARSER_MODEL", help="SDK model id or registered model slug"
+    ),
+    region: str = typer.Option(
+        "us-east-1", envvar="AWS_REGION", help="AWS region for the Bedrock invoke runner"
+    ),
+    aws_profile: str | None = typer.Option(
+        None, envvar="AWS_PROFILE", help="Named AWS profile for the Lambda runner"
+    ),
     web_adapter: bool = typer.Option(True, help="Use the SDK Lambda Web Adapter envelope"),
-    max_tokens: int = typer.Option(16000, min=1),
-    log_dir: Path | None = None,
-    log_level: str = "INFO",
-    log_max_bytes: int = typer.Option(10_000_000, min=1024),
-    log_max_files: int = typer.Option(20, min=1),
+    max_tokens: int = typer.Option(
+        16000, min=1, help="Maximum output tokens per description request"
+    ),
+    log_dir: Path | None = typer.Option(None, help="Persist run events and metrics in this folder"),
+    log_level: str = typer.Option("INFO", help="Console level; file logs retain DEBUG events"),
+    log_max_bytes: int = typer.Option(
+        10_000_000, min=1024, help="Maximum size of one log file before rotation"
+    ),
+    log_max_files: int = typer.Option(20, min=1, help="Maximum number of rotated log files"),
 ):
     """Generate descriptions through the selected Agent SDK runner (paid calls).
 

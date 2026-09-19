@@ -312,3 +312,34 @@ def test_cli_scan_keeps_info_logging(sql_fixture, tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert "INFO" in levels(result.stderr)
+
+
+def parameters():
+    """Walk every command in the app and yield its documented parameters.
+
+    Yields:
+        tuple[str, str, object]: Command path, parameter label, and the parameter.
+    """
+    from typer.main import get_command
+
+    def walk(command, path):
+        """Recurse into ``command`` and its subcommands."""
+        for parameter in command.params:
+            label = next(
+                (option for option in getattr(parameter, "opts", []) if option.startswith("--")),
+                parameter.name,
+            )
+            yield path, label, parameter
+        for name, child in getattr(command, "commands", {}).items():
+            yield from walk(child, f"{path} {name}".strip())
+
+    yield from walk(get_command(app), "etl-parser")
+
+
+def test_every_command_parameter_has_a_help_string():
+    missing = sorted(
+        f"{path} {label}"
+        for path, label, parameter in parameters()
+        if not getattr(parameter, "help", None)
+    )
+    assert not missing, f"Undocumented parameters: {missing}"
