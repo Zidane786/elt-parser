@@ -9,11 +9,13 @@ from etl_parser.schema.base import SchemaSource, SchemaSourceError, as_schema_pr
 from etl_parser.schema.catalog import write_schema_catalog
 from etl_parser.schema.glue import GlueSchemaProvider, GlueSchemaSource
 from etl_parser.schema.postgres import PostgresSchemaSource
+from etl_parser.schema.redshift import RedshiftSchemaSource
 
 __all__ = [
     "GlueSchemaProvider",
     "GlueSchemaSource",
     "PostgresSchemaSource",
+    "RedshiftSchemaSource",
     "SchemaSource",
     "SchemaSourceError",
     "as_schema_provider",

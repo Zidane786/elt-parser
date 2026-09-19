@@ -490,6 +490,149 @@ def test_postgres_missing_driver_names_extra(monkeypatch):
         PostgresSchemaSource("postgresql://localhost/app").catalog()
 
 
+RS_ROWS = [
+    (
+        "svv_columns",
+        [
+            ("dw", "orders", "id", "bigint", 1),
+            ("dw", "orders", "customer_id", "bigint", 2),
+            ("dw", "customers", "id", "bigint", 1),
+            ("dw", "profiles", "customer_id", "bigint", 1),
+        ],
+    ),
+    ("svv_table_info", [("dw", "orders"), ("dw", "customers"), ("dw", "empty_table")]),
+    ("pg_attribute", [("dw", "orders", "id", "Order key")]),
+    ("objsubid = 0", [("dw", "orders", "Orders fact")]),
+    (
+        "pg_constraint",
+        [
+            ("dw", "customers", "customers_pkey", "p", "PRIMARY KEY (id)"),
+            (
+                "dw",
+                "orders",
+                "orders_fk",
+                "f",
+                'FOREIGN KEY (customer_id) REFERENCES dw.customers("id")',
+            ),
+            ("dw", "profiles", "profiles_uq", "u", "UNIQUE (customer_id)"),
+            (
+                "dw",
+                "profiles",
+                "profiles_fk",
+                "f",
+                "FOREIGN KEY (customer_id) REFERENCES customers(id)",
+            ),
+        ],
+    ),
+]
+
+
+def test_redshift_catalog_relations_and_inline_schema_filter():
+    from etl_parser.schema.redshift import RedshiftSchemaSource
+
+    connection = FakeConnection(RS_ROWS)
+    source = RedshiftSchemaSource(connection=connection, schemas=["dw"])
+    catalog = source.catalog()
+    assert [d["db_name"] for d in catalog["databases"]] == ["dw"]
+    dw = catalog["databases"][0]
+    assert dw["db_type"] == "redshift"
+    assert [t["table_name"] for t in dw["tables"]] == [
+        "customers",
+        "empty_table",
+        "orders",
+        "profiles",
+    ]
+    assert dw["tables"][1]["schema"] == []
+    orders = dw["tables"][2]
+    assert orders["description"] == "Orders fact"
+    assert orders["schema"][0] == {
+        "field_name": "id",
+        "datatype": "bigint",
+        "description": "Order key",
+    }
+    assert source.relations() == [
+        relation("dw.customers", "dw.orders", "customer_id", source="database")
+        | {"from_column": "id"},
+        relation("dw.customers", "dw.profiles", "customer_id", "one_to_one", source="database")
+        | {"from_column": "id"},
+    ]
+    assert source.columns("redshift://dw/orders") == ["id", "customer_id"]
+    assert source.columns("redshift://dw/empty_table") == []
+    assert source.columns("postgres://dw/orders") is None
+    assert all(params is None for _sql, params in connection.executed)
+    assert all("IN ('dw')" in sql for sql, _params in connection.executed)
+    assert "%(" not in "".join(sql for sql, _params in connection.executed)
+    with pytest.raises(SchemaSourceError, match="identifier"):
+        RedshiftSchemaSource(connection=connection, schemas=["dw; drop"])
+
+
+def test_redshift_iam_and_password_connections(monkeypatch):
+    import sys
+    import types
+
+    from etl_parser.schema.redshift import RedshiftSchemaSource
+
+    attempts = []
+
+    def connect(**kwargs):
+        attempts.append(kwargs)
+        return FakeConnection(RS_ROWS)
+
+    monkeypatch.setitem(sys.modules, "redshift_connector", types.SimpleNamespace(connect=connect))
+    dsn = f"redshift://etl:{SECRET}@cluster.example.internal:5439/dw"
+    RedshiftSchemaSource(dsn).catalog()
+    assert attempts[-1] == {
+        "host": "cluster.example.internal",
+        "port": 5439,
+        "database": "dw",
+        "user": "etl",
+        "password": SECRET,
+    }
+    RedshiftSchemaSource(
+        dsn, iam=True, profile="example-profile", region="eu-west-1", cluster_identifier="c1"
+    ).catalog()
+    assert attempts[-1] == {
+        "host": "cluster.example.internal",
+        "port": 5439,
+        "database": "dw",
+        "user": "etl",
+        "iam": True,
+        "profile": "example-profile",
+        "region": "eu-west-1",
+        "cluster_identifier": "c1",
+        "db_user": "etl",
+    }
+    monkeypatch.setenv("ETL_PARSER_REDSHIFT_DSN", dsn)
+    monkeypatch.setenv("REDSHIFT_DB_USER", "svc")
+    source = RedshiftSchemaSource(iam=True, cluster_identifier="c2")
+    source.catalog()
+    assert attempts[-1]["db_user"] == "svc" and attempts[-1]["cluster_identifier"] == "c2"
+    assert "password" not in attempts[-1]
+    assert SECRET not in repr(source) and SECRET not in str(vars(source))
+    monkeypatch.delenv("ETL_PARSER_REDSHIFT_DSN")
+    monkeypatch.delenv("REDSHIFT_DB_USER")
+    with pytest.raises(SchemaSourceError, match="ETL_PARSER_REDSHIFT_DSN") as info:
+        RedshiftSchemaSource().catalog()
+    assert SECRET not in str(info.value)
+
+
+def test_redshift_missing_driver_names_extra(monkeypatch):
+    import builtins
+
+    from etl_parser.schema.redshift import RedshiftSchemaSource
+
+    original = builtins.__import__
+
+    def no_driver(name, *args, **kwargs):
+        if name == "redshift_connector":
+            raise ImportError("No module named 'redshift_connector'")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_driver)
+    with pytest.raises(ImportError, match=r"etl-parser\[redshift\]"):
+        RedshiftSchemaSource("redshift://h/db").catalog()
+
+
 def test_glue_schema_provider_alias_keeps_old_signature(glue_client):
     from etl_parser.workers import sql
 

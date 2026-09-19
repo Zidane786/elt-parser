@@ -229,7 +229,9 @@ class PostgresSchemaSource:
         column_comments = self._fetch_column_comments()
         tables: dict[tuple[str, str], list[tuple]] = defaultdict(list)
         for schema, table, column, datatype, ordinal in self._fetch_columns():
-            tables[(schema, table)].append((ordinal, column, datatype))
+            cols = tables[(schema, table)]  # a ``None`` column registers an empty table
+            if column is not None:
+                cols.append((ordinal, column, datatype))
         databases: dict[str, dict] = {}
         index: dict[str, list[str]] = {}
         for (schema, table), cols in sorted(tables.items()):
