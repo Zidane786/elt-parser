@@ -114,6 +114,13 @@ class Frame:
         parallel_sources (bool): Whether this frame was read from multiple dataset arguments
             at once (for example ``pd.read_csv([a, b])``), so an unknown column's origin
             fans out across all of ``sources`` rather than just one.
+        write_options (dict[str, ast.AST]): Writer builder options accumulated by
+            ``.format(...)``/``.option(...)``/``.options(...)`` calls on a ``df.write``
+            chain, keyed by option name, with values as their literal AST nodes. A
+            ``"path"`` entry supplies the output location for a terminal ``.save()``.
+        inferred (bool): Whether this frame's shape was reached through a heuristic (a
+            helper function followed one level, or a branch merge), so edges built from it
+            are ``inferred`` rather than ``exact`` (design spec section 13).
     """
 
     columns: dict[str, Column] = field(default_factory=dict)
@@ -124,6 +131,8 @@ class Frame:
     open_columns: bool = True
     group: list[str] = field(default_factory=list)
     parallel_sources: bool = False
+    write_options: dict[str, ast.AST] = field(default_factory=dict)
+    inferred: bool = False
 
     def column(self, name: str) -> Column:
         """Resolve a column reference against this frame, including dotted alias access.
@@ -1299,12 +1308,23 @@ class PythonWorker:
                                 out.columns[key] = right.columns[key]
                     else:
                         out.partial = True
+                elif method in {"format", "option", "options"}:
+                    # Writer builder options; ".option('path', ...)" names the output.
+                    if method == "option" and len(node.args) >= 2:
+                        out.write_options[folded(node.args[0]).text] = node.args[1]
+                    elif method == "options":
+                        out.write_options.update(keywords)
+                    elif node.args:
+                        out.write_options["format"] = node.args[0]
+                    # Capture the path at the builder call, not after a later reassignment.
+                    path = out.write_options.get("path")
+                    if path is not None and not isinstance(path, ast.Constant):
+                        resolved = concrete(path, "dynamic_path")
+                        if resolved is not None:
+                            out.write_options["path"] = ast.Constant(resolved)
                 elif method in {
                     "mode",
                     "partitionBy",
-                    "format",
-                    "option",
-                    "options",
                     "copy",
                     "dropDuplicates",
                     "drop_duplicates",
@@ -1339,6 +1359,18 @@ class PythonWorker:
                 "table",
             }:
                 sink = match_sink("read." + method)
+            if isinstance(receiver, Frame) and method in {
+                "parquet",
+                "csv",
+                "json",
+                "orc",
+                "text",
+                "save",
+            }:
+                # Writer builder chains (df.write.mode(...).parquet(path)) lose the
+                # "write." prefix from the callee text, so resolve them the way readers are.
+                writer = match_sink("write." + method)
+                sink = writer if writer and writer.direction == "write" else sink
             if method in {"load", "save"} and not isinstance(receiver, (Reader, Frame)):
                 sink = None
             if sink:
@@ -1349,6 +1381,8 @@ class PythonWorker:
                 )
                 if arg is None and isinstance(receiver, Reader):
                     arg = receiver.options.get("path")
+                if arg is None and isinstance(receiver, Frame):
+                    arg = receiver.write_options.get("path")
                 if arg is None:
                     # Builder calls such as .load() require option tracking, not a guessed path.
                     issue(node, "Dataset argument is unavailable", "dynamic_table_name")
@@ -1364,7 +1398,7 @@ class PythonWorker:
                     (
                         list(arg.elts)
                         if isinstance(arg, (ast.List, ast.Tuple))
-                        else list(node.args)
+                        else (list(node.args) or [arg])
                         if isinstance(receiver, Reader) and method == "parquet"
                         else [arg]
                     )

@@ -72,6 +72,7 @@ SINKS: list[SinkSpec] = [
     SinkSpec("write.csv", "write", 0, "path", "spark", "spark", "pyspark", alt_arg="path"),
     SinkSpec("write.json", "write", 0, "path", "spark", "spark", "pyspark", alt_arg="path"),
     SinkSpec("write.orc", "write", 0, "path", "spark", "spark", "pyspark", alt_arg="path"),
+    SinkSpec("write.text", "write", 0, "path", "spark", "spark", "pyspark", alt_arg="path"),
     SinkSpec("save", "write", 0, "path", "spark", "spark", "pyspark", alt_arg="path"),
     # AWS Glue DynamicFrame
     SinkSpec(
